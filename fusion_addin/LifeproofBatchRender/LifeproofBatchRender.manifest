@@ -1,0 +1,12 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "A1B2C3D4-E5F6-4789-A012-3456789ABCDE",
+  "author": "Your Team",
+  "description": {
+    "": "Batch render Lifeproof-style models across color folders, named views, and visibility rules."
+  },
+  "version": "0.3.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac"
+}

@@ -1,0 +1,336 @@
+[2026-04-25 16:10:38] run() called from D:\Projects\React\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-25 16:10:39] bootstrap.run() FAILED:
+Traceback (most recent call last):
+  File "D:\Projects\React\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender\plugin\bootstrap.py", line 233, in run
+    cmd_def = cmd_defs.addCommandDefinition(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'CommandDefinitions' object has no attribute 'addCommandDefinition'. Did you mean: 'addButtonDefinition'?
+
+[2026-04-26 04:55:19] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-26 04:55:19] run() completed OK
+[2026-04-26 05:06:05] stop() called
+[2026-04-26 05:06:05] stop() completed OK
+[2026-04-26 05:09:52] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-26 05:09:52] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-26 05:09:52] run() completed OK
+[2026-04-26 05:28:53] stop() called
+[2026-04-26 05:28:53] stop() OK
+[2026-04-26 05:28:53] stop() completed OK
+[2026-04-26 05:30:58] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-26 05:30:58] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-26 05:30:58] run() completed OK
+[2026-04-26 05:32:32] stop() called
+[2026-04-26 05:32:32] stop() OK
+[2026-04-26 05:32:32] stop() completed OK
+[2026-04-26 06:43:08] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-26 06:43:08] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-26 06:43:08] run() completed OK
+[2026-04-26 07:15:15] stop() called
+[2026-04-26 07:15:15] stop() OK
+[2026-04-26 07:15:15] stop() completed OK
+[2026-04-26 10:50:42] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-26 10:50:42] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-26 10:50:42] run() completed OK
+[2026-04-26 10:56:55] stop() called
+[2026-04-26 10:56:55] stop() OK
+[2026-04-26 10:56:55] stop() completed OK
+[2026-04-26 23:36:45] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-26 23:36:45] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-26 23:36:45] run() completed OK
+[2026-04-27 00:58:52] stop() called
+[2026-04-27 00:58:52] stop() OK
+[2026-04-27 00:58:52] stop() completed OK
+[2026-04-28 02:52:56] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-28 02:52:56] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-28 02:52:56] run() completed OK
+[2026-04-28 03:53:44] stop() called
+[2026-04-28 03:53:44] stop() OK
+[2026-04-28 03:53:44] stop() completed OK
+[2026-04-29 05:11:36] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-29 05:11:36] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-29 05:11:36] run() completed OK
+[2026-04-29 22:42:02] stop() called
+[2026-04-29 22:42:02] stop() OK
+[2026-04-29 22:42:02] stop() completed OK
+[2026-04-30 06:47:04] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-04-30 06:47:04] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-04-30 06:47:04] run() completed OK
+[2026-04-30 08:16:10] stop() called
+[2026-04-30 08:16:10] stop() OK
+[2026-04-30 08:16:10] stop() completed OK
+[2026-05-01 03:41:35] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-01 03:41:35] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-01 03:41:35] run() completed OK
+[2026-05-01 04:05:45] stop() called
+[2026-05-01 04:05:45] stop() OK
+[2026-05-01 04:05:45] stop() completed OK
+[2026-05-01 04:34:42] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-01 04:34:42] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-01 04:34:42] run() completed OK
+[2026-05-03 01:01:03] stop() called
+[2026-05-03 01:01:03] stop() OK
+[2026-05-03 01:01:03] stop() completed OK
+[2026-05-03 01:08:55] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-03 01:08:55] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-03 01:08:55] run() completed OK
+[2026-05-03 23:37:19] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-03 23:37:19] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-03 23:37:19] run() completed OK
+[2026-05-04 00:34:30] stop() called
+[2026-05-04 00:34:30] stop() OK
+[2026-05-04 00:34:30] stop() completed OK
+[2026-05-04 01:16:54] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-04 01:16:54] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-04 01:16:54] run() completed OK
+[2026-05-04 20:45:10] stop() called
+[2026-05-04 20:45:10] stop() OK
+[2026-05-04 20:45:10] stop() completed OK
+[2026-05-04 21:11:26] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-04 21:11:26] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-04 21:11:26] run() completed OK
+[2026-05-05 01:48:46] stop() called
+[2026-05-05 01:48:46] stop() OK
+[2026-05-05 01:48:46] stop() completed OK
+[2026-05-05 06:14:18] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-05 06:14:18] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-05 06:14:18] run() completed OK
+[2026-05-05 06:16:28] stop() called
+[2026-05-05 06:16:28] stop() OK
+[2026-05-05 06:16:28] stop() completed OK
+[2026-05-05 17:35:02] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-05 17:35:02] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-05 17:35:02] run() completed OK
+[2026-05-05 17:57:00] stop() called
+[2026-05-05 17:57:00] stop() OK
+[2026-05-05 17:57:00] stop() completed OK
+[2026-05-05 18:01:57] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-05 18:01:57] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-05 18:01:57] run() completed OK
+[2026-05-05 18:05:09] stop() called
+[2026-05-05 18:05:09] stop() OK
+[2026-05-05 18:05:09] stop() completed OK
+[2026-05-05 18:10:47] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-05 18:10:47] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-05 18:10:47] run() completed OK
+[2026-05-05 18:14:39] stop() called
+[2026-05-05 18:14:39] stop() OK
+[2026-05-05 18:14:39] stop() completed OK
+[2026-05-05 18:17:45] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-05 18:17:45] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-05 18:17:45] run() completed OK
+[2026-05-05 18:21:11] stop() called
+[2026-05-05 18:21:11] stop() OK
+[2026-05-05 18:21:11] stop() completed OK
+[2026-05-06 07:47:11] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-06 07:47:11] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-06 07:47:11] run() completed OK
+[2026-05-06 07:53:53] stop() called
+[2026-05-06 07:53:53] stop() OK
+[2026-05-06 07:53:53] stop() completed OK
+[2026-05-06 08:08:51] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-06 08:08:51] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-06 08:08:51] run() completed OK
+[2026-05-06 08:10:59] stop() called
+[2026-05-06 08:10:59] stop() OK
+[2026-05-06 08:10:59] stop() completed OK
+[2026-05-06 20:54:05] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-06 20:54:05] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-06 20:54:05] run() completed OK
+[2026-05-06 20:59:44] stop() called
+[2026-05-06 20:59:44] stop() OK
+[2026-05-06 20:59:44] stop() completed OK
+[2026-05-06 21:04:44] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-06 21:04:44] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-06 21:04:44] run() completed OK
+[2026-05-06 21:05:33] stop() called
+[2026-05-06 21:05:33] stop() OK
+[2026-05-06 21:05:33] stop() completed OK
+[2026-05-06 21:10:55] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-06 21:10:55] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-06 21:10:55] run() completed OK
+[2026-05-06 21:16:27] stop() called
+[2026-05-06 21:16:27] stop() OK
+[2026-05-06 21:16:27] stop() completed OK
+[2026-05-06 21:21:18] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-06 21:21:18] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-06 21:21:18] run() completed OK
+[2026-05-07 00:35:14] stop() called
+[2026-05-07 00:35:14] stop() OK
+[2026-05-07 00:35:14] stop() completed OK
+[2026-05-07 00:38:08] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-07 00:38:08] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-07 00:38:08] run() completed OK
+[2026-05-07 00:46:29] stop() called
+[2026-05-07 00:46:29] stop() OK
+[2026-05-07 00:46:29] stop() completed OK
+[2026-05-07 02:35:20] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-07 02:35:20] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-07 02:35:20] run() completed OK
+[2026-05-07 02:42:34] stop() called
+[2026-05-07 02:42:34] stop() OK
+[2026-05-07 02:42:34] stop() completed OK
+[2026-05-07 03:38:44] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-07 03:38:44] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-07 03:38:44] run() completed OK
+[2026-05-07 03:51:10] stop() called
+[2026-05-07 03:51:10] stop() OK
+[2026-05-07 03:51:10] stop() completed OK
+[2026-05-07 03:54:28] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-07 03:54:28] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-07 03:54:28] run() completed OK
+[2026-05-07 03:56:14] stop() called
+[2026-05-07 03:56:14] stop() OK
+[2026-05-07 03:56:14] stop() completed OK
+[2026-05-07 10:12:44] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-07 10:12:44] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-07 10:12:44] run() completed OK
+[2026-05-07 10:13:54] stop() called
+[2026-05-07 10:13:54] stop() OK
+[2026-05-07 10:13:54] stop() completed OK
+[2026-05-07 10:44:12] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-07 10:44:12] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-07 10:44:12] run() completed OK
+[2026-05-07 10:56:26] stop() called
+[2026-05-07 10:56:26] stop() OK
+[2026-05-07 10:56:26] stop() completed OK
+[2026-05-07 11:25:59] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-07 11:25:59] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-07 11:25:59] run() completed OK
+[2026-05-07 17:32:03] stop() called
+[2026-05-07 17:32:03] stop() OK
+[2026-05-07 17:32:03] stop() completed OK
+[2026-05-08 00:27:11] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-08 00:27:11] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-08 00:27:11] run() completed OK
+[2026-05-08 00:32:42] stop() called
+[2026-05-08 00:32:42] stop() OK
+[2026-05-08 00:32:42] stop() completed OK
+[2026-05-08 00:54:34] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-08 00:54:34] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-08 00:54:34] run() completed OK
+[2026-05-08 01:02:00] stop() called
+[2026-05-08 01:02:00] stop() OK
+[2026-05-08 01:02:00] stop() completed OK
+[2026-05-08 02:25:57] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-08 02:25:57] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-08 02:25:57] run() completed OK
+[2026-05-08 02:48:51] stop() called
+[2026-05-08 02:48:51] stop() OK
+[2026-05-08 02:48:51] stop() completed OK
+[2026-05-08 02:58:11] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-08 02:58:11] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-08 02:58:11] run() completed OK
+[2026-05-08 03:23:31] stop() called
+[2026-05-08 03:23:31] stop() OK
+[2026-05-08 03:23:31] stop() completed OK
+[2026-05-08 03:25:34] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-08 03:25:34] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-08 03:25:34] run() completed OK
+[2026-05-08 03:29:31] stop() called
+[2026-05-08 03:29:31] stop() OK
+[2026-05-08 03:29:31] stop() completed OK
+[2026-05-08 22:52:59] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-08 22:52:59] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-08 22:52:59] run() completed OK
+[2026-05-08 22:58:40] stop() called
+[2026-05-08 22:58:40] stop() OK
+[2026-05-08 22:58:40] stop() completed OK
+[2026-05-08 23:17:56] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-08 23:17:56] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-08 23:17:56] run() completed OK
+[2026-05-08 23:22:09] stop() called
+[2026-05-08 23:22:09] stop() OK
+[2026-05-08 23:22:09] stop() completed OK
+[2026-05-09 00:12:06] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 00:12:06] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 00:12:06] run() completed OK
+[2026-05-09 00:17:54] stop() called
+[2026-05-09 00:17:54] stop() OK
+[2026-05-09 00:17:54] stop() completed OK
+[2026-05-09 00:24:20] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 00:24:20] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 00:24:20] run() completed OK
+[2026-05-09 00:45:48] stop() called
+[2026-05-09 00:45:48] stop() OK
+[2026-05-09 00:45:48] stop() completed OK
+[2026-05-09 00:52:26] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 00:52:26] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 00:52:26] run() completed OK
+[2026-05-09 00:56:43] stop() called
+[2026-05-09 00:56:43] stop() OK
+[2026-05-09 00:56:43] stop() completed OK
+[2026-05-09 01:18:13] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 01:18:13] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 01:18:13] run() completed OK
+[2026-05-09 01:21:59] stop() called
+[2026-05-09 01:21:59] stop() OK
+[2026-05-09 01:21:59] stop() completed OK
+[2026-05-09 01:32:33] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 01:32:33] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 01:32:33] run() completed OK
+[2026-05-09 01:38:18] stop() called
+[2026-05-09 01:38:18] stop() OK
+[2026-05-09 01:38:18] stop() completed OK
+[2026-05-09 13:57:57] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 13:57:57] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 13:57:57] run() completed OK
+[2026-05-09 17:40:11] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 17:40:11] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 17:40:11] run() completed OK
+[2026-05-09 17:42:17] stop() called
+[2026-05-09 17:42:17] stop() OK
+[2026-05-09 17:42:17] stop() completed OK
+[2026-05-09 22:11:31] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 22:11:32] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 22:11:32] run() completed OK
+[2026-05-09 22:17:12] stop() called
+[2026-05-09 22:17:12] stop() OK
+[2026-05-09 22:17:12] stop() completed OK
+[2026-05-09 22:55:15] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 22:55:15] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 22:55:15] run() completed OK
+[2026-05-09 23:06:34] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 23:06:34] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 23:06:34] run() completed OK
+[2026-05-09 23:08:28] stop() called
+[2026-05-09 23:08:28] stop() OK
+[2026-05-09 23:08:28] stop() completed OK
+[2026-05-09 23:11:10] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 23:11:10] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 23:11:10] run() completed OK
+[2026-05-09 23:16:51] stop() called
+[2026-05-09 23:16:51] stop() OK
+[2026-05-09 23:16:51] stop() completed OK
+[2026-05-09 23:46:13] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-09 23:46:13] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-09 23:46:13] run() completed OK
+[2026-05-09 23:59:22] stop() called
+[2026-05-09 23:59:22] stop() OK
+[2026-05-09 23:59:22] stop() completed OK
+[2026-05-10 00:10:01] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-10 00:10:02] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-10 00:10:02] run() completed OK
+[2026-05-10 00:24:36] stop() called
+[2026-05-10 00:24:36] stop() OK
+[2026-05-10 00:24:36] stop() completed OK
+[2026-05-10 00:35:37] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-10 00:35:37] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-10 00:35:37] run() completed OK
+[2026-05-10 00:35:58] stop() called
+[2026-05-10 00:35:58] stop() OK
+[2026-05-10 00:35:58] stop() completed OK
+[2026-05-10 00:37:51] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-10 00:37:51] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-10 00:37:51] run() completed OK
+[2026-05-10 00:40:19] stop() called
+[2026-05-10 00:40:19] stop() OK
+[2026-05-10 00:40:19] stop() completed OK
+[2026-05-10 01:02:41] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-10 01:02:41] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-10 01:02:41] run() completed OK
+[2026-05-10 01:05:31] stop() called
+[2026-05-10 01:05:31] stop() OK
+[2026-05-10 01:05:31] stop() completed OK
+[2026-05-10 20:19:06] run() called from D:\Projects\Python\Fusion360\Project\lifeproof-fusion-batch-render\fusion_addin\LifeproofBatchRender
+[2026-05-10 20:19:06] Command attached to: FusionSolidEnvironment/SolidScriptsAddinsPanel, FusionSolidEnvironment/SolidModifyPanel
+[2026-05-10 20:19:06] run() completed OK

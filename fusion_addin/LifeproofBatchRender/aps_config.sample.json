@@ -1,0 +1,7 @@
+{
+  "client_id": "YOUR_APS_CLIENT_ID",
+  "client_secret": "YOUR_APS_CLIENT_SECRET",
+  "scopes": "data:read data:write bucket:create bucket:read",
+  "bucket_key": "",
+  "workflow_notes": "bucket_key + OSS upload + your render job API must be implemented in plugin/renderer_aps.py for APS mode to produce images."
+}

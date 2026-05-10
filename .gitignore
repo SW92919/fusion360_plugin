@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.vscode/
+*.f3d
+*.jpg
+*.jpeg
+*.png
+*.tif
+
+# APS secrets (copy aps_config.sample.json → aps_config.json locally)
+fusion_addin/LifeproofBatchRender/aps_config.json
