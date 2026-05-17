@@ -98,6 +98,105 @@ APPEARANCE_BROADCAST: bool = True
 # the original mixed materials preserved (some bodies will not change).
 FORCE_BODY_COVERAGE: bool = True
 
+# When True, every body gets a freshly-created decal of the user's color-set
+# image projected onto its largest planar face. Disabled by default because
+# the Fusion 360 builds we tested on silently reject every decal-sizing API
+# (width/height on input, post-add, scaleX/Y, scaleFactor, transform matrix
+# scaling) — decals are created at Fusion's default ~5cm patch size and
+# can't be made to cover the face. With this flag False, the plugin runs
+# the appearance pipeline against ``SLOT1_APPEARANCE_NAMES`` (the prepared-
+# template path described in docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md).
+BODY_COVERAGE_VIA_DECALS: bool = False
+
+# When True, every face of every body gets its own decal so the image wraps
+# the WHOLE model — top, sides, ends, curved nose, etc. When False (default),
+# only the largest planar face per body receives a decal.
+#
+# Set this to False unless you really need 100+ decals: each color-set change
+# rewrites the imageFilename of every active decal, and on this build that
+# triggers a synchronous re-projection + viewport refresh per decal, which is
+# what made a 6-image batch take >1 hour. With one decal per body (~14
+# decals on the stair tread template) the same batch finishes in minutes,
+# and the bottom-face/inner-face decals were never visible to the camera
+# anyway so the rendered output looks the same or better.
+BATCH_DECAL_ALL_FACES: bool = False
+
+# All decals this pipeline creates are named with this prefix so we can locate
+# and delete them at end-of-batch without touching decals authored in the .f3d.
+BATCH_DECAL_NAME_PREFIX: str = "LifeproofBatchDecal_"
+
+# Multiplier applied to the face's longest bounding-box side when sizing each
+# decal. Fusion clips decals at the face boundary, so over-sizing the decal
+# guarantees full-face coverage even when the build auto-fits to the image
+# aspect ratio. Set this aggressively — even when Fusion ignores it, the
+# tiling fallback below picks up the slack.
+DECAL_OVERSIZE_FACTOR: float = 20.0
+
+# When True, decals are TILED across the face's longest direction in a grid
+# of step-sized cells, instead of one decal centered on the face. This is
+# the workaround for Fusion builds that ignore every decal-sizing API:
+# place many small default-sized decals next to each other and let them
+# collectively cover the face.
+BATCH_DECAL_TILE: bool = True
+
+# Grid step in cm for tiling. Each decal is a ~5 cm patch; with image
+# slicing OFF every tile shows the full swatch. 5 cm makes cells the same
+# size as the patch → contiguous coverage with no bare slivers (6+ cm left
+# the plank only partially covered, reading as a strip). Smaller = denser.
+BATCH_DECAL_TILE_STEP_CM: float = 5.0
+
+# Hard cap on tile decals per single face. A large plank/tread show face
+# needs a full grid (a ~120 × 15 cm face is ~24 × 3 = ~72 patches at 5 cm)
+# or it only partially covers. Set high enough for full single-face cover.
+BATCH_DECAL_MAX_TILES_PER_FACE: int = 80
+
+# Hard cap on total batch decals across the WHOLE model — the anti-freeze
+# safety valve (each decal = 1 create + N color-set swaps + 1 teardown, all
+# synchronous re-projections). This is THE speed↔coverage knob:
+#   * lower (e.g. 80)  → faster, but long parts may show bare gaps;
+#   * higher (e.g. 160)→ fuller coverage, slower (can freeze on weak PCs).
+# 320 + GLOBAL largest-face-first + visible-only filtering: enough to FULLY
+# cover the visible show faces of a multi-body assembly at the 5 cm step
+# (each big plank/tread/nose face wants ~70-80 patches). Ray tracing is OFF
+# (instant viewport capture) so decals are the only load; ~320 stays
+# workable (UI is pumped) — it's slower than before but gives full coverage.
+# Lower if decal create/teardown bogs the UI; raise if gaps remain.
+BATCH_DECAL_MAX_TOTAL: int = 320
+
+# Faces smaller than this (cm² of bounding-box area) are skipped entirely —
+# they are slivers/fillets that are not meaningfully visible and only burn
+# the decal budget.
+BATCH_DECAL_MIN_FACE_AREA_CM2: float = 1.5
+
+# Faces whose longest side is <= this (cm) get exactly ONE decal instead of
+# a grid: a single ~5 cm patch already covers them (end caps, short returns),
+# so gridding them just wastes the budget and freezes the UI.
+BATCH_DECAL_SINGLE_DECAL_MAX_CM: float = 7.0
+
+# When True, each tile decal shows only its own (iu, iv) cell of the source
+# image, so the tiles on a face reassemble into ONE big copy of the swatch.
+# That reconstruction is fragile: any face that is curved, trimmed, or only
+# partially covered (off-face skips) ends up showing a scrambled / half-
+# missing photo — the "messy / wrong color / half textured" results on the
+# moulding parts. When False (default) every tile shows the FULL image, so
+# the part reads as a clean, uniform repeating texture (exactly how real
+# flooring / trim renders look) and partial coverage degrades gracefully
+# instead of looking broken. Set True only for flat slab-like models where
+# you specifically want one giant copy of the swatch stretched across.
+BATCH_DECAL_TILE_SLICE_IMAGE: bool = False
+
+# Pump Fusion's UI message loop every N decal operations so the application
+# stays responsive. Tighter = smoother UI, marginally more overhead.
+BATCH_DECAL_UI_PUMP_INTERVAL: int = 8
+
+# When True, the plugin also rewrites ``imageFilename`` on every user-
+# authored decal in the .f3d (anything not named ``LifeproofBatchDecal_*``).
+# Disable when you have many user-authored decals (e.g. 15+ on a single
+# template) — they bloat the per-color-set swap loop and aren't necessary
+# once the tile coverage is good. Re-enable if you intentionally maintain
+# hand-placed decals you want auto-swapped.
+UPDATE_USER_AUTHORED_DECALS: bool = False
+
 # Library appearance keywords used to source a carrier when nothing in the
 # active design accepts texture updates. Order matters: items earlier in the
 # tuple are tried before later ones, so wood-flavoured raster appearances
@@ -197,6 +296,14 @@ DECAL_TEXTURE_IMAGE_SHIFT_PX: int = 0
 
 _decal_shift_temp_paths: List[str] = []
 _decal_shift_pil_warning_emitted: bool = False
+
+# Maps id(decal) -> (ix, iy, nx, ny) so we can slice each color-set image
+# the same way when updating per-decal imageFilename. Populated by the tile
+# loop in create_batch_decals_for_all_bodies; cleared by cleanup_batch_decals.
+_TILE_METADATA: dict = {}
+
+# Temp PNG paths produced by _slice_image_for_tile. Deleted at batch end.
+_TILE_TEMP_PATHS: List[str] = []
 
 # 1×1 PNG (base64) used only to discover a library carrier when the client's
 # color-set raster (often JPG) is rejected by ``changeTextureImage`` everywhere,
@@ -379,42 +486,148 @@ def _sorted_carrier_library_candidates(
     return slim, len(slim)
 
 
-def _apply_image_to_appearance_textures(appearance: adsk.fusion.Appearance, image_path: str) -> int:
+_NON_COLOR_BRANCH_HINTS: Tuple[str, ...] = (
+    "bump",
+    "normal",
+    "rough",
+    "metal",
+    "specular",
+    "gloss",
+    "displace",
+    "height",
+    "ao",
+    "ambient_occlusion",
+    "opacity",
+    "transparency",
+    "emission",
+    "anisotropy",
+    "cutout",
+    "mask",
+)
+
+
+def _branch_label_is_color(parent_names: Tuple[str, ...]) -> bool:
+    """True unless the texture's branch path clearly identifies it as a
+    non-visible channel (bump / normal / roughness / metallic / etc.).
+
+    We rely on the procedural-name blacklist (``_is_procedural_carrier_name``)
+    to reject Pine / limestone / steel / paint / foam etc. by *appearance*
+    name. That leaves this per-slot filter with one job: reject swaps that
+    *clearly* landed on a non-color branch. Anything else — including
+    properties with unnamed parents or names Fusion doesn't tag with
+    "color"/"albedo" — is accepted, because real raster diffuse slots in
+    Fusion libraries often have generic names like ``value``, ``Image``,
+    ``texture``, or empty strings on some builds.
     """
-    Call changeTextureImage on every AppearanceTexture property on this appearance.
-    Returns how many textures were successfully updated.
+    if not parent_names:
+        return True
+    joined = " ".join(parent_names).lower()
+    if any(neg in joined for neg in _NON_COLOR_BRANCH_HINTS):
+        return False
+    return True
+
+
+def _apply_image_to_appearance_textures_detailed(
+    appearance: adsk.fusion.Appearance, image_path: str
+) -> Tuple[int, int]:
     """
-    changed = 0
+    Call changeTextureImage on every AppearanceTexture reachable from this
+    appearance, at any nesting depth.
+
+    Modern Fusion PBR appearances (the bulk of materialLibraries) expose
+    their texture as ``AppearanceTextureProperty.value`` rather than as a
+    top-level ``AppearanceTexture`` on ``appearanceProperties`` — a flat
+    ``AppearanceTexture.cast(prop)`` over the top level misses them and
+    returns 0, which is what made every library probe fail in the field.
+    """
     try:
         props = appearance.appearanceProperties
     except Exception:
-        return 0
+        return 0, 0
     path_opts = _texture_image_path_candidates(image_path)
-    for i in range(props.count):
-        prop = props.item(i)
-        try:
-            tex = adsk.core.AppearanceTexture.cast(prop)
-            if tex:
-                for cand in path_opts:
-                    try:
-                        if tex.changeTextureImage(cand):
-                            changed += 1
-                            break
-                    except Exception:
-                        pass
+    changed = 0
+    color_changed = 0
+    seen: Set[int] = set()
+
+    def _try_change_on(tex: Any) -> bool:
+        method = getattr(tex, "changeTextureImage", None)
+        if not callable(method):
+            return False
+        for cand in path_opts:
+            try:
+                if method(cand):
+                    return True
+            except Exception:
                 continue
-            # Some builds: texture property not castable but still exposes the method.
-            if callable(getattr(prop, "changeTextureImage", None)):
-                for cand in path_opts:
-                    try:
-                        if prop.changeTextureImage(cand):
-                            changed += 1
-                            break
-                    except Exception:
-                        pass
+        return False
+
+    def _record(parents: Tuple[str, ...]) -> None:
+        nonlocal changed, color_changed
+        changed += 1
+        if _branch_label_is_color(parents):
+            color_changed += 1
+
+    def walk(coll: Any, parents: Tuple[str, ...], depth: int) -> None:
+        if coll is None or depth > 28:
+            return
+        try:
+            n = coll.count
         except Exception:
-            pass
-    return changed
+            return
+        for i in range(n):
+            try:
+                p = coll.item(i)
+            except Exception:
+                continue
+            try:
+                k = id(p)
+                if k in seen:
+                    continue
+                seen.add(k)
+            except Exception:
+                pass
+            try:
+                pname = p.name or ""
+            except Exception:
+                pname = ""
+            child_parents = parents + (pname,) if pname else parents
+            try:
+                tex = adsk.core.AppearanceTexture.cast(p)
+                if tex is not None and _try_change_on(tex):
+                    _record(child_parents)
+                    continue
+            except Exception:
+                pass
+            try:
+                tprop = adsk.core.AppearanceTextureProperty.cast(p)
+                if tprop is not None:
+                    inner = getattr(tprop, "value", None)
+                    if inner is not None and _try_change_on(inner):
+                        _record(child_parents)
+                    inner_props = getattr(inner, "properties", None) if inner is not None else None
+                    if inner_props is not None:
+                        walk(inner_props, child_parents, depth + 1)
+                    continue
+            except Exception:
+                pass
+            if _try_change_on(p):
+                _record(child_parents)
+                continue
+            try:
+                child = getattr(p, "properties", None)
+                if child is not None:
+                    walk(child, child_parents, depth + 1)
+            except Exception:
+                pass
+
+    walk(props, (), 0)
+    return changed, color_changed
+
+
+def _apply_image_to_appearance_textures(appearance: adsk.fusion.Appearance, image_path: str) -> int:
+    """Backwards-compatible wrapper that returns total slot updates only."""
+    total, _ = _apply_image_to_appearance_textures_detailed(appearance, image_path)
+    return total
 
 
 def _is_u_texture_offset_name(name: str, *, bare_ok: bool = False) -> bool:
@@ -648,6 +861,776 @@ def _collect_all_decals(design: adsk.fusion.Design) -> List[adsk.fusion.Decal]:
     return decals
 
 
+def _entity_is_visible(entity: Any, *, default: bool = True) -> bool:
+    """Best-effort "is this shown in the document right now".
+
+    Prefers the resolved ``isVisible`` (accounts for parent occurrences),
+    then falls back to the ``isLightBulbOn`` toggle. Returns ``default`` if
+    neither property is queryable, so we never wrongly drop geometry on
+    Fusion builds that don't expose them.
+    """
+    for attr in ("isVisible", "isLightBulbOn"):
+        try:
+            v = getattr(entity, attr)
+        except Exception:
+            continue
+        if v is None:
+            continue
+        return bool(v)
+    return default
+
+
+def _face_area(face: adsk.fusion.BRepFace) -> float:
+    try:
+        a = face.area
+        if a is not None:
+            return float(a)
+    except Exception:
+        pass
+    try:
+        bbox = face.boundingBox
+        if bbox is None:
+            return 0.0
+        dx = bbox.maxPoint.x - bbox.minPoint.x
+        dy = bbox.maxPoint.y - bbox.minPoint.y
+        dz = bbox.maxPoint.z - bbox.minPoint.z
+        sides = sorted((abs(dx), abs(dy), abs(dz)), reverse=True)
+        return sides[0] * sides[1]
+    except Exception:
+        return 0.0
+
+
+def _largest_planar_face(body: adsk.fusion.BRepBody) -> Optional[adsk.fusion.BRepFace]:
+    """Pick the largest planar face. Falls back to the largest face overall if
+    no planar face exists (some bodies are entirely cylindrical / spline)."""
+    best_planar: Optional[adsk.fusion.BRepFace] = None
+    best_planar_area = 0.0
+    best_any: Optional[adsk.fusion.BRepFace] = None
+    best_any_area = 0.0
+    try:
+        faces = body.faces
+        n = faces.count
+    except Exception:
+        return None
+    for i in range(n):
+        try:
+            f = faces.item(i)
+        except Exception:
+            continue
+        area = _face_area(f)
+        if area > best_any_area:
+            best_any_area = area
+            best_any = f
+        try:
+            is_plane = isinstance(f.geometry, adsk.core.Plane)
+        except Exception:
+            is_plane = False
+        if is_plane and area > best_planar_area:
+            best_planar_area = area
+            best_planar = f
+    return best_planar or best_any
+
+
+def _slice_image_for_tile(
+    src_path: Path, ix: int, iy: int, nx: int, ny: int
+) -> Optional[Path]:
+    """Crop ``src_path`` to the (ix, iy) cell of an nx × ny grid.
+
+    Returns the temp PNG path containing only that cell of the image. When
+    each tile decal points to a different cell, the tiles arranged in their
+    natural spatial grid display the source image as one continuous picture
+    instead of repeating the full image once per tile.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    if nx < 1 or ny < 1 or not src_path or not src_path.is_file():
+        return None
+    try:
+        im = Image.open(str(src_path)).convert("RGB")
+        w, h = im.size
+        if w < nx or h < ny:
+            return None
+        cw = w / nx
+        ch = h / ny
+        left = int(ix * cw)
+        top = int(iy * ch)
+        right = int(min((ix + 1) * cw, w))
+        bottom = int(min((iy + 1) * ch, h))
+        if right - left < 2 or bottom - top < 2:
+            return None
+        crop = im.crop((left, top, right, bottom))
+        fd, tmp = tempfile.mkstemp(suffix=".png", prefix="lifeproof_tile_")
+        os.close(fd)
+        crop.save(tmp, format="PNG")
+        _TILE_TEMP_PATHS.append(tmp)
+        return Path(tmp)
+    except Exception:
+        return None
+
+
+def _tile_points_on_planar_face(
+    face: adsk.fusion.BRepFace, step_cm: float
+) -> List[Tuple[adsk.core.Point3D, int, int, int, int]]:
+    """Yield a grid of points spanning the face's bbox in step_cm increments.
+
+    Each point is then validated against the face's evaluator so we only
+    keep points that are actually on the face surface — bbox of a non-
+    rectangular face leaves grid points in empty space that Fusion would
+    reject with "Input point not on primary face".
+    """
+    # Generate a 2D grid spanning the face's two longest bbox axes (the third
+    # axis is the face's thickness / perpendicular). Each tile carries its
+    # (iu, iv, nu, nv) so the per-tile image slice maps to the correct cell.
+    # Returning the grid coords lets ``update_batch_decal_images`` slice each
+    # color-set image into nu × nv pieces and assign one piece per tile,
+    # which eliminates the visible "same image repeated" pattern.
+    result: List[Tuple[adsk.core.Point3D, int, int, int, int]] = []
+    try:
+        bbox = face.boundingBox
+        if bbox is None:
+            return result
+        dx = abs(bbox.maxPoint.x - bbox.minPoint.x)
+        dy = abs(bbox.maxPoint.y - bbox.minPoint.y)
+        dz = abs(bbox.maxPoint.z - bbox.minPoint.z)
+        dims = [(dx, "x"), (dy, "y"), (dz, "z")]
+        dims.sort(key=lambda t: t[0], reverse=True)
+        d_u, axis_u = dims[0]
+        d_v, axis_v = dims[1]
+        d_w, axis_w = dims[2]
+        step = max(step_cm, 1.0)
+        nu = max(1, int(d_u / step) + 1)
+        nv = max(1, int(d_v / step) + 1)
+        # Cap nu * nv up-front so the slicing math (nu, nv) stays meaningful;
+        # decimating the flat list later would scramble which slice maps to
+        # which decal.
+        cap = max(int(BATCH_DECAL_MAX_TILES_PER_FACE), 1)
+        while nu * nv > cap:
+            if nu > nv:
+                nu -= 1
+            else:
+                nv -= 1
+            if nu < 1 or nv < 1:
+                nu = max(nu, 1)
+                nv = max(nv, 1)
+                break
+
+        for iu in range(nu):
+            for iv in range(nv):
+                u_off = (iu * d_u / max(nu - 1, 1)) if nu > 1 else d_u / 2.0
+                v_off = (iv * d_v / max(nv - 1, 1)) if nv > 1 else d_v / 2.0
+                w_off = d_w / 2.0  # centre of the perpendicular dim
+                px = bbox.minPoint.x
+                py = bbox.minPoint.y
+                pz = bbox.minPoint.z
+                for off, axis in ((u_off, axis_u), (v_off, axis_v), (w_off, axis_w)):
+                    if axis == "x":
+                        px += off
+                    elif axis == "y":
+                        py += off
+                    else:
+                        pz += off
+                pt = adsk.core.Point3D.create(px, py, pz)
+                result.append((pt, iu, iv, nu, nv))
+    except Exception:
+        pass
+    return result
+
+
+def _face_long_dims(face: adsk.fusion.BRepFace) -> Tuple[float, float]:
+    """The face's two longest physical extents in cm (for tile-count sizing)."""
+    try:
+        bbox = face.boundingBox
+        if bbox is None:
+            return 0.0, 0.0
+        dx = abs(bbox.maxPoint.x - bbox.minPoint.x)
+        dy = abs(bbox.maxPoint.y - bbox.minPoint.y)
+        dz = abs(bbox.maxPoint.z - bbox.minPoint.z)
+        dims = sorted((dx, dy, dz), reverse=True)
+        return dims[0], dims[1]
+    except Exception:
+        return 0.0, 0.0
+
+
+def _tile_points_on_face_uv(
+    face: adsk.fusion.BRepFace, step_cm: float
+) -> List[Tuple[adsk.core.Point3D, int, int, int, int]]:
+    """Grid the face in its own parametric (U/V) space via the evaluator.
+
+    This is far more reliable than the world-axis bounding-box grid for thin,
+    chamfered, or non-axis-aligned faces (e.g. the long ``Plastic - Matte
+    (White)`` edge strip that rendered as a pale line): every sample comes
+    straight from ``getPointAtParameter`` so it is guaranteed on the surface,
+    and tile counts are derived from the face's real physical size so the
+    image still assembles continuously across the face.
+    """
+    result: List[Tuple[adsk.core.Point3D, int, int, int, int]] = []
+    try:
+        ev = face.evaluator
+        if ev is None:
+            return result
+        ok, prange = ev.parametricRange()
+        if not ok or prange is None:
+            return result
+        u0 = prange.minPoint.x
+        u1 = prange.maxPoint.x
+        v0 = prange.minPoint.y
+        v1 = prange.maxPoint.y
+        if u1 <= u0 or v1 <= v0:
+            return result
+
+        d_u, d_v = _face_long_dims(face)
+        step = max(float(step_cm), 1.0)
+        # Cells sized ~step so neighbouring ~5 cm Fusion decals overlap and
+        # leave no bare slivers; longest physical dim drives the U count.
+        nu = max(1, int(d_u / step) + 1)
+        nv = max(1, int(d_v / step) + 1)
+        cap = max(int(BATCH_DECAL_MAX_TILES_PER_FACE), 1)
+        while nu * nv > cap:
+            if nu >= nv:
+                nu -= 1
+            else:
+                nv -= 1
+            if nu < 1 or nv < 1:
+                nu = max(nu, 1)
+                nv = max(nv, 1)
+                break
+
+        for iu in range(nu):
+            for iv in range(nv):
+                # Cell centre in parametric space — keeps the decal inside its
+                # image slice and away from the trimmed face boundary.
+                fu = (iu + 0.5) / nu
+                fv = (iv + 0.5) / nv
+                u = u0 + fu * (u1 - u0)
+                v = v0 + fv * (v1 - v0)
+                p2 = adsk.core.Point2D.create(u, v)
+                try:
+                    on = ev.isParameterOnFace(p2)
+                except Exception:
+                    on = True
+                if not on:
+                    continue
+                try:
+                    ok2, p3 = ev.getPointAtParameter(p2)
+                except Exception:
+                    ok2, p3 = False, None
+                if ok2 and p3 is not None:
+                    result.append((p3, iu, iv, nu, nv))
+    except Exception:
+        return result
+    return result
+
+
+def _on_face_point(face: adsk.fusion.BRepFace) -> Optional[adsk.core.Point3D]:
+    """Return a Point3D guaranteed to lie on the face surface.
+
+    Fusion rejects ``createInput`` with "Input point is not located on primary
+    face" whenever the supplied point isn't strictly on the face — which is
+    common for fillets, the curved nose, and any non-convex face whose
+    bounding-box center is in empty space. ``BRepFace.pointOnFace`` is the
+    API's documented "give me any point on the face" helper.
+    """
+    try:
+        p = face.pointOnFace
+        if p is not None:
+            return p
+    except Exception:
+        pass
+    try:
+        ev = face.evaluator
+        if ev is not None:
+            ok, prange = ev.parametricRange()
+            if ok and prange is not None:
+                u_mid = (prange.minPoint.x + prange.maxPoint.x) / 2.0
+                v_mid = (prange.minPoint.y + prange.maxPoint.y) / 2.0
+                ok2, p = ev.getPointAtParameter(adsk.core.Point2D.create(u_mid, v_mid))
+                if ok2 and p is not None:
+                    return p
+    except Exception:
+        pass
+    try:
+        bbox = face.boundingBox
+        if bbox is not None:
+            return adsk.core.Point3D.create(
+                (bbox.minPoint.x + bbox.maxPoint.x) / 2.0,
+                (bbox.minPoint.y + bbox.maxPoint.y) / 2.0,
+                (bbox.minPoint.z + bbox.maxPoint.z) / 2.0,
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _create_decal_on_face(
+    decals_collection: Any,
+    image_win_path: str,
+    face: adsk.fusion.BRepFace,
+    decal_name: str,
+    center_override: Optional[adsk.core.Point3D] = None,
+) -> Tuple[Optional[adsk.fusion.Decal], str]:
+    """Create one decal on ``face`` using the known-working call shape:
+    ``createInput(filename, [face], point_on_face)``. Keep API calls to the
+    minimum — every extra ``getattr``/``setattr`` on a Fusion API object can
+    trigger a compute/redraw and 100+ decals × extra calls freezes the UI.
+
+    When ``center_override`` is provided, the decal is placed at that point
+    (used by tiling to spread decals across the face). Otherwise we pick the
+    face's natural centre point.
+    """
+    center = center_override if center_override is not None else _on_face_point(face)
+    if center is None:
+        return None, "no on-face point"
+
+    # MINIMAL fast path: createInput + add + name. Nothing else.
+    #
+    # Earlier iterations tried width/height/scaleX/Y/scaleFactor/xDirection
+    # setattr on both DecalCreateInput AND Decal, plus a transform-matrix
+    # get+set as a "last resort". On this Fusion build NONE of those took
+    # effect (verified by the user — visible decal size never changed) but
+    # `decal.transform = new_m` and the readbacks each triggered a full
+    # Fusion re-projection per decal (~100-300ms × hundreds of tile decals =
+    # the UI freeze the user kept hitting). Coverage now comes from the
+    # tiling grid (BATCH_DECAL_TILE), not from per-decal sizing.
+    try:
+        decal_input = decals_collection.createInput(image_win_path, [face], center)
+    except Exception as ex:
+        return None, "createInput: {}".format(ex)
+    if decal_input is None:
+        return None, "createInput returned None"
+
+    try:
+        decal = decals_collection.add(decal_input)
+    except Exception as ex:
+        return None, "decals.add: {}".format(ex)
+    if decal is None:
+        return None, "decals.add returned None"
+
+    try:
+        decal.name = decal_name
+    except Exception:
+        pass
+    return decal, ""
+
+
+def create_batch_decals_for_all_bodies(
+    design: adsk.fusion.Design, image_path: Path
+) -> Tuple[List[adsk.fusion.Decal], List[str]]:
+    """Project ``image_path`` onto every body as a decal on its largest face.
+
+    Returns ``(decals_created, log_lines)``. The decals are added to whichever
+    component the body belongs to (root or sub-occurrence). All created decals
+    are named ``BATCH_DECAL_NAME_PREFIX<index>`` so ``cleanup_batch_decals``
+    can find and remove them without touching pre-existing decals.
+    """
+    lines: List[str] = []
+    created: List[adsk.fusion.Decal] = []
+    if not image_path or not image_path.is_file():
+        lines.append("Decal projection skipped: image not found ({})".format(image_path))
+        return created, lines
+
+    image_win = _win_path(image_path)
+
+    # (area, face, decals_collection, body_label) gathered across the WHOLE
+    # model in phase 1, then decaled biggest-first in phase 2. Collecting
+    # globally (not per body) is what stops a small first-processed body
+    # like "Foam Pad" eating the whole budget and starving the visible
+    # tread / nose faces.
+    candidates: List[Tuple[float, Any, Any, str]] = []
+
+    def _handle_component(
+        comp: adsk.fusion.Component, label: str
+    ) -> None:
+        try:
+            decals_coll = comp.decals
+        except Exception as ex:
+            lines.append("  {}: decals collection error: {}".format(label, ex))
+            return
+        try:
+            bodies = comp.bRepBodies
+            n_bodies = bodies.count
+        except Exception:
+            return
+        for bi in range(n_bodies):
+            try:
+                body = bodies.item(bi)
+            except Exception:
+                continue
+            if _body_hide_for_batch(body, include_face_uv_pins=False):
+                continue
+            # Skip bodies the designer hid in the .f3d — they are not in the
+            # render, so spending the decal budget on them leaves the
+            # visible geometry bare.
+            if not _entity_is_visible(body, default=True):
+                continue
+            body_label = "{}/{}".format(label, body.name or "?")
+
+            if BATCH_DECAL_ALL_FACES:
+                try:
+                    faces = body.faces
+                    n_faces = faces.count
+                except Exception as ex:
+                    lines.append("  {}: faces error: {}".format(body_label, ex))
+                    continue
+                body_ok = 0
+                body_fail = 0
+                first_err = ""
+                for fi in range(n_faces):
+                    try:
+                        face = faces.item(fi)
+                    except Exception:
+                        body_fail += 1
+                        continue
+                    name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
+                    decal, info = _create_decal_on_face(decals_coll, image_win, face, name)
+                    if decal is None:
+                        body_fail += 1
+                        if not first_err:
+                            first_err = info
+                        continue
+                    created.append(decal)
+                    body_ok += 1
+                lines.append(
+                    "  {}: {} / {} face(s) decaled{}".format(
+                        body_label,
+                        body_ok,
+                        body_ok + body_fail,
+                        "" if not first_err else " (first failure: {})".format(first_err),
+                    )
+                )
+            else:
+                # Phase 1: just COLLECT this body's worthwhile faces. Decals
+                # are created later (phase 2) biggest-face-first across the
+                # WHOLE model, so the global budget always lands on the
+                # visible show surfaces regardless of which body/occurrence
+                # they belong to (a small first-processed body like the Foam
+                # Pad must not eat the whole budget).
+                try:
+                    faces = body.faces
+                    n_faces = faces.count
+                except Exception as ex:
+                    lines.append("  {}: faces error: {}".format(body_label, ex))
+                    continue
+                for fi in range(n_faces):
+                    try:
+                        f = faces.item(fi)
+                    except Exception:
+                        continue
+                    a = _face_area(f)
+                    if a < BATCH_DECAL_MIN_FACE_AREA_CM2:
+                        continue  # sliver / fillet — not worth a decal
+                    candidates.append((a, f, decals_coll, body_label))
+
+    try:
+        _handle_component(design.rootComponent, "(root)")
+    except Exception as ex:
+        lines.append("Root component decal pass failed: {}".format(ex))
+
+    try:
+        occs = design.rootComponent.allOccurrences
+        n_occ = occs.count
+    except Exception as ex:
+        n_occ = 0
+        lines.append("allOccurrences error: {}".format(ex))
+
+    for oi in range(n_occ):
+        try:
+            occ = occs.item(oi)
+        except Exception:
+            continue
+        if _occurrence_should_hide_batch(occ):
+            continue
+        # Skip occurrences the designer HID in the .f3d (alternate tread /
+        # riser configurations, etc.). They are not in the render, so
+        # decaling them just burns the whole budget and leaves the visible
+        # bullnose bare — exactly the "no texture" symptom.
+        if not _entity_is_visible(occ, default=True):
+            lines.append(
+                "  {}: skipped (hidden in document)".format(occ.name)
+            )
+            continue
+        try:
+            comp = occ.component
+        except Exception:
+            continue
+        _handle_component(comp, occ.name)
+
+    # ---- Phase 2: decal the biggest faces in the WHOLE model first ----
+    # candidates is empty in BATCH_DECAL_ALL_FACES mode (that path creates
+    # decals itself above), so this is a no-op there.
+    if candidates:
+        # Total visible face area drives a PROPORTIONAL split of the budget:
+        # every visible face gets tiles ∝ its share of the area, so a few
+        # huge faces (the nose) can no longer eat the whole budget and leave
+        # the plank bare. Uniform density everywhere instead of all-or-none.
+        total_area = 0.0
+        for _a, _f, _dc, _bl in candidates:
+            total_area += max(0.0, float(_a))
+        if total_area <= 0.0:
+            total_area = 1.0
+
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        per_body_ok: dict = {}
+        per_body_fail: dict = {}
+        per_body_faces: dict = {}
+        first_err = ""
+        budget_hit = False
+        for _area, face, decals_coll, body_label in candidates:
+            if len(created) >= BATCH_DECAL_MAX_TOTAL:
+                budget_hit = True
+                break
+            try:
+                is_plane = isinstance(face.geometry, adsk.core.Plane)
+            except Exception:
+                is_plane = False
+
+            d_long = _face_long_dims(face)[0]
+            big = (
+                BATCH_DECAL_TILE
+                and d_long > BATCH_DECAL_SINGLE_DECAL_MAX_CM
+            )
+            if big:
+                # This face's fair share of the global budget (by area),
+                # clamped to [1, per-face cap].
+                share = BATCH_DECAL_MAX_TOTAL * (float(_area) / total_area)
+                target = int(round(share))
+                target = max(1, min(target, BATCH_DECAL_MAX_TILES_PER_FACE))
+                # Spread `target` tiles over the WHOLE face by deriving an
+                # effective step from it (never denser than the base step),
+                # so coverage is uniform — not a dense patch + bare strip.
+                step_eff = max(
+                    BATCH_DECAL_TILE_STEP_CM,
+                    math.sqrt(max(float(_area), 1.0) / float(target)),
+                )
+                tile_specs = _tile_points_on_face_uv(face, step_eff)
+                if not tile_specs and is_plane:
+                    tile_specs = _tile_points_on_planar_face(face, step_eff)
+                if not tile_specs:
+                    p = _on_face_point(face)
+                    tile_specs = [(p, 0, 0, 1, 1)] if p is not None else []
+                # If the grid still overshoots, thin it EVENLY (taking the
+                # first N would cluster decals at one end → a strip).
+                if len(tile_specs) > target:
+                    n_have = len(tile_specs)
+                    keep = sorted(
+                        {
+                            int(round(i * (n_have - 1) / max(target - 1, 1)))
+                            for i in range(target)
+                        }
+                    )
+                    tile_specs = [tile_specs[i] for i in keep]
+            else:
+                # Small face: one ~5 cm decal already covers it.
+                p = _on_face_point(face)
+                tile_specs = [(p, 0, 0, 1, 1)] if p is not None else []
+
+            if not tile_specs:
+                continue
+
+            remaining = BATCH_DECAL_MAX_TOTAL - len(created)
+            if remaining <= 0:
+                budget_hit = True
+                break
+            if len(tile_specs) > remaining:
+                tile_specs = tile_specs[:remaining]
+
+            used_face = False
+            for tile_pt, iu, iv, nu, nv in tile_specs:
+                name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
+                slice_path = (
+                    _slice_image_for_tile(image_path, iu, iv, nu, nv)
+                    if BATCH_DECAL_TILE_SLICE_IMAGE and nu * nv > 1
+                    else None
+                )
+                decal_image_str = (
+                    _win_path(slice_path) if slice_path else image_win
+                )
+                decal, err = _create_decal_on_face(
+                    decals_coll,
+                    decal_image_str,
+                    face,
+                    name,
+                    center_override=tile_pt,
+                )
+                if decal is None:
+                    per_body_fail[body_label] = (
+                        per_body_fail.get(body_label, 0) + 1
+                    )
+                    if not first_err:
+                        first_err = err
+                    continue
+                created.append(decal)
+                _TILE_METADATA[id(decal)] = (iu, iv, nu, nv)
+                per_body_ok[body_label] = per_body_ok.get(body_label, 0) + 1
+                used_face = True
+                if (
+                    BATCH_DECAL_UI_PUMP_INTERVAL > 0
+                    and len(created) % BATCH_DECAL_UI_PUMP_INTERVAL == 0
+                ):
+                    try:
+                        adsk.doEvents()
+                    except Exception:
+                        pass
+            if used_face:
+                per_body_faces[body_label] = (
+                    per_body_faces.get(body_label, 0) + 1
+                )
+
+        for bl in sorted(set(per_body_ok) | set(per_body_fail)):
+            ok = per_body_ok.get(bl, 0)
+            fail = per_body_fail.get(bl, 0)
+            if ok == 0:
+                lines.append(
+                    "  {}: no decals (budget spent on larger faces "
+                    "elsewhere)".format(bl)
+                )
+            else:
+                extra = " across {} face(s)".format(per_body_faces.get(bl, 0))
+                if fail:
+                    extra += " ({} off-face skipped)".format(fail)
+                lines.append(
+                    "  {}: {} tile decal(s) added{}".format(bl, ok, extra)
+                )
+        if budget_hit:
+            lines.append(
+                "  Global decal budget {} reached — smaller faces skipped "
+                "(anti-freeze cap)".format(BATCH_DECAL_MAX_TOTAL)
+            )
+
+    lines.insert(0, "Batch decal projection: {} decal(s) created".format(len(created)))
+    return created, lines
+
+
+def update_batch_decal_images(
+    decals: List[adsk.fusion.Decal], image_path: Path
+) -> Tuple[int, List[str]]:
+    """Swap ``imageFilename`` on every tracked decal. When per-decal grid
+    metadata exists in ``_TILE_METADATA``, each decal receives its own slice
+    of ``image_path`` so the tiles assemble into one continuous image.
+    """
+    lines: List[str] = []
+    if not image_path or not image_path.is_file():
+        lines.append("Decal update skipped: image not found ({})".format(image_path))
+        return 0, lines
+    base_target = _win_path(image_path)
+    n = 0
+    pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
+    # Cache slice paths so we only run PIL once per (iu, iv, nu, nv) — many
+    # decals share the same grid coords if a face yields the same cell across
+    # passes (defensive; usually each decal has a unique tuple).
+    slice_cache: dict = {}
+    for idx, d in enumerate(decals):
+        meta = _TILE_METADATA.get(id(d))
+        if (
+            BATCH_DECAL_TILE_SLICE_IMAGE
+            and meta is not None
+            and meta[2] * meta[3] > 1
+        ):
+            cache_key = meta
+            cached = slice_cache.get(cache_key)
+            if cached is None:
+                iu, iv, nu, nv = meta
+                sp = _slice_image_for_tile(image_path, iu, iv, nu, nv)
+                cached = _win_path(sp) if sp else base_target
+                slice_cache[cache_key] = cached
+            target = cached
+        else:
+            target = base_target
+        try:
+            d.imageFilename = target
+            n += 1
+        except Exception as ex:
+            try:
+                dn = d.name
+            except Exception:
+                dn = "?"
+            lines.append("  Decal '{}': imageFilename FAILED ({})".format(dn, ex))
+        if (idx + 1) % pump_every == 0:
+            try:
+                adsk.doEvents()
+            except Exception:
+                pass
+    lines.insert(0, "Batch decal update: {} / {} imageFilename swap(s)".format(n, len(decals)))
+    return n, lines
+
+
+def update_user_authored_decals(
+    design: adsk.fusion.Design,
+    image_path: Path,
+    exclude_decal_ids: Optional[set] = None,
+) -> Tuple[int, List[str]]:
+    """Swap ``imageFilename`` on every decal in the design that was NOT created
+    by this batch run.
+
+    Use case: when ``BODY_COVERAGE_VIA_DECALS`` is on this build, the auto-
+    created batch decals stay at Fusion's default ~5 cm size (the sizing API
+    is locked on some installs). If the user manually places one large decal
+    in Fusion's UI per body — sized by dragging handles, which always works —
+    those decals are persisted in the .f3d and we just update their image
+    per color set here.
+    """
+    lines: List[str] = []
+    if not image_path or not image_path.is_file():
+        lines.append("User-decal update skipped: image not found ({})".format(image_path))
+        return 0, lines
+    exclude = exclude_decal_ids or set()
+    target = _win_path(image_path)
+    decals = _collect_all_decals(design)
+    n = 0
+    user_count = 0
+    pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
+    for d in decals:
+        try:
+            if id(d) in exclude:
+                continue
+        except Exception:
+            pass
+        try:
+            d_name = d.name or ""
+        except Exception:
+            d_name = ""
+        # Also skip anything our pipeline already created — defensive against
+        # the exclude_ids set being stale (decals re-fetched between calls).
+        if d_name.startswith(BATCH_DECAL_NAME_PREFIX):
+            continue
+        user_count += 1
+        try:
+            d.imageFilename = target
+            n += 1
+            lines.append("  User decal '{}': image -> {}".format(d_name or "?", target))
+        except Exception as ex:
+            lines.append("  User decal '{}': FAILED ({})".format(d_name or "?", ex))
+        if user_count % pump_every == 0:
+            try:
+                adsk.doEvents()
+            except Exception:
+                pass
+    lines.insert(0, "User-authored decal update: {} / {} imageFilename swap(s)".format(n, user_count))
+    return n, lines
+
+
+def cleanup_batch_decals(decals: List[adsk.fusion.Decal]) -> int:
+    """Delete every tracked decal so the .f3d isn't polluted after a batch.
+
+    Also clears the per-tile slice metadata and removes the temp PNG slices
+    produced by ``_slice_image_for_tile`` so Resources/Texture doesn't fill
+    up with throwaway crops.
+    """
+    n = 0
+    for d in decals:
+        try:
+            d.deleteMe()
+            n += 1
+        except Exception:
+            pass
+    _TILE_METADATA.clear()
+    for p in _TILE_TEMP_PATHS:
+        _unlink_silent(p)
+    _TILE_TEMP_PATHS.clear()
+    return n
+
+
 def apply_decal_color_set(
     design: adsk.fusion.Design,
     slot1: Optional[Path],
@@ -798,15 +1781,57 @@ def broadcast_to_textured_appearances(
 
 
 def _appearance_has_texture_slot(appearance: adsk.fusion.Appearance) -> bool:
-    """True if the appearance exposes at least one AppearanceTexture property."""
+    """True if the appearance exposes at least one AppearanceTexture at any depth.
+
+    Walks ``AppearanceTextureProperty.value`` and nested property collections so
+    modern PBR appearances (which hide the texture one level down) are detected.
+    """
+    seen: Set[int] = set()
+
+    def walk(coll: Any, depth: int) -> bool:
+        if coll is None or depth > 28:
+            return False
+        try:
+            n = coll.count
+        except Exception:
+            return False
+        for i in range(n):
+            try:
+                p = coll.item(i)
+            except Exception:
+                continue
+            try:
+                k = id(p)
+                if k in seen:
+                    continue
+                seen.add(k)
+            except Exception:
+                pass
+            try:
+                if adsk.core.AppearanceTexture.cast(p):
+                    return True
+            except Exception:
+                pass
+            try:
+                tprop = adsk.core.AppearanceTextureProperty.cast(p)
+                if tprop is not None:
+                    inner = getattr(tprop, "value", None)
+                    if inner is not None:
+                        return True
+            except Exception:
+                pass
+            try:
+                child = getattr(p, "properties", None)
+                if child is not None and walk(child, depth + 1):
+                    return True
+            except Exception:
+                pass
+        return False
+
     try:
-        props = appearance.appearanceProperties
-        for i in range(props.count):
-            if adsk.core.AppearanceTexture.cast(props.item(i)):
-                return True
+        return walk(appearance.appearanceProperties, 0)
     except Exception:
-        pass
-    return False
+        return False
 
 
 def _walk_bodies(design: adsk.fusion.Design):
@@ -849,29 +1874,113 @@ def _try_changeTextureImage(
     return _apply_image_to_appearance_textures(appearance, image_path)
 
 
+# Autodesk procedural shader families (Wood / Stone / Metal / Concrete / etc.)
+# accept changeTextureImage on auxiliary slots (bump, finish noise, color-name
+# slots in the shader graph) without ever using a real raster diffuse — the
+# visible color is generated procedurally, so the bitmap is ignored at render
+# time. Skip them outright as carrier candidates.
+#
+# Substrings (lower-cased) — we substring-match rather than exact-match because
+# the Fusion library ships variants like "Steel - Satin", "Steel - Satin1",
+# "Steel - Striped", "Bamboo Light - Semigloss", " LCD (2000)" (note leading
+# space) etc., and the design often copies them with the same prefix.
+_PROCEDURAL_APPEARANCE_SUBSTRINGS: Tuple[str, ...] = (
+    # Wood / bamboo (procedural Wood shader)
+    "pine", "oak", "maple", "walnut", "cherry", "birch", "hickory",
+    "ash", "beech", "fir", "spruce", "teak", "mahogany", "bamboo",
+    # Stone family (procedural Stone shader)
+    "limestone", "lime stone", "granite", "marble", "sandstone",
+    "slate", "travertine", "quartz",
+    # Metal family (procedural Metal shader)
+    "steel", "iron", "aluminum", "aluminium", "copper", "brass",
+    "bronze", "chrome", "gold", "silver", "nickel", "titanium",
+    "zinc", "metal", "metallic",
+    # Concrete / masonry (procedural)
+    "concrete", "asphalt", "brick", "cinder",
+    # Paint / generic solid colors (no raster diffuse)
+    "paint", "foam",
+    # Display assets the model uses as lit screens, not as wrap textures
+    "lcd", "display - 4x20",
+    # Light source dummy
+    "light",
+)
+
+
+def _is_procedural_carrier_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return True  # unnamed appearance: don't risk it as carrier
+    return any(sub in n for sub in _PROCEDURAL_APPEARANCE_SUBSTRINGS)
+
+
+def _reset_carrier_to_neutral(
+    carrier: adsk.fusion.Appearance, lines: List[str]
+) -> None:
+    """Park the carrier on a throwaway PNG so the first real per-color-set swap
+    is seen as a genuine change.
+
+    Without this, ``_find_verified_in_design_carrier`` leaves the carrier
+    pointing at the very first color set's slot1 image. The batch loop then
+    re-applies that same path and ``changeTextureImage`` returns False because
+    nothing changed — surfacing as "Textures 0 for 1 color set(s)" in the
+    summary for whichever color set happens to be processed first.
+    """
+    probe = _write_carrier_probe_png()
+    if not probe:
+        return
+    try:
+        _apply_image_to_appearance_textures(carrier, probe)
+    except Exception as ex:
+        lines.append("Carrier neutral-reset failed: {}".format(ex))
+    finally:
+        _unlink_silent(probe)
+
+
+def _try_changeTextureImage_color(
+    appearance: adsk.fusion.Appearance, image_path: str
+) -> Tuple[int, int]:
+    """Returns ``(total_slots, color_slots)``. A carrier is only useful when
+    ``color_slots > 0`` — i.e. the swap landed in a base-color/diffuse/albedo
+    branch, not in bump/normal/roughness/etc.
+    """
+    return _apply_image_to_appearance_textures_detailed(appearance, image_path)
+
+
 def _find_verified_in_design_carrier(
     design: adsk.fusion.Design, test_image_win_path: str
 ) -> Optional[adsk.fusion.Appearance]:
-    """Return the first design appearance whose texture actually swaps.
+    """Return the first design appearance whose **visible color** actually swaps.
 
-    Note: a successful test leaves the appearance pointing at
-    ``test_image_win_path`` until the per-color-set update overwrites it,
-    which is the desired behaviour for the very first color set anyway.
+    Two-pass: prefer raster-friendly names that almost always carry a real
+    diffuse texture, then fall back to anything in the design that swaps a
+    color slot. Procedural species (Pine/Oak/…) are excluded entirely —
+    they accept changeTextureImage on bump but never change color.
     """
     apps = design.appearances
-    preferred = ("Pine", "Oak", "Maple", "Walnut", "Cherry", "Birch", "Hickory", "Wood")
-    by_name = {apps.item(i).name: apps.item(i) for i in range(apps.count)}
-    for name in preferred:
-        ap = by_name.get(name)
-        if ap is None:
-            continue
-        if _try_changeTextureImage(ap, test_image_win_path) > 0:
-            return ap
+    preferred = (
+        "Wood Flooring", "Hardwood", "Laminate", "Vinyl", "Carpet",
+        "Wall Paint", "Concrete", "Brick", "Stone", "Tile", "Marble",
+        "Plastic", "Fabric", "Leather", "Paper",
+    )
+
+    # Pass 1: name-prefix preference, color slot required.
     for i in range(apps.count):
         ap = apps.item(i)
-        if ap.name == CARRIER_APPEARANCE_NAME:
+        if ap.name == CARRIER_APPEARANCE_NAME or _is_procedural_carrier_name(ap.name):
             continue
-        if _try_changeTextureImage(ap, test_image_win_path) > 0:
+        if not any(p.lower() in (ap.name or "").lower() for p in preferred):
+            continue
+        _, color = _try_changeTextureImage_color(ap, test_image_win_path)
+        if color > 0:
+            return ap
+
+    # Pass 2: any non-procedural design appearance, color slot required.
+    for i in range(apps.count):
+        ap = apps.item(i)
+        if ap.name == CARRIER_APPEARANCE_NAME or _is_procedural_carrier_name(ap.name):
+            continue
+        _, color = _try_changeTextureImage_color(ap, test_image_win_path)
+        if color > 0:
             return ap
     return None
 
@@ -926,16 +2035,17 @@ def _verified_library_carrier(
         if carrier is None:
             continue
         tried += 1
+        n = 0
+        color = 0
         try:
-            n = _try_changeTextureImage(carrier, test_image_win_path)
+            n, color = _try_changeTextureImage_color(carrier, test_image_win_path)
         except Exception as ex:
-            n = 0
             last_error = str(ex)
-        if n > 0:
+        if color > 0:
             return carrier, (
-                "Carrier from library: {} (verified, {} slot; listed {} unique appearances, "
-                "{} addByCopy probes{})"
-            ).format(label, n, total_listed, tried, cap_suffix)
+                "Carrier from library: {} (verified COLOR slot, {} total / {} color; "
+                "listed {} unique appearances, {} addByCopy probes{})"
+            ).format(label, n, color, total_listed, tried, cap_suffix)
         try:
             carrier.deleteMe()
         except Exception:
@@ -980,6 +2090,31 @@ def _verified_library_carrier(
     return None, msg
 
 
+def _first_textured_design_appearance(
+    design: adsk.fusion.Design,
+) -> Optional[adsk.fusion.Appearance]:
+    """First design appearance that exposes a texture slot (property-only).
+
+    Wood species names are preferred (they almost always carry a real
+    diffuse bitmap), then any non-carrier appearance with a texture slot.
+    This is the cheap, build-independent fallback used whenever the
+    verified ``changeTextureImage`` probes are unavailable or exhausted.
+    """
+    apps = design.appearances
+    for name in ("Pine", "Oak", "Maple", "Walnut", "Cherry", "Birch", "Wood"):
+        for i in range(apps.count):
+            ap = apps.item(i)
+            if ap.name == name and _appearance_has_texture_slot(ap):
+                return ap
+    for i in range(apps.count):
+        ap = apps.item(i)
+        if ap.name == CARRIER_APPEARANCE_NAME:
+            continue
+        if _appearance_has_texture_slot(ap):
+            return ap
+    return None
+
+
 def get_or_create_carrier(
     design: adsk.fusion.Design,
     test_image: Optional[Path] = None,
@@ -998,16 +2133,18 @@ def get_or_create_carrier(
     existing = _existing_carrier(design)
     if existing is not None:
         if test_image is not None:
-            n = _try_changeTextureImage(existing, _win_path(test_image))
-            if n > 0:
+            n, color = _try_changeTextureImage_color(existing, _win_path(test_image))
+            if color > 0:
                 lines.append(
-                    "Carrier reused from previous run: '{}' (verified, {} slot)".format(
-                        existing.name, n
+                    "Carrier reused from previous run: '{}' (verified COLOR slot, {} total / {} color)".format(
+                        existing.name, n, color
                     )
                 )
                 return existing, lines
             lines.append(
-                "Existing carrier '{}' rejected texture; recreating".format(existing.name)
+                "Existing carrier '{}' had no color slot ({} non-color updates); recreating".format(
+                    existing.name, n
+                )
             )
             try:
                 existing.deleteMe()
@@ -1027,11 +2164,13 @@ def get_or_create_carrier(
                     in_design.name
                 )
             )
+            _reset_carrier_to_neutral(in_design, lines)
             return in_design, lines
 
         carrier, msg = _verified_library_carrier(design, test_path)
         lines.append(msg)
         if carrier is not None:
+            _reset_carrier_to_neutral(carrier, lines)
             return carrier, lines
 
         # Some Fusion builds reject JPG/WEBP on AppearanceTexture but still accept
@@ -1046,16 +2185,18 @@ def get_or_create_carrier(
                 carrier_png, msg_png = _verified_library_carrier(design, probe_png)
                 lines.append(msg_png)
                 if carrier_png is not None:
-                    n_user = _try_changeTextureImage(carrier_png, test_path)
-                    if n_user > 0:
+                    n_user, color_user = _try_changeTextureImage_color(carrier_png, test_path)
+                    if color_user > 0:
                         lines.append(
-                            "Carrier OK: PNG probe unlocked library copy; user color-set image applies ({} slot)".format(
-                                n_user
+                            "Carrier OK: PNG probe unlocked library copy; user image applies ({} total / {} color)".format(
+                                n_user, color_user
                             )
                         )
                         return carrier_png, lines
                     lines.append(
-                        "Carrier found via PNG probe but user color-set image still refused on that copy."
+                        "Carrier found via PNG probe but user image landed on no color slot ({} non-color updates)".format(
+                            n_user
+                        )
                     )
                     try:
                         carrier_png.deleteMe()
@@ -1064,23 +2205,48 @@ def get_or_create_carrier(
             finally:
                 _unlink_silent(probe_png)
 
+        # Verified discovery exhausted. Don't give up: the design clearly has
+        # at least one working textured appearance (the main body renders its
+        # texture), so reuse the same property-only scan as the no-image path.
+        # Returning None here is what previously left FORCE_BODY_COVERAGE on
+        # the per-name fallback, leaving solid appearances (e.g. the end-cap
+        # "Paint - Metallic (Black)") permanently un-textured.
+        fb = _first_textured_design_appearance(design)
+        if fb is not None:
+            lines.append(
+                "Carrier fallback: verified probes failed; reusing design "
+                "appearance with a texture slot: '{}'".format(fb.name)
+            )
+            _reset_carrier_to_neutral(fb, lines)
+            return fb, lines
+
         return None, lines
 
-    # No test image: cheap property-only fallback.
-    apps = design.appearances
-    for name in ("Pine", "Oak", "Maple", "Walnut", "Cherry", "Birch", "Wood"):
-        for i in range(apps.count):
-            ap = apps.item(i)
-            if ap.name == name and _appearance_has_texture_slot(ap):
-                lines.append("Carrier in design (untested): '{}'".format(ap.name))
-                return ap, lines
-    for i in range(apps.count):
-        ap = apps.item(i)
-        if ap.name == CARRIER_APPEARANCE_NAME:
-            continue
-        if _appearance_has_texture_slot(ap):
-            lines.append("Carrier in design (untested): '{}'".format(ap.name))
-            return ap, lines
+    # No test image: cheap property-only fallback first.
+    fb = _first_textured_design_appearance(design)
+    if fb is not None:
+        lines.append("Carrier in design (untested): '{}'".format(fb.name))
+        return fb, lines
+
+    # Final fallback: probe libraries with the built-in PNG so we still get a
+    # real addByCopy carrier even when the caller had no color-set image yet.
+    # Without this, FORCE_BODY_COVERAGE silently does nothing on templates
+    # whose design appearances don't expose AppearanceTexture in this build.
+    probe_png = _write_carrier_probe_png()
+    if probe_png:
+        try:
+            carrier_png, msg_png = _verified_library_carrier(design, probe_png)
+            lines.append(msg_png)
+            if carrier_png is not None:
+                lines.append(
+                    "Carrier created from library via built-in PNG probe (no test_image): '{}'".format(
+                        carrier_png.name
+                    )
+                )
+                return carrier_png, lines
+        finally:
+            _unlink_silent(probe_png)
+
     return None, lines + ["No carrier candidate found in design (no test_image provided)"]
 
 

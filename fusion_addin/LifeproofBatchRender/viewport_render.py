@@ -89,7 +89,9 @@ def tighten_view_after_fit(app: adsk.core.Application, extent_scale: float = 1.0
         if cam is None:
             return False
 
-        s = max(0.20, min(2.35, float(extent_scale)))
+        # Ceiling raised to 6.0 so a very long thin part can be zoomed far
+        # enough out to sit small and centered with generous margin.
+        s = max(0.20, min(6.0, float(extent_scale)))
 
         # Primary path: scale orthographic / parallel view extents.
         try:
@@ -156,9 +158,286 @@ def yaw_orbit_camera_about_world_y(app: adsk.core.Application, degrees: float) -
         return False
 
 
-def apply_named_view_framing(app: adsk.core.Application, view_name: str) -> None:
-    """Fit visible geometry, then tune zoom / yaw by view name for consistent exports."""
-    fit_view_to_model(app)
+# When True, the batch ignores the .f3d's saved named views entirely and
+# shoots every output from fixed, Fusion-standard 3/4 isometric angles.
+# This reliably reproduces the compact, centered "product still" look for
+# long thin parts (stair treads / noses) — the saved named views in these
+# templates are side/elevation angles that render a long part as a thin
+# diagonal streak. Set False to go back to honoring saved named views.
+FORCE_ISOMETRIC_VIEW: bool = True
+
+# When True, every image is a near-instant VIEWPORT screenshot — the
+# ray-traced ``Rendering.startLocalRender`` path is never used, regardless
+# of the dialog's render-backend selection. This is the anti-freeze switch:
+# ray tracing 9 images is what locked Fusion up. The viewport already shows
+# the applied decal texture, so captures are clean product stills with only
+# slightly flatter lighting (no ray-traced GI / soft shadows). Set False to
+# allow the dialog-selected ray-traced backend again.
+FORCE_VIEWPORT_CAPTURE: bool = True
+
+# Distinct standard angles rendered per color set when FORCE_ISOMETRIC_VIEW
+# is on. Each entry is ``(label, ViewOrientations-enum-name, yaw_degrees)``;
+# the label becomes the ``{named view}`` token in the output filename so
+# every angle is a separate file. ``yaw_degrees`` orbits the camera about
+# the world vertical AFTER the orientation is set, giving a distinct 3/4
+# angle without dropping to the edge-on bottom isometric. Add/remove entries
+# to control how many images per color set you get.
+ISO_VIEW_ORIENTATIONS = (
+    ("Iso Front-Right", "IsoTopRightViewOrientation", 0.0),
+    ("Iso Front-Left", "IsoTopLeftViewOrientation", 0.0),
+    ("Iso Front 3-4", "IsoTopRightViewOrientation", 28.0),
+)
+
+# Zoom factor when framing on the PART's own bounding box (see
+# frame_part_centered). It scales the bounding-SPHERE fit, and a long thin
+# moulding only occupies a thin diagonal slice of that sphere, so values
+# well below 1.0 are correct and safe (the thin cross-section never clips):
+#   1.0  = whole bounding sphere fits (part looks tiny — the old problem)
+#   0.90 = whole part sits centered with clear margin, never clipping edges
+#   lower = bigger (0.52 ran off the frame); raise toward 1.0 = smaller.
+ISO_VIEW_MARGIN_SCALE: float = 0.90
+
+
+def set_isometric_camera(
+    app: adsk.core.Application,
+    orientation_name: str = "IsoTopRightViewOrientation",
+    yaw_degrees: float = 0.0,
+) -> bool:
+    """Aim the active viewport at a Fusion standard isometric orientation.
+
+    Prefers the official ``Camera.viewOrientation`` enum (Fusion computes the
+    correct corner regardless of the model's up-axis). Falls back to a manual
+    Z-up (1, -1, 1) eye vector on builds where the enum assignment is rejected
+    (the fallback only approximates the top-right corner). When ``yaw_degrees``
+    is non-zero the camera is orbited about the world vertical afterwards, so
+    callers can get a distinct 3/4 angle without using the edge-on bottom iso.
+    """
+    try:
+        vp = app.activeViewport
+        cam = vp.camera
+        if cam is None:
+            return False
+    except Exception:
+        return False
+
+    # Primary: official orientation enum — build-stable, up-axis aware.
+    ok = False
+    try:
+        orient = getattr(
+            adsk.core.ViewOrientations,
+            orientation_name,
+            adsk.core.ViewOrientations.IsoTopRightViewOrientation,
+        )
+        cam.viewOrientation = orient
+        cam.isSmoothTransition = False
+        vp.camera = cam
+        vp.refresh()
+        pump_ui()
+        ok = True
+    except Exception:
+        ok = False
+
+    if ok:
+        if yaw_degrees:
+            # Orbit BEFORE the caller's fit so the rotated pose is what gets
+            # framed (fitting first then orbiting slides a long part off-frame).
+            yaw_orbit_camera_about_world_y(app, float(yaw_degrees))
+        return True
+
+    # Fallback: place the eye on the (1, -1, 1) corner, Z up.
+    try:
+        target = cam.target or adsk.core.Point3D.create(0.0, 0.0, 0.0)
+        eye = cam.eye
+        if eye and target:
+            dx = eye.x - target.x
+            dy = eye.y - target.y
+            dz = eye.z - target.z
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz) or 10.0
+        else:
+            dist = 10.0
+        n = math.sqrt(3.0)
+        cam.eye = adsk.core.Point3D.create(
+            target.x + dist / n,
+            target.y - dist / n,
+            target.z + dist / n,
+        )
+        cam.target = target
+        cam.upVector = adsk.core.Vector3D.create(0.0, 0.0, 1.0)
+        cam.isSmoothTransition = False
+        vp.camera = cam
+        vp.refresh()
+        pump_ui()
+        if yaw_degrees:
+            yaw_orbit_camera_about_world_y(app, float(yaw_degrees))
+        return True
+    except Exception:
+        return False
+
+
+def _visible_root_part_bbox(design):
+    """World-space bbox center + radius of the visible ROOT bodies (the part).
+
+    Lights / fixtures live in sub-occurrences ("Main Light:1"), not the root
+    component, so unioning only ``rootComponent`` bodies frames the actual
+    moulding and excludes the off-to-the-side light that was throwing
+    ``ViewFit`` off-centre. Returns ``(Point3D centre, float radius)`` or
+    ``None`` when nothing usable is found (caller falls back to ViewFit).
+    """
+    try:
+        bodies = design.rootComponent.bRepBodies
+        n = bodies.count
+    except Exception:
+        return None
+
+    have = False
+    xmin = ymin = zmin = 1e30
+    xmax = ymax = zmax = -1e30
+    for i in range(n):
+        try:
+            b = bodies.item(i)
+            if not b.isVisible:
+                continue
+            bb = b.boundingBox
+            if bb is None:
+                continue
+            mn, mx = bb.minPoint, bb.maxPoint
+        except Exception:
+            continue
+        xmin = min(xmin, mn.x); ymin = min(ymin, mn.y); zmin = min(zmin, mn.z)
+        xmax = max(xmax, mx.x); ymax = max(ymax, mx.y); zmax = max(zmax, mx.z)
+        have = True
+
+    if not have:
+        return None
+    cx = (xmin + xmax) / 2.0
+    cy = (ymin + ymax) / 2.0
+    cz = (zmin + zmax) / 2.0
+    radius = 0.5 * math.sqrt(
+        (xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2
+    )
+    if radius <= 0.0:
+        return None
+    return adsk.core.Point3D.create(cx, cy, cz), radius
+
+
+def frame_part_centered(
+    app: adsk.core.Application, design, pad: float = ISO_VIEW_MARGIN_SCALE
+) -> bool:
+    """Aim the camera dead-centre on the part's bbox at a controlled zoom.
+
+    Keeps the current view direction (set by the isometric orientation), so
+    only the target / distance / extents change. ``pad`` scales the
+    bounding-sphere fit: <1 zooms IN (bigger part — correct for thin
+    mouldings), 1 fits the whole sphere, >1 adds margin. Independent of any
+    off-to-the-side light geometry that ``ViewFit`` would otherwise include.
+    """
+    info = _visible_root_part_bbox(design)
+    if info is None:
+        return False
+    center, radius = info
+    # Guard only against zero/insane zoom; allow <1 so thin parts get big.
+    radius *= max(0.05, float(pad))
+    try:
+        vp = app.activeViewport
+        cam = vp.camera
+        if cam is None:
+            return False
+
+        eye = cam.eye
+        tgt = cam.target
+        dx, dy, dz = eye.x - tgt.x, eye.y - tgt.y, eye.z - tgt.z
+        dlen = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dlen <= 1e-9:
+            dx, dy, dz, dlen = 1.0, -1.0, 1.0, math.sqrt(3.0)
+        ux, uy, uz = dx / dlen, dy / dlen, dz / dlen
+
+        # Perspective: distance so a sphere of `radius` fills the FOV.
+        try:
+            fov = float(cam.perspectiveAngle)
+        except Exception:
+            fov = 0.0
+        if fov <= 0.0:
+            fov = 0.61  # ~35° fallback
+        distance = radius / math.tan(fov / 2.0)
+
+        cam.target = center
+        cam.eye = adsk.core.Point3D.create(
+            center.x + ux * distance,
+            center.y + uy * distance,
+            center.z + uz * distance,
+        )
+        # Orthographic / parallel cameras ignore distance — set the extent.
+        try:
+            cam.viewExtents = 2.0 * radius
+        except Exception:
+            pass
+        cam.isSmoothTransition = False
+        vp.camera = cam
+        vp.refresh()
+        pump_ui()
+        return True
+    except Exception:
+        return False
+
+
+def apply_isometric_view_framing(
+    app: adsk.core.Application,
+    design,
+    orientation_name: str = "IsoTopRightViewOrientation",
+    yaw_degrees: float = 0.0,
+    pad: float = ISO_VIEW_MARGIN_SCALE,
+) -> None:
+    """Force a 3/4 isometric (optionally yawed), centred tightly on the part.
+
+    Frames on the part's own bounding box so the moulding sits dead-centre;
+    falls back to ViewFit + zoom-out only if the bbox can't be computed.
+    """
+    set_isometric_camera(app, orientation_name, yaw_degrees)
+    if not frame_part_centered(app, design, pad):
+        fit_view_to_model(app)
+        tighten_view_after_fit(app, 2.4)
+
+
+_ISO_TOKENS = (
+    "iso",
+    "isometric",
+    "corner",
+    "oblique",
+    "perspective",
+    "hero",
+    "showcase",
+)
+_AXIS_TOKENS = frozenset(("close", "front", "back"))
+
+
+def apply_named_view_framing(
+    app: adsk.core.Application,
+    view_name: str,
+    *,
+    preserve_orientation: bool = False,
+) -> None:
+    """Frame the model for export.
+
+    ``preserve_orientation=True`` means the caller activated a **human-authored
+    named view** from the ``.f3d``. The designer already chose a good camera
+    angle (the look the client signed off on), so we must NOT yaw-orbit or
+    re-aim it — doing that rotated good 3/4 angles into a near-edge-on line.
+    We only re-fit (which keeps the authored eye direction / up vector and just
+    adjusts distance + target so nothing is clipped and the part is centered)
+    and add a small even margin.
+
+    ``preserve_orientation=False`` is the fallback "Viewport" capture: there is
+    no authored camera, so name-token heuristics pick a yaw + margin. Order
+    matters there — the yaw must happen **before** the fit, otherwise a long
+    thin part gets swung diagonally off-frame after the fit already framed the
+    old angle.
+    """
+    if preserve_orientation:
+        # Trust the authored named-view camera. Just recenter + light margin.
+        fit_view_to_model(app)
+        tighten_view_after_fit(app, 1.08)
+        return
+
     vn = (view_name or "").lower()
     # Whole tokens only — avoids matching ``feedback``, ``backdrop``, etc.
     words = set(re.findall(r"[a-z0-9]+", vn))
@@ -170,52 +449,36 @@ def apply_named_view_framing(app: adsk.core.Application, view_name: str) -> None
             return max(b, _BALANCED_MARGIN_MIN_SCALE)
         return b
 
-    # Close / detail shots: modest zoom-in (still leaves some air vs old ultra-tight crops).
+    # 1. Decide the orientation tweak + zoom margin from the view name.
     if "close" in words:
-        tighten_view_after_fit(app, _margin_scale(0.82))
-        return
-
-    # Rear angles on long thin parts read as a “line”; yaw slightly off-axis.
-    if "back" in words and "front" not in words:
+        # Close / detail shots: modest zoom-in (still leaves some air).
+        scale = _margin_scale(0.82)
+    elif "back" in words and "front" not in words:
+        # Rear angles on long thin parts read as a “line”; yaw slightly off-axis.
         yaw_orbit_camera_about_world_y(app, 18.0)
-        tighten_view_after_fit(app, _margin_scale(1.36))
-        return
-
-    # Front-style hero shots — even corner space like manual / isometric references.
-    if "front" in words and "back" not in words:
-        tighten_view_after_fit(app, _margin_scale(1.36))
-        return
-
-    # True top/bottom captures — keep yaw (edge-on L / channel reads as a line if we orbit).
-    if {"top", "bottom"}.intersection(words):
-        tighten_view_after_fit(app, _margin_scale(1.28))
-        return
-
-    if {"trimetric"}.intersection(words):
-        tighten_view_after_fit(app, _margin_scale(1.28))
-        return
-
-    _iso_tokens = (
-        "iso",
-        "isometric",
-        "corner",
-        "oblique",
-        "perspective",
-        "hero",
-        "showcase",
-    )
-    axis_tokens = frozenset(("close", "front", "back"))
-    if any(t in words for t in _iso_tokens):
+        scale = _margin_scale(1.36)
+    elif "front" in words and "back" not in words:
+        # Front-style hero shots — even corner space like isometric references.
+        scale = _margin_scale(1.36)
+    elif {"top", "bottom"}.intersection(words):
+        # True top/bottom captures — keep yaw (edge-on L reads as a line if we orbit).
+        scale = _margin_scale(1.28)
+    elif {"trimetric"}.intersection(words):
+        scale = _margin_scale(1.28)
+    elif any(t in words for t in _ISO_TOKENS):
         yaw_orbit_camera_about_world_y(app, 14.0)
-        tighten_view_after_fit(app, _margin_scale(1.30))
-        return
+        scale = _margin_scale(1.30)
+    else:
+        if _AXIS_TOKENS.isdisjoint(words):
+            # Default / single “Viewport” captures: gentle ¾ orbit matches many
+            # product stills (L-profiles read as slabs when shot edge-on).
+            yaw_orbit_camera_about_world_y(app, 11.0)
+        scale = _margin_scale(1.32)
 
-    if axis_tokens.isdisjoint(words):
-        # Default / single “Viewport” captures: gentle ¾ orbit matches many product stills
-        # (e.g. structural angles and L‑profiles that read as slabs when shot edge-on).
-        yaw_orbit_camera_about_world_y(app, 11.0)
-
-    tighten_view_after_fit(app, _margin_scale(1.32))
+    # 2. Fit AFTER the yaw so the (now final) camera direction frames the whole
+    #    model centered. 3. Pull back for even margin without losing centering.
+    fit_view_to_model(app)
+    tighten_view_after_fit(app, scale)
 
 
 def prepare_clean_render_view(app: adsk.core.Application) -> None:
@@ -325,7 +588,7 @@ def save_fusion_local_render(
     width: int,
     height: int,
     *,
-    render_quality: int = 90,
+    render_quality: int = 60,
     timeout_sec: float = 1800.0,
     poll_sec: float = 0.25,
 ) -> bool:
@@ -333,6 +596,12 @@ def save_fusion_local_render(
 
     Uses the active viewport camera. Requires ``design.renderManager``; returns False if the
     API is unavailable or the render fails/timeouts (caller may fall back to ``save_viewport_image``).
+
+    ``render_quality`` is the Fusion Render-quality slider (25 draft … 100
+    final). Ray-trace time scales steeply with it; 60 is the speed/quality
+    sweet spot for these matte product stills (≈half the time of 90 with no
+    visible difference on a textured part against a plain backdrop). Raise
+    toward 90 only if you need print-grade output and can wait.
     """
     path = filepath
     low = path.lower()

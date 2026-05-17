@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import adsk.core
 import adsk.fusion
@@ -63,9 +63,19 @@ def _save_local_image(
 
     Fusion ``Rendering.startLocalRender`` is the default local path; viewport capture is only
     used when that backend is explicitly selected, or as fallback after Fusion fails.
+
+    ``FORCE_VIEWPORT_CAPTURE`` (viewport_render) hard-overrides this: when True
+    we ALWAYS use the near-instant viewport screenshot and never trigger a
+    ray-traced local render, regardless of the dialog's backend selection.
+    This is what keeps Fusion from freezing on 9-image batches.
     """
     path = str(out_path.resolve())
-    viewport_only = (render_backend or "").strip() == uip.RENDER_BACKEND_LOCAL_VIEWPORT
+    force_viewport = bool(
+        getattr(viewport_render, "FORCE_VIEWPORT_CAPTURE", False)
+    )
+    viewport_only = force_viewport or (
+        (render_backend or "").strip() == uip.RENDER_BACKEND_LOCAL_VIEWPORT
+    )
     if not viewport_only:
         if viewport_render.save_fusion_local_render(design, app, path, render_width, render_height):
             return True, "fusion"
@@ -207,6 +217,30 @@ def execute_batch(
                 )
             )
 
+        # Forced standard 3/4 isometric: ignore the .f3d's saved named-view
+        # angles (they render long thin treads as a diagonal streak) and shoot
+        # several distinct, compact, centered isometric angles per color set.
+        force_iso = bool(getattr(viewport_render, "FORCE_ISOMETRIC_VIEW", False))
+        iso_label_to_cam: dict = {}
+        if force_iso:
+            iso_orients = list(getattr(viewport_render, "ISO_VIEW_ORIENTATIONS", ()))
+            if not iso_orients:
+                iso_orients = [("Isometric", "IsoTopRightViewOrientation", 0.0)]
+            # Each entry is (label, orientation_name, yaw_degrees).
+            iso_label_to_cam = {
+                row[0]: (row[1], float(row[2]) if len(row) > 2 else 0.0)
+                for row in iso_orients
+            }
+            view_tasks = [(None, row[0]) for row in iso_orients]
+            summary_lines.append(
+                "  Camera: forced standard 3/4 isometric — {} angle(s) per "
+                "color set ({} saved named view(s) ignored): {}".format(
+                    len(view_tasks),
+                    n_named_views_in_design,
+                    ", ".join(row[0] for row in iso_orients),
+                )
+            )
+
         an, dn = texture_pipeline.list_appearance_and_decal_names(design)
         summary_lines.append(
             "Template targets - Appearances ({}): {} | Decals ({}): {}".format(
@@ -225,7 +259,29 @@ def execute_batch(
 
         carrier: Optional[adsk.fusion.Appearance] = None
         body_appearance_snap: list = []
-        if texture_pipeline.FORCE_BODY_COVERAGE:
+        batch_decals: List[Any] = []
+        use_decal_coverage = (
+            texture_pipeline.FORCE_BODY_COVERAGE
+            and texture_pipeline.BODY_COVERAGE_VIA_DECALS
+        )
+
+        if use_decal_coverage:
+            first_image = None
+            for cs in color_sets:
+                if cs.slot1:
+                    first_image = cs.slot1
+                    break
+            if first_image is None:
+                summary_lines.append(
+                    "  Decal projection skipped: no color-set image available"
+                )
+            else:
+                batch_decals, decal_lines = texture_pipeline.create_batch_decals_for_all_bodies(
+                    design, first_image
+                )
+                for line in decal_lines:
+                    summary_lines.append("  " + line)
+        elif texture_pipeline.FORCE_BODY_COVERAGE:
             summary_lines.append("  Pre-batch appearance audit:")
             for line in texture_pipeline.audit_design_appearances(design):
                 summary_lines.append("    " + line)
@@ -257,9 +313,29 @@ def execute_batch(
                 for line in texture_pipeline.audit_design_appearances(design):
                     summary_lines.append("    " + line)
             else:
+                # No carrier means this Fusion build exposes no usable
+                # appearance texture slots (every addByCopy probe failed), so
+                # the per-name appearance match can't texture solid materials
+                # like the end-cap "Paint - Metallic (Black)". Decals are the
+                # only mechanism that works here — auto-fall back to projecting
+                # batch tile decals onto every face so coverage is complete.
                 summary_lines.append(
-                    "  Carrier setup: NONE found - falling back to per-name appearance match"
+                    "  Carrier setup: NONE found - auto-falling back to "
+                    "batch-decal coverage (build has no texture slots)"
                 )
+                fb_image = test_image
+                if fb_image is None:
+                    summary_lines.append(
+                        "  Decal fallback skipped: no color-set image available"
+                    )
+                else:
+                    batch_decals, decal_lines = (
+                        texture_pipeline.create_batch_decals_for_all_bodies(
+                            design, fb_image
+                        )
+                    )
+                    for line in decal_lines:
+                        summary_lines.append("  " + line)
 
         zero_texture_color_sets: List[str] = []
 
@@ -271,9 +347,34 @@ def execute_batch(
             bump_progress("Textures: {} / {}".format(model_stem, cs.folder.name))
 
             s1, s2 = image_mapper.effective_texture_slots(design, mode, cs.slot1, cs.slot2)
-            n_tex, tex_lines = texture_pipeline.apply_color_set_for_open_design(
-                mode, s1, s2, carrier=carrier
-            )
+            n_tex = 0
+            tex_lines: List[str] = []
+            if batch_decals:
+                decal_image = s1 or cs.slot1
+                n_tex, dec_lines = texture_pipeline.update_batch_decal_images(
+                    batch_decals, decal_image
+                )
+                tex_lines.extend(dec_lines)
+                # Optionally also swap imageFilename on user-authored decals
+                # in the .f3d. Disabled by default — every extra decal write
+                # triggers a Fusion re-projection that grows the freeze
+                # window, and with the batch tile coverage we usually don't
+                # need them. Toggle UPDATE_USER_AUTHORED_DECALS in
+                # texture_pipeline.py to re-enable.
+                if texture_pipeline.UPDATE_USER_AUTHORED_DECALS:
+                    try:
+                        batch_ids = set(id(d) for d in batch_decals)
+                    except Exception:
+                        batch_ids = set()
+                    n_user, user_lines = texture_pipeline.update_user_authored_decals(
+                        design, decal_image, batch_ids
+                    )
+                    n_tex += n_user
+                    tex_lines.extend(user_lines)
+            else:
+                n_tex, tex_lines = texture_pipeline.apply_color_set_for_open_design(
+                    mode, s1, s2, carrier=carrier
+                )
             if n_tex == 0:
                 zero_texture_color_sets.append(cs.folder.name)
             else:
@@ -293,9 +394,18 @@ def execute_batch(
                 if texture_pipeline.APPLY_NAMED_VIEW_VISIBILITY:
                     visibility_apply.apply_visibility_for_named_view(root, view_name)
                 visibility_apply.apply_batch_render_geometry_hides(root, batch_hide_tokens)
-                if nv is not None:
+                if force_iso:
+                    _orient, _yaw = iso_label_to_cam.get(
+                        view_name, ("IsoTopRightViewOrientation", 0.0)
+                    )
+                    viewport_render.apply_isometric_view_framing(
+                        app, design, _orient, _yaw
+                    )
+                elif nv is not None:
                     viewport_render.activate_named_view(app, nv)
-                    viewport_render.apply_named_view_framing(app, view_name)
+                    viewport_render.apply_named_view_framing(
+                        app, view_name, preserve_orientation=True
+                    )
                 else:
                     try:
                         app.activeViewport.refresh()
@@ -307,8 +417,17 @@ def execute_batch(
                 viewport_render.pump_ui()
                 # Reframe once helpers/lights are off — otherwise ViewFit bounds still
                 # include proxy solids hidden after the first fit (wrong crop vs manual hide).
-                if nv is not None:
-                    viewport_render.apply_named_view_framing(app, view_name)
+                if force_iso:
+                    _orient, _yaw = iso_label_to_cam.get(
+                        view_name, ("IsoTopRightViewOrientation", 0.0)
+                    )
+                    viewport_render.apply_isometric_view_framing(
+                        app, design, _orient, _yaw
+                    )
+                elif nv is not None:
+                    viewport_render.apply_named_view_framing(
+                        app, view_name, preserve_orientation=True
+                    )
                 else:
                     viewport_render.apply_named_view_framing(app, view_name or "Viewport")
                 viewport_render.pump_ui()
@@ -399,6 +518,12 @@ def execute_batch(
                 viewport_render.pump_ui()
 
         visibility_apply.restore_visibility(occ_snap, body_snap, mesh_snap, decal_snap)
+
+        if batch_decals:
+            n_removed = texture_pipeline.cleanup_batch_decals(batch_decals)
+            summary_lines.append(
+                "  Decal teardown: {} batch decal(s) removed".format(n_removed)
+            )
 
         if body_appearance_snap and texture_pipeline.RESTORE_BODY_APPEARANCES_ON_FINISH:
             n_restored = texture_pipeline.restore_body_appearances(body_appearance_snap)

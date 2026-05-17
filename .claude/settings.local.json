@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path 'D:\\\\Projects\\\\Python\\\\Fusion360\\\\Project\\\\Fusion360Model' -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)"
+    ]
+  }
+}
