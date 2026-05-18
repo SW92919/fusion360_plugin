@@ -193,9 +193,9 @@ ISO_VIEW_ORIENTATIONS = (
 # moulding only occupies a thin diagonal slice of that sphere, so values
 # well below 1.0 are correct and safe (the thin cross-section never clips):
 #   1.0  = whole bounding sphere fits (part looks tiny — the old problem)
-#   0.90 = whole part sits centered with clear margin, never clipping edges
-#   lower = bigger (0.52 ran off the frame); raise toward 1.0 = smaller.
-ISO_VIEW_MARGIN_SCALE: float = 0.90
+#   1.05 = part sits a bit smaller, comfortably centered with even margin
+#   lower = bigger (0.52 ran off the frame); higher = smaller.
+ISO_VIEW_MARGIN_SCALE: float = 1.05
 
 
 def set_isometric_camera(
@@ -274,38 +274,90 @@ def set_isometric_camera(
         return False
 
 
+# Occurrence name fragments that must NOT drive framing: studio/scene
+# lights and Render-workspace helper proxies. Mirrors the batch-hide rules
+# so the camera frames the product, not an off-to-the-side light.
+_FRAME_SKIP_OCC_SUBSTRINGS = (
+    "light",
+    "uv plane",
+    "uv_plane",
+    "uv reference",
+    "uv map",
+    "backdrop",
+    "render proxy",
+    "light rig",
+    "light proxy",
+)
+
+
+def _frame_entity_visible(entity) -> bool:
+    """Best-effort 'shown in the document' (isVisible, then isLightBulbOn)."""
+    for attr in ("isVisible", "isLightBulbOn"):
+        try:
+            v = getattr(entity, attr)
+        except Exception:
+            continue
+        if v is None:
+            continue
+        return bool(v)
+    return True
+
+
 def _visible_root_part_bbox(design):
-    """World-space bbox center + radius of the visible ROOT bodies (the part).
+    """World-space bbox center + radius of the visible PRODUCT geometry.
 
-    Lights / fixtures live in sub-occurrences ("Main Light:1"), not the root
-    component, so unioning only ``rootComponent`` bodies frames the actual
-    moulding and excludes the off-to-the-side light that was throwing
-    ``ViewFit`` off-centre. Returns ``(Point3D centre, float radius)`` or
-    ``None`` when nothing usable is found (caller falls back to ViewFit).
+    Unions the visible root-component bodies AND every visible, non-light
+    sub-occurrence (the Bullnose's plank / nose / foam all live in
+    occurrences, so a root-only bbox was empty → the camera fell back to
+    ViewFit, which included the hidden treads + light and shoved the part
+    off-centre). Hidden occurrences (alternate treads/risers the designer
+    turned off) and light / helper proxies are excluded so the frame is
+    centred on exactly what gets rendered. Returns ``(Point3D, radius)`` or
+    ``None`` (caller falls back to ViewFit).
     """
-    try:
-        bodies = design.rootComponent.bRepBodies
-        n = bodies.count
-    except Exception:
-        return None
-
     have = False
     xmin = ymin = zmin = 1e30
     xmax = ymax = zmax = -1e30
-    for i in range(n):
-        try:
-            b = bodies.item(i)
-            if not b.isVisible:
-                continue
-            bb = b.boundingBox
-            if bb is None:
-                continue
-            mn, mx = bb.minPoint, bb.maxPoint
-        except Exception:
-            continue
+
+    def _union(bb):
+        nonlocal have, xmin, ymin, zmin, xmax, ymax, zmax
+        if bb is None:
+            return
+        mn, mx = bb.minPoint, bb.maxPoint
         xmin = min(xmin, mn.x); ymin = min(ymin, mn.y); zmin = min(zmin, mn.z)
         xmax = max(xmax, mx.x); ymax = max(ymax, mx.y); zmax = max(zmax, mx.z)
         have = True
+
+    # Root-component bodies (single-body mouldings live here).
+    try:
+        bodies = design.rootComponent.bRepBodies
+        for i in range(bodies.count):
+            try:
+                b = bodies.item(i)
+                if not _frame_entity_visible(b):
+                    continue
+                _union(b.boundingBox)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Visible product sub-occurrences (assemblies like the Bullnose).
+    try:
+        occs = design.rootComponent.allOccurrences
+        for i in range(occs.count):
+            try:
+                occ = occs.item(i)
+                nm = (occ.name or "").lower()
+                if any(s in nm for s in _FRAME_SKIP_OCC_SUBSTRINGS):
+                    continue
+                if not _frame_entity_visible(occ):
+                    continue
+                _union(occ.boundingBox)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     if not have:
         return None
