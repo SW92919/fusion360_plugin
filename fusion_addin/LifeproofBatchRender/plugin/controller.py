@@ -217,24 +217,56 @@ def execute_batch(
                 )
             )
 
-        # Forced standard 3/4 isometric: ignore the .f3d's saved named-view
-        # angles (they render long thin treads as a diagonal streak) and shoot
-        # several distinct, compact, centered isometric angles per color set.
-        force_iso = bool(getattr(viewport_render, "FORCE_ISOMETRIC_VIEW", False))
+        # View source: PREFER the .f3d's own saved named views (the designer's
+        # exact "Nose Front"/"Nose Rear" product cameras the client signed off
+        # on). Only fall back to computed low-angle 3/4 hero shots when the
+        # model has NO saved named views. Honoring the saved views is fully
+        # automatic — the plugin reads them from the file, nothing manual.
+        prefer_named = bool(getattr(viewport_render, "PREFER_SAVED_NAMED_VIEWS", True))
+        have_named_views = n_named_views_in_design > 0
+        use_saved_named_views = prefer_named and have_named_views
+        force_iso = (not use_saved_named_views) and bool(
+            getattr(viewport_render, "FORCE_ISOMETRIC_VIEW", False)
+        )
         iso_label_to_cam: dict = {}
+        if use_saved_named_views:
+            # Drop working/draft views (iso, top, bottom, macro). Keep close-up
+            # and full-length hero views — multi-part models need both.
+            _is_deliverable = getattr(viewport_render, "is_deliverable_view_name", None)
+            if callable(_is_deliverable):
+                kept = [(nv, name) for (nv, name) in view_tasks if _is_deliverable(name)]
+                dropped = [name for (nv, name) in view_tasks if not _is_deliverable(name)]
+                if kept:
+                    view_tasks = kept
+                    if dropped:
+                        summary_lines.append(
+                            "  Saved views filtered — dropped working views: {}".format(
+                                ", ".join(dropped)
+                            )
+                        )
+            summary_lines.append(
+                "  Camera: honoring {} saved named view(s) from the file "
+                "(designer's product cameras): {}".format(
+                    len(view_tasks),
+                    ", ".join(str(vn_name) for _nv, vn_name in view_tasks),
+                )
+            )
         if force_iso:
             iso_orients = list(getattr(viewport_render, "ISO_VIEW_ORIENTATIONS", ()))
             if not iso_orients:
-                iso_orients = [("Isometric", "IsoTopRightViewOrientation", 0.0)]
-            # Each entry is (label, orientation_name, yaw_degrees).
+                iso_orients = [("Front 3-4", 30.0, 20.0)]
+            # Each entry is (label, azimuth_degrees, elevation_degrees).
             iso_label_to_cam = {
-                row[0]: (row[1], float(row[2]) if len(row) > 2 else 0.0)
+                row[0]: (
+                    float(row[1]) if len(row) > 1 else 30.0,
+                    float(row[2]) if len(row) > 2 else 20.0,
+                )
                 for row in iso_orients
             }
             view_tasks = [(None, row[0]) for row in iso_orients]
             summary_lines.append(
-                "  Camera: forced standard 3/4 isometric — {} angle(s) per "
-                "color set ({} saved named view(s) ignored): {}".format(
+                "  Camera: forced low product-hero angles — {} per color set "
+                "({} saved named view(s) ignored): {}".format(
                     len(view_tasks),
                     n_named_views_in_design,
                     ", ".join(row[0] for row in iso_orients),
@@ -329,6 +361,19 @@ def execute_batch(
                         "  Decal fallback skipped: no color-set image available"
                     )
                 else:
+                    # Neutralize dark/reflective body appearances BEFORE decals
+                    # project, so any decal gap shows matte grey instead of a
+                    # black-metallic or shiny-steel stripe. Snapshot is
+                    # restored at end-of-batch via body_appearance_snap.
+                    # getattr-guarded so a texture_pipeline version that lacks
+                    # this helper degrades gracefully instead of hard-crashing.
+                    _neutralize = getattr(
+                        texture_pipeline, "neutralize_dark_body_appearances", None
+                    )
+                    if callable(_neutralize):
+                        body_appearance_snap, neut_lines = _neutralize(design)
+                        for line in neut_lines:
+                            summary_lines.append("  " + line)
                     batch_decals, decal_lines = (
                         texture_pipeline.create_batch_decals_for_all_bodies(
                             design, fb_image
@@ -395,16 +440,14 @@ def execute_batch(
                     visibility_apply.apply_visibility_for_named_view(root, view_name)
                 visibility_apply.apply_batch_render_geometry_hides(root, batch_hide_tokens)
                 if force_iso:
-                    _orient, _yaw = iso_label_to_cam.get(
-                        view_name, ("IsoTopRightViewOrientation", 0.0)
-                    )
+                    _az, _el = iso_label_to_cam.get(view_name, (30.0, 20.0))
                     viewport_render.apply_isometric_view_framing(
-                        app, design, _orient, _yaw
+                        app, design, _az, _el
                     )
                 elif nv is not None:
                     viewport_render.activate_named_view(app, nv)
                     viewport_render.apply_named_view_framing(
-                        app, view_name, preserve_orientation=True
+                        app, view_name, preserve_orientation=True, design=design
                     )
                 else:
                     try:
@@ -418,15 +461,17 @@ def execute_batch(
                 # Reframe once helpers/lights are off — otherwise ViewFit bounds still
                 # include proxy solids hidden after the first fit (wrong crop vs manual hide).
                 if force_iso:
-                    _orient, _yaw = iso_label_to_cam.get(
-                        view_name, ("IsoTopRightViewOrientation", 0.0)
-                    )
+                    _az, _el = iso_label_to_cam.get(view_name, (30.0, 20.0))
                     viewport_render.apply_isometric_view_framing(
-                        app, design, _orient, _yaw
+                        app, design, _az, _el
                     )
                 elif nv is not None:
+                    # Re-apply the designer's exact saved camera right before
+                    # capture so the visibility toggling above can't nudge the
+                    # composition (PRESERVE_NAMED_VIEW_COMPOSITION trusts it 1:1).
+                    viewport_render.activate_named_view(app, nv)
                     viewport_render.apply_named_view_framing(
-                        app, view_name, preserve_orientation=True
+                        app, view_name, preserve_orientation=True, design=design
                     )
                 else:
                     viewport_render.apply_named_view_framing(app, view_name or "Viewport")

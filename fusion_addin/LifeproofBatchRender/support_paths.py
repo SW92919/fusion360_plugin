@@ -40,6 +40,23 @@ def _ignored_texture_stem(stem: str) -> bool:
     return bool(re.search(r"(?<!un)flipped(?![a-z])", sl))
 
 
+def _is_batch_output_stem(stem: str) -> bool:
+    """True for PNG/JPG renders this add-in writes into color folders."""
+    s = (stem or "").strip()
+    if re.search(r" \(v\d+\)$", s):
+        return True
+    # Output basename: {model} - {image} - {view} — at least two " - " separators.
+    return s.count(" - ") >= 2
+
+
+def _is_slot1_stem(stem_lower: str) -> bool:
+    return stem_lower.endswith("_1") or stem_lower.endswith("-1")
+
+
+def _is_slot2_stem(stem_lower: str) -> bool:
+    return stem_lower.endswith("_2") or stem_lower.endswith("-2")
+
+
 def purge_ignored_texture_sidecars(folder: Path) -> List[str]:
     if not DELETE_FLIPPED_TEXTURE_SIDECARS or not folder.is_dir():
         return []
@@ -57,15 +74,21 @@ def purge_ignored_texture_sidecars(folder: Path) -> List[str]:
 
 def find_slot_images(folder: Path) -> Tuple[Optional[Path], Optional[Path]]:
     rasters = sorted(
-        [p for p in folder.iterdir() if _is_raster(p) and not _ignored_texture_stem(p.stem)],
+        [
+            p
+            for p in folder.iterdir()
+            if _is_raster(p)
+            and not _ignored_texture_stem(p.stem)
+            and not _is_batch_output_stem(p.stem)
+        ],
         key=lambda x: x.name.lower(),
     )
     slot1 = slot2 = None
     for p in rasters:
         stem_lower = p.stem.lower()
-        if stem_lower.endswith("_1"):
+        if _is_slot1_stem(stem_lower):
             slot1 = p
-        elif stem_lower.endswith("_2"):
+        elif _is_slot2_stem(stem_lower):
             slot2 = p
     if not slot1 and rasters:
         slot1 = rasters[0]

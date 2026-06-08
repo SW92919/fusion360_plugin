@@ -41,6 +41,20 @@ def list_named_views(design: adsk.fusion.Design) -> List[adsk.fusion.NamedView]:
     return out
 
 
+def is_deliverable_view_name(name: str) -> bool:
+    """True if a saved named view should be exported.
+
+    Exports every designer-authored named view except obvious working/draft
+    angles (iso, top, bottom, macro). Close-up / detail / zoom views are
+    kept — multi-part models (e.g. End Cap + track bar) need them alongside
+    full-length hero shots.
+    """
+    n = (name or "").lower()
+    if any(tok in n for tok in EXCLUDE_VIEW_NAME_TOKENS):
+        return False
+    return True
+
+
 def fit_view_to_model(app: adsk.core.Application) -> bool:
     """Re-frame the active viewport so the whole visible design fits.
 
@@ -158,13 +172,86 @@ def yaw_orbit_camera_about_world_y(app: adsk.core.Application, degrees: float) -
         return False
 
 
-# When True, the batch ignores the .f3d's saved named views entirely and
-# shoots every output from fixed, Fusion-standard 3/4 isometric angles.
-# This reliably reproduces the compact, centered "product still" look for
-# long thin parts (stair treads / noses) — the saved named views in these
-# templates are side/elevation angles that render a long part as a thin
-# diagonal streak. Set False to go back to honoring saved named views.
+def pitch_camera_toward_horizontal(
+    app: adsk.core.Application, degrees: float
+) -> bool:
+    """Tilt the camera up/down around its horizontal right-axis through the
+    target, WITHOUT changing the azimuth (the 3/4 spin around vertical).
+
+    ``degrees`` > 0 lowers the eye toward the horizon → a low product-
+    photography angle that shows the part's side profile / bullnose curve
+    (the client's hero look). < 0 raises it back toward straight-down.
+    Uses Rodrigues rotation around the (viewDir × up) axis so it works for
+    any model up-axis. If the result tilts the wrong way, negate ``degrees``.
+    """
+    try:
+        vp = app.activeViewport
+        cam = vp.camera
+        if cam is None:
+            return False
+        eye, target, up = cam.eye, cam.target, cam.upVector
+        if not (eye and target and up):
+            return False
+        # View offset (target -> eye) and the camera's horizontal right axis.
+        dx, dy, dz = eye.x - target.x, eye.y - target.y, eye.z - target.z
+        kx = dy * up.z - dz * up.y
+        ky = dz * up.x - dx * up.z
+        kz = dx * up.y - dy * up.x
+        kmag = math.sqrt(kx * kx + ky * ky + kz * kz)
+        if kmag < 1e-9:
+            return False
+        kx, ky, kz = kx / kmag, ky / kmag, kz / kmag
+
+        ang = math.radians(degrees)
+        c, s = math.cos(ang), math.sin(ang)
+
+        def _rodrigues(vx, vy, vz):
+            dot = vx * kx + vy * ky + vz * kz
+            cxx = ky * vz - kz * vy
+            cxy = kz * vx - kx * vz
+            cxz = kx * vy - ky * vx
+            return (
+                vx * c + cxx * s + kx * dot * (1.0 - c),
+                vy * c + cxy * s + ky * dot * (1.0 - c),
+                vz * c + cxz * s + kz * dot * (1.0 - c),
+            )
+
+        nx, ny, nz = _rodrigues(dx, dy, dz)
+        ux, uy, uz = _rodrigues(up.x, up.y, up.z)
+        cam.eye = adsk.core.Point3D.create(
+            target.x + nx, target.y + ny, target.z + nz
+        )
+        cam.upVector = adsk.core.Vector3D.create(ux, uy, uz)
+        cam.isSmoothTransition = False
+        vp.camera = cam
+        vp.refresh()
+        pump_ui()
+        return True
+    except Exception:
+        return False
+
+
+# When True, prefer the .f3d's own SAVED NAMED VIEWS over any computed angle.
+# For the deliverable templates the designer baked the exact product cameras
+# into the file (named "Nose Front" / "Nose Rear", etc.) — they ARE the
+# cameras the client's reference renders were made from, so reproducing them
+# by hand from azimuth/elevation guesses is error-prone and never matches.
+# This is fully automatic: the plugin reads the views stored in the file; the
+# client does nothing manual. When a model has NO saved named views, the
+# batch falls back to the computed iso hero angles below.
+PREFER_SAVED_NAMED_VIEWS: bool = True
+
+# Fallback-only now: computed product-hero angles are used when a model has no
+# usable saved named views (see PREFER_SAVED_NAMED_VIEWS). Left True so that
+# view-less models still get a nice low 3/4 hero shot instead of a flat
+# default viewport grab.
 FORCE_ISOMETRIC_VIEW: bool = True
+
+# When honoring saved named views we export every view in the .f3d except
+# obvious working/draft angles listed here. Close-up / detail / zoom views
+# are product deliverables for assemblies like End Cap + track bar.
+# Cap count via the dialog's "Max named views" or by reordering views in Fusion.
+EXCLUDE_VIEW_NAME_TOKENS = ("macro", "iso", "top", "bottom")
 
 # When True, every image is a near-instant VIEWPORT screenshot — the
 # ray-traced ``Rendering.startLocalRender`` path is never used, regardless
@@ -175,17 +262,38 @@ FORCE_ISOMETRIC_VIEW: bool = True
 # allow the dialog-selected ray-traced backend again.
 FORCE_VIEWPORT_CAPTURE: bool = True
 
-# Distinct standard angles rendered per color set when FORCE_ISOMETRIC_VIEW
-# is on. Each entry is ``(label, ViewOrientations-enum-name, yaw_degrees)``;
-# the label becomes the ``{named view}`` token in the output filename so
-# every angle is a separate file. ``yaw_degrees`` orbits the camera about
-# the world vertical AFTER the orientation is set, giving a distinct 3/4
-# angle without dropping to the edge-on bottom isometric. Add/remove entries
-# to control how many images per color set you get.
+# Distinct product-hero angles rendered per color set when
+# FORCE_ISOMETRIC_VIEW is on. Each entry is
+# ``(label, azimuth_degrees, elevation_degrees)`` for set_product_hero_camera:
+#   * azimuth  = rotation around the part's UP axis. 0 = straight at the
+#     front (length runs flat across the frame); +/- swings to a 3/4 from
+#     the right / left. Sign flips which end of the nose faces the camera —
+#     if the bullnose faces away, negate the azimuths (or add/subtract 180).
+#   * elevation = height above the ground plane. ~18-22° = the client's low
+#     hero look showing the rounded nose profile; 90 = straight top-down.
+# The label becomes the ``{named view}`` token in the output filename.
+# Client deliverable = TWO views: the bullnose from the FRONT (convex nose
+# toward camera) and from the REAR (looking across the tread toward the
+# nose, showing the underside curl). They sit on opposite sides of the
+# part's depth axis → azimuths ~180° apart, same low elevation. The labels
+# become the filename suffix, matching the client's "... - Nose Front.png"
+# / "... - Nose Rear.png" pattern.
+#   * If Front/Rear look swapped, swap the two azimuths (or +/- 180).
+#   * If a view shows the heel end instead of the nose, nudge that azimuth.
+# FINAL 2-VIEW DELIVERABLE (exactly two output files per model):
+#   Nose Front = (35, 22) — locked, matches the client sample: camera ABOVE
+#     (+elevation) looking down at the top surface + convex nose.
+#   Nose Rear  = (35, -18) — SAME azimuth as the front (so the nose end stays
+#     on the LEFT, matching the client pair), but elevation goes NEGATIVE so
+#     the camera drops BELOW the part and looks UP into the open underside
+#     hollow / return. A 180° azimuth swing was wrong: it flipped the nose to
+#     the right AND, at +elevation, still showed the top instead of the
+#     hollow. The underside only reveals at negative elevation.
+#   * Rear not deep enough into the hollow? Make the -18 more negative.
+#   * Rear shows too much underside / too little top? Raise toward 0.
 ISO_VIEW_ORIENTATIONS = (
-    ("Iso Front-Right", "IsoTopRightViewOrientation", 0.0),
-    ("Iso Front-Left", "IsoTopLeftViewOrientation", 0.0),
-    ("Iso Front 3-4", "IsoTopRightViewOrientation", 28.0),
+    ("Nose Front", 35.0, 22.0),
+    ("Nose Rear", 35.0, -18.0),
 )
 
 # Zoom factor when framing on the PART's own bounding box (see
@@ -193,9 +301,34 @@ ISO_VIEW_ORIENTATIONS = (
 # moulding only occupies a thin diagonal slice of that sphere, so values
 # well below 1.0 are correct and safe (the thin cross-section never clips):
 #   1.0  = whole bounding sphere fits (part looks tiny — the old problem)
-#   1.05 = part sits a bit smaller, comfortably centered with even margin
-#   lower = bigger (0.52 ran off the frame); higher = smaller.
-ISO_VIEW_MARGIN_SCALE: float = 1.05
+#   0.55 = part fills ~80% of the frame, matching the client's sample
+#   lower = bigger (0.40 ran off the edges); higher = smaller (1.05 was tiny).
+ISO_VIEW_MARGIN_SCALE: float = 0.55
+
+# Zoom factor for the SAVED-NAMED-VIEW path (apply_named_view_framing). Same
+# meaning as ISO_VIEW_MARGIN_SCALE: it keeps the designer's exact view angle
+# and only sizes the part in frame. <1 = bigger (fills more). The client's
+# Nose Front/Rear fill ~85% of the frame, so 0.62 enlarges the part to match.
+# Raise toward 1.0 for more margin; lower for a tighter crop.
+NAMED_VIEW_MARGIN_SCALE: float = 0.62
+
+# When True, a saved named view is reproduced EXACTLY as the designer framed
+# it — full camera (eye + target + zoom), no re-centering. The client's
+# reference renders were made from these very views, so re-centering on the
+# part's bbox would drag the designer's deliberate composition back to dead-
+# center (e.g. it pulled the "Full Back" view down-left instead of leaving the
+# nose up-and-right like the sample). NAMED_VIEW_MARGIN_SCALE is then ignored
+# for these views. Set False to fall back to angle-preserving re-centering
+# (used only if a saved view frames the part badly / clips it).
+PRESERVE_NAMED_VIEW_COMPOSITION: bool = True
+
+# Degrees to LOWER the camera from Fusion's steep ~35° isometric toward a
+# low product-photography angle (the client's hero shots sit ~18-20° above
+# horizontal, showing the rounded bullnose profile instead of a flat top-
+# down view). Applied after the orientation + yaw, before the fit.
+#   ~16 brings 35° iso down to ~19°.  0 = keep the standard steep iso.
+#   If a render tilts the WRONG way (camera goes more overhead), negate this.
+ISO_VIEW_PITCH_DOWN_DEGREES: float = 16.0
 
 
 def set_isometric_camera(
@@ -303,17 +436,11 @@ def _frame_entity_visible(entity) -> bool:
     return True
 
 
-def _visible_root_part_bbox(design):
-    """World-space bbox center + radius of the visible PRODUCT geometry.
-
-    Unions the visible root-component bodies AND every visible, non-light
-    sub-occurrence (the Bullnose's plank / nose / foam all live in
-    occurrences, so a root-only bbox was empty → the camera fell back to
-    ViewFit, which included the hidden treads + light and shoved the part
-    off-centre). Hidden occurrences (alternate treads/risers the designer
-    turned off) and light / helper proxies are excluded so the frame is
-    centred on exactly what gets rendered. Returns ``(Point3D, radius)`` or
-    ``None`` (caller falls back to ViewFit).
+def _visible_part_bounds(design):
+    """World AABB of the visible PRODUCT geometry as ``(xmin, ymin, zmin,
+    xmax, ymax, zmax)`` or ``None``. Unions visible root bodies + visible,
+    non-light sub-occurrences (excludes hidden alternate treads/risers and
+    light/helper proxies) — the exact set that gets rendered.
     """
     have = False
     xmin = ymin = zmin = 1e30
@@ -328,7 +455,6 @@ def _visible_root_part_bbox(design):
         xmax = max(xmax, mx.x); ymax = max(ymax, mx.y); zmax = max(zmax, mx.z)
         have = True
 
-    # Root-component bodies (single-body mouldings live here).
     try:
         bodies = design.rootComponent.bRepBodies
         for i in range(bodies.count):
@@ -342,7 +468,6 @@ def _visible_root_part_bbox(design):
     except Exception:
         pass
 
-    # Visible product sub-occurrences (assemblies like the Bullnose).
     try:
         occs = design.rootComponent.allOccurrences
         for i in range(occs.count):
@@ -353,19 +478,140 @@ def _visible_root_part_bbox(design):
                     continue
                 if not _frame_entity_visible(occ):
                     continue
-                _union(occ.boundingBox)
             except Exception:
                 continue
+            # Union the occurrence's BODY bounding boxes (proxy bodies are in
+            # world/assembly space). Occurrence.boundingBox is unreliable on
+            # this build (returns nothing), which made the whole bounds empty
+            # for occurrence-based assemblies like the Bullnose → the camera
+            # fell back to ViewFit-with-light and rendered off-centre.
+            try:
+                obodies = occ.bRepBodies
+            except Exception:
+                obodies = None
+            if obodies is not None:
+                for bi in range(obodies.count):
+                    try:
+                        ob = obodies.item(bi)
+                        if not _frame_entity_visible(ob):
+                            continue
+                        _union(ob.boundingBox)
+                    except Exception:
+                        continue
+            # Fall back to occ.boundingBox if bodies gave nothing.
+            try:
+                if not have:
+                    _union(occ.boundingBox)
+            except Exception:
+                pass
+
     except Exception:
         pass
 
     if not have:
         return None
-    cx = (xmin + xmax) / 2.0
-    cy = (ymin + ymax) / 2.0
-    cz = (zmin + zmax) / 2.0
+    return (xmin, ymin, zmin, xmax, ymax, zmax)
+
+
+def set_product_hero_camera(
+    app: adsk.core.Application,
+    design,
+    elevation_deg: float = 20.0,
+    azimuth_deg: float = 30.0,
+) -> bool:
+    """Aim a low product-photography camera built from the part's own axes.
+
+    Identifies the part's thickness (smallest bbox extent → "up"), length
+    (largest) and width (middle → "front") directions, then places the eye
+    at ``elevation_deg`` above the ground plane and ``azimuth_deg`` rotated
+    from straight-on-the-front toward the length. This reproduces the
+    client's hero composition (part lying roughly flat/horizontal, low angle
+    showing the rounded nose profile) regardless of how the model's axes are
+    oriented. ``frame_part_centered`` should be called afterwards to set the
+    distance / zoom. Returns False if no visible geometry is found.
+    """
+    bounds = _visible_part_bounds(design)
+    if bounds is None:
+        return False
+    xmn, ymn, zmn, xmx, ymx, zmx = bounds
+    center = adsk.core.Point3D.create(
+        (xmn + xmx) / 2.0, (ymn + ymx) / 2.0, (zmn + zmx) / 2.0
+    )
+    exts = [
+        (xmx - xmn, (1.0, 0.0, 0.0)),
+        (ymx - ymn, (0.0, 1.0, 0.0)),
+        (zmx - zmn, (0.0, 0.0, 1.0)),
+    ]
+    exts.sort(key=lambda t: t[0])
+    up_v = exts[0][1]      # thinnest extent → up (part lies flat on this)
+    front_v = exts[1][1]   # middle extent → width, faces the camera
+    long_v = exts[2][1]    # largest extent → length, runs across the frame
+
+    e = math.radians(elevation_deg)
+    a = math.radians(azimuth_deg)
+    ce, se, ca, sa = math.cos(e), math.sin(e), math.cos(a), math.sin(a)
+
+    # Horizontal look-from direction: front blended toward length by azimuth.
+    hx = ca * front_v[0] + sa * long_v[0]
+    hy = ca * front_v[1] + sa * long_v[1]
+    hz = ca * front_v[2] + sa * long_v[2]
+    # Eye direction (target → eye): horizontal lifted toward up by elevation.
+    ex = ce * hx + se * up_v[0]
+    ey = ce * hy + se * up_v[1]
+    ez = ce * hz + se * up_v[2]
+    em = math.sqrt(ex * ex + ey * ey + ez * ez)
+    if em < 1e-9:
+        return False
+    ex, ey, ez = ex / em, ey / em, ez / em
+
+    diag = math.sqrt(
+        (xmx - xmn) ** 2 + (ymx - ymn) ** 2 + (zmx - zmn) ** 2
+    ) or 10.0
+
+    # Up vector = thickness axis projected perpendicular to the view dir.
+    dot = up_v[0] * ex + up_v[1] * ey + up_v[2] * ez
+    ux, uy, uz = up_v[0] - dot * ex, up_v[1] - dot * ey, up_v[2] - dot * ez
+    um = math.sqrt(ux * ux + uy * uy + uz * uz)
+    if um < 1e-9:
+        ux, uy, uz = 0.0, 0.0, 1.0
+    else:
+        ux, uy, uz = ux / um, uy / um, uz / um
+
+    try:
+        vp = app.activeViewport
+        cam = vp.camera
+        if cam is None:
+            return False
+        cam.target = center
+        cam.eye = adsk.core.Point3D.create(
+            center.x + ex * diag * 2.0,
+            center.y + ey * diag * 2.0,
+            center.z + ez * diag * 2.0,
+        )
+        cam.upVector = adsk.core.Vector3D.create(ux, uy, uz)
+        cam.isSmoothTransition = False
+        vp.camera = cam
+        vp.refresh()
+        pump_ui()
+        return True
+    except Exception:
+        return False
+
+
+def _visible_root_part_bbox(design):
+    """World-space bbox center + radius of the visible PRODUCT geometry,
+    derived from ``_visible_part_bounds``. Returns ``(Point3D, radius)`` or
+    ``None`` (caller falls back to ViewFit).
+    """
+    bounds = _visible_part_bounds(design)
+    if bounds is None:
+        return None
+    xmn, ymn, zmn, xmx, ymx, zmx = bounds
+    cx = (xmn + xmx) / 2.0
+    cy = (ymn + ymx) / 2.0
+    cz = (zmn + zmx) / 2.0
     radius = 0.5 * math.sqrt(
-        (xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2
+        (xmx - xmn) ** 2 + (ymx - ymn) ** 2 + (zmx - zmn) ** 2
     )
     if radius <= 0.0:
         return None
@@ -435,16 +681,25 @@ def frame_part_centered(
 def apply_isometric_view_framing(
     app: adsk.core.Application,
     design,
-    orientation_name: str = "IsoTopRightViewOrientation",
-    yaw_degrees: float = 0.0,
+    azimuth_degrees: float = 30.0,
+    elevation_degrees: float = 20.0,
     pad: float = ISO_VIEW_MARGIN_SCALE,
 ) -> None:
-    """Force a 3/4 isometric (optionally yawed), centred tightly on the part.
+    """Aim a low product-hero camera (built from the part's own axes) and
+    frame it tightly centred on the part.
 
-    Frames on the part's own bounding box so the moulding sits dead-centre;
-    falls back to ViewFit + zoom-out only if the bbox can't be computed.
+    Replaces the old fixed-iso-corner + yaw + pitch approach, which was
+    anchored to the model's arbitrary axis orientation and rendered the part
+    corner-to-corner. ``set_product_hero_camera`` instead derives the part's
+    length / width / thickness and places a controllable low-angle 3/4 shot
+    matching the client's reference. Falls back to a standard iso + ViewFit
+    only if the part's bounds can't be computed.
     """
-    set_isometric_camera(app, orientation_name, yaw_degrees)
+    if set_product_hero_camera(app, design, elevation_degrees, azimuth_degrees):
+        frame_part_centered(app, design, pad)
+        return
+    # Fallback: no usable bounds — old steep iso so we still produce an image.
+    set_isometric_camera(app, "IsoTopRightViewOrientation", 0.0)
     if not frame_part_centered(app, design, pad):
         fit_view_to_model(app)
         tighten_view_after_fit(app, 2.4)
@@ -467,6 +722,7 @@ def apply_named_view_framing(
     view_name: str,
     *,
     preserve_orientation: bool = False,
+    design=None,
 ) -> None:
     """Frame the model for export.
 
@@ -485,9 +741,29 @@ def apply_named_view_framing(
     old angle.
     """
     if preserve_orientation:
-        # Trust the authored named-view camera. Just recenter + light margin.
+        # Trust the authored named-view camera. The caller already applied the
+        # designer's exact camera via activate_named_view.
+        if PRESERVE_NAMED_VIEW_COMPOSITION:
+            # Reproduce the saved view EXACTLY — eye, target AND zoom — so the
+            # designer's deliberate composition (e.g. the rear's nose framed
+            # up-and-right) is preserved. Re-centering here is what pulled it
+            # back to dead-center. Just refresh; do not touch the camera.
+            try:
+                app.activeViewport.refresh()
+            except Exception:
+                pass
+            pump_ui()
+            return
+        # Legacy fallback: keep the authored view direction/up but recenter +
+        # size onto the visible part. frame_part_centered excludes the
+        # light/helpers (ViewFit would include them and shove the part
+        # off-centre); fall back to a light ViewFit if bounds are missing.
+        if design is not None and frame_part_centered(
+            app, design, NAMED_VIEW_MARGIN_SCALE
+        ):
+            return
         fit_view_to_model(app)
-        tighten_view_after_fit(app, 1.08)
+        tighten_view_after_fit(app, NAMED_VIEW_MARGIN_SCALE)
         return
 
     vn = (view_name or "").lower()

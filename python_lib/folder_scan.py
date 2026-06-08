@@ -31,21 +31,44 @@ def _ignored_texture_stem(stem: str) -> bool:
     return bool(re.search(r"(?<!un)flipped(?![a-z])", sl))
 
 
+def _is_batch_output_stem(stem: str) -> bool:
+    """True for PNG/JPG renders this add-in writes into color folders."""
+    s = (stem or "").strip()
+    if re.search(r" \(v\d+\)$", s):
+        return True
+    return s.count(" - ") >= 2
+
+
+def _is_slot1_stem(stem_lower: str) -> bool:
+    return stem_lower.endswith("_1") or stem_lower.endswith("-1")
+
+
+def _is_slot2_stem(stem_lower: str) -> bool:
+    return stem_lower.endswith("_2") or stem_lower.endswith("-2")
+
+
 def find_slot_images(folder: Path) -> tuple[Path | None, Path | None]:
     """
-    Find *_1.* and *_2.* (case-insensitive stem ending with _1 or _2).
-    Fallback: first / last raster if slots missing.
+    Find slot-1 / slot-2 rasters (``*_1``, ``*-1``, ``*_2``, ``*-2`` stems).
+    Ignores batch-render outputs and flipped sidecars. Fallback: first / last
+    raster if slots missing.
     """
     rasters = sorted(
-        [p for p in folder.iterdir() if _is_raster(p) and not _ignored_texture_stem(p.stem)],
+        [
+            p
+            for p in folder.iterdir()
+            if _is_raster(p)
+            and not _ignored_texture_stem(p.stem)
+            and not _is_batch_output_stem(p.stem)
+        ],
         key=lambda x: x.name.lower(),
     )
     slot1 = slot2 = None
     for p in rasters:
         stem_lower = p.stem.lower()
-        if stem_lower.endswith("_1"):
+        if _is_slot1_stem(stem_lower):
             slot1 = p
-        elif stem_lower.endswith("_2"):
+        elif _is_slot2_stem(stem_lower):
             slot2 = p
     if not slot1 and rasters:
         slot1 = rasters[0]

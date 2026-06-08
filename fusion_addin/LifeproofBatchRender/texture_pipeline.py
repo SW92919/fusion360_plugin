@@ -140,38 +140,61 @@ DECAL_OVERSIZE_FACTOR: float = 20.0
 BATCH_DECAL_TILE: bool = True
 
 # Grid step in cm for tiling. Each decal is a ~5 cm patch; with image
-# slicing OFF every tile shows the full swatch. 5 cm makes cells the same
-# size as the patch → contiguous coverage with no bare slivers (6+ cm left
-# the plank only partially covered, reading as a strip). Smaller = denser.
-BATCH_DECAL_TILE_STEP_CM: float = 5.0
+# slicing OFF every tile shows the full swatch. 4 cm is denser than 5 cm and
+# reduces bare slivers on curved/trimmed faces (square nose, wear layer).
+BATCH_DECAL_TILE_STEP_CM: float = 4.0
 
 # Hard cap on tile decals per single face. A large plank/tread show face
-# needs a full grid (a ~120 × 15 cm face is ~24 × 3 = ~72 patches at 5 cm)
+# needs a full grid (a ~120 × 15 cm face is ~30 × 4 = ~120 patches at 4 cm)
 # or it only partially covers. Set high enough for full single-face cover.
-BATCH_DECAL_MAX_TILES_PER_FACE: int = 80
+BATCH_DECAL_MAX_TILES_PER_FACE: int = 120
 
 # Hard cap on total batch decals across the WHOLE model — the anti-freeze
 # safety valve (each decal = 1 create + N color-set swaps + 1 teardown, all
 # synchronous re-projections). This is THE speed↔coverage knob:
 #   * lower (e.g. 80)  → faster, but long parts may show bare gaps;
-#   * higher (e.g. 160)→ fuller coverage, slower (can freeze on weak PCs).
-# 320 + GLOBAL largest-face-first + visible-only filtering: enough to FULLY
-# cover the visible show faces of a multi-body assembly at the 5 cm step
-# (each big plank/tread/nose face wants ~70-80 patches). Ray tracing is OFF
-# (instant viewport capture) so decals are the only load; ~320 stays
-# workable (UI is pumped) — it's slower than before but gives full coverage.
-# Lower if decal create/teardown bogs the UI; raise if gaps remain.
-BATCH_DECAL_MAX_TOTAL: int = 320
+#   * higher (e.g. 800)→ fuller coverage, slower (can freeze on weak PCs).
+# 500 + largest-face-first + gap-fill retries: better automatic coverage on
+# unknown client models without per-.f3d appearance prep.
+BATCH_DECAL_MAX_TOTAL: int = 500
+
+# When a tile placement fails (off-face), try alternate on-surface anchors
+# before counting a skip. Helps curved noses and chamfered tread edges.
+BATCH_DECAL_CREATE_RETRIES: int = 5
+
+# After the main tile grid on a face, place extra single decals at unused
+# anchor points when any tile failed — fills holes without manual model prep.
+BATCH_DECAL_GAP_FILL_ON_FAIL: bool = True
+BATCH_DECAL_GAP_FILL_MAX_PER_FACE: int = 12
 
 # Faces smaller than this (cm² of bounding-box area) are skipped entirely —
 # they are slivers/fillets that are not meaningfully visible and only burn
 # the decal budget.
 BATCH_DECAL_MIN_FACE_AREA_CM2: float = 1.5
 
+# Skip faces whose normal points clearly downward — the render camera is a
+# top angle, so plank/foam-pad/nose UNDERSIDES are never seen. Decaling them
+# wastes budget that should fill the visible top (which was showing light
+# patches where its decals ran out). Threshold = z component of the unit
+# normal: -1 straight down, 0 horizontal, +1 up. -0.25 keeps top + sides +
+# forward-curving nose, drops only clearly-downward faces.
+BATCH_DECAL_SKIP_DOWN_FACING: bool = True
+BATCH_DECAL_DOWN_FACE_THRESHOLD: float = -0.25
+
 # Faces whose longest side is <= this (cm) get exactly ONE decal instead of
 # a grid: a single ~5 cm patch already covers them (end caps, short returns),
 # so gridding them just wastes the budget and freezes the UI.
 BATCH_DECAL_SINGLE_DECAL_MAX_CM: float = 7.0
+
+# Skip strongly curved faces (e.g. the rounded nose-front return). Decals
+# project flat, so tiling a tight curve smears the image into streaks. With
+# this on, such faces get NO decals and the wood-tone neutral shows there
+# instead — a clean undertone reads far better than smeared texture. The
+# threshold is the max angle (degrees) the face normal may swing across the
+# face before it's treated as "too curved"; higher = more tolerant (fewer
+# faces skipped). 55° keeps gentle chamfers textured, drops tight rounds.
+BATCH_DECAL_SKIP_CURVED_FACES: bool = False
+BATCH_DECAL_CURVED_FACE_MAX_DEG: float = 55.0
 
 # When True, each tile decal shows only its own (iu, iv) cell of the source
 # image, so the tiles on a face reassemble into ONE big copy of the swatch.
@@ -900,6 +923,92 @@ def _face_area(face: adsk.fusion.BRepFace) -> float:
         return 0.0
 
 
+def _face_up_score(face: adsk.fusion.BRepFace) -> float:
+    """Z component of the face's unit normal at its center: +1 up, 0 sideways,
+    -1 down. Used to skip undersides the top camera can't see. Returns 0.0
+    (neutral, not skipped) when the normal can't be computed.
+    """
+    try:
+        ev = face.evaluator
+        if ev is None:
+            return 0.0
+        ok, prange = ev.parametricRange()
+        if not ok or prange is None:
+            return 0.0
+        u = (prange.minPoint.x + prange.maxPoint.x) / 2.0
+        v = (prange.minPoint.y + prange.maxPoint.y) / 2.0
+        ok2, n = ev.getNormalAtParameter(adsk.core.Point2D.create(u, v))
+        if not ok2 or n is None:
+            return 0.0
+        mag = math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z)
+        if mag <= 1e-9:
+            return 0.0
+        return n.z / mag
+    except Exception:
+        return 0.0
+
+
+def _face_curvature_spread_deg(face: adsk.fusion.BRepFace) -> float:
+    """Max angle (degrees) the surface normal swings across the face.
+
+    Planar faces return ~0. Tightly rounded faces (the nose-front return)
+    return a large angle. Decals project flat, so a high spread means tiling
+    the face will smear the image — callers skip such faces and let the
+    neutral backdrop show instead. Returns 0.0 when it can't be computed
+    (treated as flat / safe to texture).
+    """
+    try:
+        if isinstance(face.geometry, adsk.core.Plane):
+            return 0.0
+    except Exception:
+        pass
+    try:
+        ev = face.evaluator
+        if ev is None:
+            return 0.0
+        ok, prange = ev.parametricRange()
+        if not ok or prange is None:
+            return 0.0
+        u0, u1 = prange.minPoint.x, prange.maxPoint.x
+        v0, v1 = prange.minPoint.y, prange.maxPoint.y
+        if u1 <= u0 or v1 <= v0:
+            return 0.0
+        normals = []
+        for fu in (0.1, 0.5, 0.9):
+            for fv in (0.1, 0.5, 0.9):
+                u = u0 + fu * (u1 - u0)
+                v = v0 + fv * (v1 - v0)
+                p2 = adsk.core.Point2D.create(u, v)
+                try:
+                    on = ev.isParameterOnFace(p2)
+                except Exception:
+                    on = True
+                if not on:
+                    continue
+                ok2, n = ev.getNormalAtParameter(p2)
+                if not ok2 or n is None:
+                    continue
+                mag = math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z)
+                if mag <= 1e-9:
+                    continue
+                normals.append((n.x / mag, n.y / mag, n.z / mag))
+        max_deg = 0.0
+        for i in range(len(normals)):
+            for j in range(i + 1, len(normals)):
+                dot = (
+                    normals[i][0] * normals[j][0]
+                    + normals[i][1] * normals[j][1]
+                    + normals[i][2] * normals[j][2]
+                )
+                dot = max(-1.0, min(1.0, dot))
+                deg = math.degrees(math.acos(dot))
+                if deg > max_deg:
+                    max_deg = deg
+        return max_deg
+    except Exception:
+        return 0.0
+
+
 def _largest_planar_face(body: adsk.fusion.BRepBody) -> Optional[adsk.fusion.BRepFace]:
     """Pick the largest planar face. Falls back to the largest face overall if
     no planar face exists (some bodies are entirely cylindrical / spline)."""
@@ -1032,7 +1141,8 @@ def _tile_points_on_planar_face(
                     else:
                         pz += off
                 pt = adsk.core.Point3D.create(px, py, pz)
-                result.append((pt, iu, iv, nu, nv))
+                if _is_point_on_face_surface(face, pt):
+                    result.append((pt, iu, iv, nu, nv))
     except Exception:
         pass
     return result
@@ -1123,6 +1233,87 @@ def _tile_points_on_face_uv(
     return result
 
 
+def _point_key(p: adsk.core.Point3D) -> Tuple[float, float, float]:
+    return (round(p.x, 4), round(p.y, 4), round(p.z, 4))
+
+
+def _is_point_on_face_surface(
+    face: adsk.fusion.BRepFace,
+    pt: adsk.core.Point3D,
+    tol_cm: float = 0.08,
+) -> bool:
+    """True when ``pt`` lies on (or very near) the face surface."""
+    try:
+        ev = face.evaluator
+        if ev is None:
+            return True
+        ok, closest, dist = ev.getClosestPoint(pt)
+        if ok and dist is not None:
+            return float(dist) <= float(tol_cm)
+    except Exception:
+        pass
+    return True
+
+
+def _collect_decal_anchor_points(
+    face: adsk.fusion.BRepFace,
+    primary: Optional[adsk.core.Point3D] = None,
+    *,
+    step_cm: Optional[float] = None,
+    max_points: int = 24,
+) -> List[adsk.core.Point3D]:
+    """Ordered on-surface anchors for decal placement / gap-fill retries."""
+    step = max(float(step_cm or BATCH_DECAL_TILE_STEP_CM), 1.0)
+    seen: set = set()
+    out: List[adsk.core.Point3D] = []
+
+    def _add(pt: Optional[adsk.core.Point3D]) -> None:
+        if pt is None or len(out) >= max_points:
+            return
+        key = _point_key(pt)
+        if key in seen:
+            return
+        if not _is_point_on_face_surface(face, pt):
+            return
+        seen.add(key)
+        out.append(pt)
+
+    _add(primary)
+    _add(_on_face_point(face))
+
+    for tile in _tile_points_on_face_uv(face, step):
+        _add(tile[0])
+    for tile in _tile_points_on_planar_face(face, step):
+        _add(tile[0])
+
+    # Finer UV corners / centres for curved or trimmed faces.
+    try:
+        ev = face.evaluator
+        if ev is not None:
+            ok, prange = ev.parametricRange()
+            if ok and prange is not None:
+                u0, u1 = prange.minPoint.x, prange.maxPoint.x
+                v0, v1 = prange.minPoint.y, prange.maxPoint.y
+                if u1 > u0 and v1 > v0:
+                    for fu in (0.2, 0.35, 0.5, 0.65, 0.8):
+                        for fv in (0.2, 0.35, 0.5, 0.65, 0.8):
+                            u = u0 + fu * (u1 - u0)
+                            v = v0 + fv * (v1 - v0)
+                            p2 = adsk.core.Point2D.create(u, v)
+                            try:
+                                on = ev.isParameterOnFace(p2)
+                            except Exception:
+                                on = True
+                            if not on:
+                                continue
+                            ok2, p3 = ev.getPointAtParameter(p2)
+                            if ok2 and p3 is not None:
+                                _add(p3)
+    except Exception:
+        pass
+    return out
+
+
 def _on_face_point(face: adsk.fusion.BRepFace) -> Optional[adsk.core.Point3D]:
     """Return a Point3D guaranteed to lie on the face surface.
 
@@ -1179,39 +1370,51 @@ def _create_decal_on_face(
     (used by tiling to spread decals across the face). Otherwise we pick the
     face's natural centre point.
     """
-    center = center_override if center_override is not None else _on_face_point(face)
-    if center is None:
+    retries = max(1, int(BATCH_DECAL_CREATE_RETRIES))
+    anchors = _collect_decal_anchor_points(
+        face,
+        center_override,
+        max_points=max(retries, 8),
+    )
+    if not anchors:
         return None, "no on-face point"
 
-    # MINIMAL fast path: createInput + add + name. Nothing else.
-    #
-    # Earlier iterations tried width/height/scaleX/Y/scaleFactor/xDirection
-    # setattr on both DecalCreateInput AND Decal, plus a transform-matrix
-    # get+set as a "last resort". On this Fusion build NONE of those took
-    # effect (verified by the user — visible decal size never changed) but
-    # `decal.transform = new_m` and the readbacks each triggered a full
-    # Fusion re-projection per decal (~100-300ms × hundreds of tile decals =
-    # the UI freeze the user kept hitting). Coverage now comes from the
-    # tiling grid (BATCH_DECAL_TILE), not from per-decal sizing.
-    try:
-        decal_input = decals_collection.createInput(image_win_path, [face], center)
-    except Exception as ex:
-        return None, "createInput: {}".format(ex)
-    if decal_input is None:
-        return None, "createInput returned None"
+    last_err = "no on-face point"
+    for center in anchors[:retries]:
+        # MINIMAL fast path: createInput + add + name. Nothing else.
+        #
+        # Earlier iterations tried width/height/scaleX/Y/scaleFactor/xDirection
+        # setattr on both DecalCreateInput AND Decal, plus a transform-matrix
+        # get+set as a "last resort". On this Fusion build NONE of those took
+        # effect (verified by the user — visible decal size never changed) but
+        # `decal.transform = new_m` and the readbacks each triggered a full
+        # Fusion re-projection per decal (~100-300ms × hundreds of tile decals =
+        # the UI freeze the user kept hitting). Coverage now comes from the
+        # tiling grid (BATCH_DECAL_TILE), not from per-decal sizing.
+        try:
+            decal_input = decals_collection.createInput(image_win_path, [face], center)
+        except Exception as ex:
+            last_err = "createInput: {}".format(ex)
+            continue
+        if decal_input is None:
+            last_err = "createInput returned None"
+            continue
 
-    try:
-        decal = decals_collection.add(decal_input)
-    except Exception as ex:
-        return None, "decals.add: {}".format(ex)
-    if decal is None:
-        return None, "decals.add returned None"
+        try:
+            decal = decals_collection.add(decal_input)
+        except Exception as ex:
+            last_err = "decals.add: {}".format(ex)
+            continue
+        if decal is None:
+            last_err = "decals.add returned None"
+            continue
 
-    try:
-        decal.name = decal_name
-    except Exception:
-        pass
-    return decal, ""
+        try:
+            decal.name = decal_name
+        except Exception:
+            pass
+        return decal, ""
+    return None, last_err
 
 
 def create_batch_decals_for_all_bodies(
@@ -1320,6 +1523,22 @@ def create_batch_decals_for_all_bodies(
                     a = _face_area(f)
                     if a < BATCH_DECAL_MIN_FACE_AREA_CM2:
                         continue  # sliver / fillet — not worth a decal
+                    # Skip clearly downward-facing faces: the top camera never
+                    # sees them, so decaling them steals budget from the
+                    # visible top (which was showing light patches where its
+                    # decals ran out).
+                    if BATCH_DECAL_SKIP_DOWN_FACING and (
+                        _face_up_score(f) < BATCH_DECAL_DOWN_FACE_THRESHOLD
+                    ):
+                        continue
+                    # Skip tightly curved faces (rounded nose return): decals
+                    # project flat and would smear into streaks. The wood-tone
+                    # neutral shows there instead — a clean undertone.
+                    if BATCH_DECAL_SKIP_CURVED_FACES and (
+                        _face_curvature_spread_deg(f)
+                        > BATCH_DECAL_CURVED_FACE_MAX_DEG
+                    ):
+                        continue
                     candidates.append((a, f, decals_coll, body_label))
 
     try:
@@ -1436,7 +1655,11 @@ def create_batch_decals_for_all_bodies(
                 tile_specs = tile_specs[:remaining]
 
             used_face = False
+            face_fail = 0
+            tried_anchors: set = set()
             for tile_pt, iu, iv, nu, nv in tile_specs:
+                if tile_pt is not None:
+                    tried_anchors.add(_point_key(tile_pt))
                 name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
                 slice_path = (
                     _slice_image_for_tile(image_path, iu, iv, nu, nv)
@@ -1454,6 +1677,7 @@ def create_batch_decals_for_all_bodies(
                     center_override=tile_pt,
                 )
                 if decal is None:
+                    face_fail += 1
                     per_body_fail[body_label] = (
                         per_body_fail.get(body_label, 0) + 1
                     )
@@ -1472,6 +1696,47 @@ def create_batch_decals_for_all_bodies(
                         adsk.doEvents()
                     except Exception:
                         pass
+
+            if (
+                BATCH_DECAL_GAP_FILL_ON_FAIL
+                and face_fail > 0
+                and len(created) < BATCH_DECAL_MAX_TOTAL
+            ):
+                gap_cap = max(1, int(BATCH_DECAL_GAP_FILL_MAX_PER_FACE))
+                gap_added = 0
+                for anchor in _collect_decal_anchor_points(face, step_cm=step_eff if big else None):
+                    if gap_added >= gap_cap:
+                        break
+                    if len(created) >= BATCH_DECAL_MAX_TOTAL:
+                        break
+                    if _point_key(anchor) in tried_anchors:
+                        continue
+                    tried_anchors.add(_point_key(anchor))
+                    name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
+                    decal, err = _create_decal_on_face(
+                        decals_coll,
+                        image_win,
+                        face,
+                        name,
+                        center_override=anchor,
+                    )
+                    if decal is None:
+                        if not first_err:
+                            first_err = err
+                        continue
+                    created.append(decal)
+                    per_body_ok[body_label] = per_body_ok.get(body_label, 0) + 1
+                    used_face = True
+                    gap_added += 1
+                    if (
+                        BATCH_DECAL_UI_PUMP_INTERVAL > 0
+                        and len(created) % BATCH_DECAL_UI_PUMP_INTERVAL == 0
+                    ):
+                        try:
+                            adsk.doEvents()
+                        except Exception:
+                            pass
+
             if used_face:
                 per_body_faces[body_label] = (
                     per_body_faces.get(body_label, 0) + 1
@@ -2259,6 +2524,149 @@ def capture_body_appearances(design: adsk.fusion.Design) -> List[Tuple[Any, Any]
         except Exception:
             pass
     return snap
+
+
+# When True, bodies with steel/reflective/decorative appearances are
+# temporarily swapped to a wood-tone neutral while decals project, so decal
+# gaps blend into the swatch instead of a grey steel stripe. Originals
+# restored at end of batch.
+BATCH_DECAL_NEUTRALIZE_APPEARANCES: bool = True
+
+# Also neutralize steel/satin/striped/foam bodies (common on decal templates).
+BATCH_DECAL_NEUTRALIZE_STEEL_LIKE: bool = True
+
+# Appearance-name fragments that trigger neutralization (dark / decorative).
+_NEUTRALIZE_APPEARANCE_FRAGMENTS = (
+    "metallic",
+    "(black)",
+    "paint",
+    "vinyl",
+    "lcd",
+    "display",
+)
+
+# Procedural steel / foam bodies on decal templates — gaps used to show grey.
+_STEEL_LIKE_APPEARANCE_FRAGMENTS = (
+    "steel",
+    "striped",
+    "foam",
+    "plastic - matte",
+)
+
+# Ranked preference for the neutral backdrop (earliest wins). Prefer wood /
+# light matte so uncovered slivers read as undertone, not grey metal.
+_NEUTRAL_TARGET_PREFERENCES = (
+    "pine",
+    "oak",
+    "wood",
+    "bamboo light",
+    "plastic - matte (white)",
+    "plastic - matte",
+    "lime",
+    "granite",
+    "steel - satin",
+    "satin",
+)
+
+
+def _appearance_should_neutralize(ap_name: str) -> bool:
+    """True when a body appearance should be swapped to the wood-tone backdrop."""
+    n = (ap_name or "").lower()
+    if not n:
+        return False
+    if n in {x.lower() for x in SLOT1_APPEARANCE_NAMES}:
+        return False
+    if n in {x.lower() for x in SLOT2_APPEARANCE_NAMES}:
+        return False
+    if any(w in n for w in ("pine", "oak", "wood", "maple", "walnut", "cherry", "birch", "hickory")):
+        return False
+    if any(k in n for k in _NEUTRALIZE_APPEARANCE_FRAGMENTS):
+        return True
+    if BATCH_DECAL_NEUTRALIZE_STEEL_LIKE and any(
+        k in n for k in _STEEL_LIKE_APPEARANCE_FRAGMENTS
+    ):
+        return True
+    return False
+
+
+def _pick_neutral_appearance(design):
+    """Pick a clean, light, matte in-design appearance as the decal backdrop.
+    Honors ``_NEUTRAL_TARGET_PREFERENCES`` as a ranked priority (the name
+    matching the earliest entry wins, regardless of design iteration order).
+    """
+    try:
+        apps = design.appearances
+        n = apps.count
+    except Exception:
+        return None
+    best_rank = None
+    cand_pref = None
+    cand_any = None
+    for i in range(n):
+        try:
+            a = apps.item(i)
+            nm = (a.name or "").lower()
+        except Exception:
+            continue
+        if any(k in nm for k in _NEUTRALIZE_APPEARANCE_FRAGMENTS):
+            continue
+        if cand_any is None:
+            cand_any = a
+        for rank, pref in enumerate(_NEUTRAL_TARGET_PREFERENCES):
+            if pref in nm:
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    cand_pref = a
+                break
+    return cand_pref or cand_any
+
+
+def neutralize_dark_body_appearances(
+    design: adsk.fusion.Design,
+) -> Tuple[List[Tuple[Any, Any]], List[str]]:
+    """Swap dark/reflective body appearances on VISIBLE bodies to a neutral
+    matte one so decal gaps don't show as a black/steel stripe. Returns
+    ``(snap, log_lines)``; the snapshot feeds ``restore_body_appearances`` at
+    end of batch. No-op when ``BATCH_DECAL_NEUTRALIZE_APPEARANCES`` is False.
+    """
+    lines: List[str] = []
+    if not BATCH_DECAL_NEUTRALIZE_APPEARANCES:
+        lines.append("Appearance neutralization: disabled (flag off)")
+        return [], lines
+    neutral = _pick_neutral_appearance(design)
+    if neutral is None:
+        lines.append(
+            "Appearance neutralization skipped: no neutral appearance found"
+        )
+        return [], lines
+    try:
+        neutral_name = neutral.name
+    except Exception:
+        neutral_name = "?"
+
+    snap: List[Tuple[Any, Any]] = []
+    changed = 0
+    for body in _walk_bodies(design):
+        try:
+            if not _entity_is_visible(body, default=True):
+                continue
+            ap = body.appearance
+            if ap is None:
+                continue
+            nm = ap.name or ""
+            if not _appearance_should_neutralize(nm):
+                continue
+            snap.append((body, ap))
+            body.appearance = neutral
+            changed += 1
+        except Exception:
+            continue
+    lines.append(
+        "Appearance neutralization: {} body(ies) swapped to '{}'".format(
+            changed, neutral_name
+        )
+    )
+    return snap, lines
 
 
 def _set_body_and_faces(

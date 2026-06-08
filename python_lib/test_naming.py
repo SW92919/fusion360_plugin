@@ -122,6 +122,31 @@ class TestFolderScan(unittest.TestCase):
             self.assertIsNotNone(s1)
             self.assertEqual(s1.name, "ColorSet01-1.jpg")
 
+    def test_hyphen_slot_suffixes(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "Color Set 01-1.jpg").write_bytes(b"1")
+            (root / "Color Set 01-2.jpg").write_bytes(b"2")
+            s1, s2 = find_slot_images(root)
+            self.assertIsNotNone(s1)
+            self.assertEqual(s1.name, "Color Set 01-1.jpg")
+            self.assertIsNotNone(s2)
+            self.assertEqual(s2.name, "Color Set 01-2.jpg")
+
+    def test_batch_output_png_not_used_as_slot(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "3-in-1 - Decal - Color Set 01-1 - Full Front.png").write_bytes(b"render")
+            (root / "Color Set 01-1.jpg").write_bytes(b"1")
+            (root / "Color Set 01-2.jpg").write_bytes(b"2")
+            s1, s2 = find_slot_images(root)
+            self.assertIsNotNone(s1)
+            self.assertEqual(s1.name, "Color Set 01-1.jpg")
+
 
 if __name__ == "__main__":
     unittest.main()
