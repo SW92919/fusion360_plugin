@@ -18,6 +18,7 @@ from plugin import image_mapper
 from plugin import logger as logutil
 from plugin import model_handler
 from plugin import renderer_aps
+from plugin import task_manager
 from plugin import ui as uip
 
 
@@ -102,7 +103,6 @@ def execute_batch(
     max_named_views: int,
     addin_dir: Path,
 ) -> None:
-    _ = concurrency  # reserved for future parallel APS I/O
     log_path = logutil.default_log_path(texture_root)
     logutil.append_log(log_path, "execute_batch start backend={}".format(render_backend))
 
@@ -123,6 +123,8 @@ def execute_batch(
 
     aps_cfg = renderer_aps.load_aps_config(addin_dir)
     token = ""
+    aps_executor: Optional[task_manager.BoundedExecutor] = None
+    aps_bucket_key = ""
     if "APS" in (render_backend or "").upper():
         tr = renderer_aps.fetch_two_legged_token(aps_cfg)
         if not tr.ok:
@@ -136,6 +138,21 @@ def execute_batch(
         else:
             token = tr.access_token
             logutil.append_log(log_path, "APS token acquired (expires_in={})".format(tr.expires_in))
+            ready, ready_msg = renderer_aps.verify_aps_setup(aps_cfg, token)
+            logutil.append_log(log_path, ready_msg)
+            aps_bucket_key = renderer_aps.resolve_bucket_key(aps_cfg)
+            if not ready:
+                if aps_fallback:
+                    fui.messageBox(
+                        "APS setup failed:\n{}\n\nFalling back to local rendering.".format(ready_msg)
+                    )
+                    render_backend = uip.RENDER_BACKEND_LOCAL_FUSION
+                    token = ""
+                else:
+                    fui.messageBox("APS setup failed:\n{}\nEnable fallback or fix aps_config.json.".format(ready_msg))
+                    return
+            else:
+                aps_executor = task_manager.BoundedExecutor(concurrency)
 
     app = adsk.core.Application.get()
     csv_log = texture_root / "_LifeproofBatchRender_log.csv"
@@ -146,6 +163,14 @@ def execute_batch(
         "Output: {} × {} {}".format(render_width, render_height, output_ext.upper()),
         "Pipeline mode: {}".format(pipeline_selection),
         "Render backend: {}".format(render_backend),
+        *(
+            [
+                "APS bucket: {}".format(aps_bucket_key or "(none)"),
+                "APS render_mode: {}".format(aps_cfg.render_mode),
+            ]
+            if token
+            else []
+        ),
         (
             "Max named views per color set: 0 (all views in each design)"
             if max_named_views <= 0
@@ -165,6 +190,8 @@ def execute_batch(
 
     renders_ok = 0
     renders_fail = 0
+    aps_render_ok = 0
+    aps_fallback_count = 0
 
     total_steps: Optional[int] = None
     done_steps = 0
@@ -495,24 +522,49 @@ def execute_batch(
                 local_capture = "viewport"
 
                 if "APS" in (render_backend or "").upper() and token:
-                    outcome = renderer_aps.render_placeholder(
+                    outcome = renderer_aps.submit_render_job(
                         aps_cfg,
                         token,
+                        design=design,
+                        app=app,
                         model_path=mp,
                         color_folder=cs.folder,
+                        color_name=cs.folder.name,
                         view_name=view_name,
                         width=render_width,
                         height=render_height,
+                        model_stem=model_stem,
+                        slot_paths=[s1 or cs.slot1, s2],
                     )
                     if outcome.ok and outcome.output_bytes:
                         try:
                             out_path.write_bytes(outcome.output_bytes)
                             ok = True
                             used_aps = True
+                            aps_render_ok += 1
+                            if outcome.job_prefix:
+                                summary_lines.append(
+                                    "  APS job: oss://{}/{}".format(
+                                        outcome.bucket_key or aps_bucket_key,
+                                        outcome.job_prefix,
+                                    )
+                                )
                         except Exception as ex:
                             ok = False
                             summary_lines.append("APS write failed: {}".format(ex))
                     elif aps_fallback:
+                        aps_fail_msg = (outcome.message or "APS render failed (no message).").strip()
+                        summary_lines.append(
+                            "  APS fallback ({} | {}): {}".format(
+                                cs.folder.name, view_name, aps_fail_msg
+                            )
+                        )
+                        logutil.append_log(
+                            log_path,
+                            "APS fallback model={} color={} view={} reason={}".format(
+                                model_stem, cs.folder.name, view_name, aps_fail_msg
+                            ),
+                        )
                         ok, local_capture = _save_local_image(
                             design,
                             app,
@@ -522,9 +574,21 @@ def execute_batch(
                             uip.RENDER_BACKEND_LOCAL_FUSION,
                         )
                         used_fallback = True
+                        aps_fallback_count += 1
                     else:
                         ok = False
-                        summary_lines.append("APS: {}".format(outcome.message))
+                        aps_fail_msg = (outcome.message or "APS render failed.").strip()
+                        summary_lines.append(
+                            "  APS failed ({} | {}): {}".format(
+                                cs.folder.name, view_name, aps_fail_msg
+                            )
+                        )
+                        logutil.append_log(
+                            log_path,
+                            "APS failed model={} color={} view={} reason={}".format(
+                                model_stem, cs.folder.name, view_name, aps_fail_msg
+                            ),
+                        )
                 else:
                     ok, local_capture = _save_local_image(
                         design,
@@ -604,6 +668,18 @@ def execute_batch(
         summary_lines.append("Removed *flipped* / mirror sidecar rasters after batch:")
         summary_lines.extend(["  {}".format(x) for x in _post_purge])
 
+    if "APS" in (render_backend or "").upper() or aps_render_ok or aps_fallback_count:
+        summary_lines.append("")
+        summary_lines.append(
+            "APS renders OK: {}  APS fallbacks: {}".format(
+                aps_render_ok, aps_fallback_count
+            )
+        )
+        if aps_fallback_count and not aps_render_ok:
+            summary_lines.append(
+                "  Hint: check APS fallback lines above for OSS/upload/render errors."
+            )
+
     summary_lines.append("")
     summary_lines.append("Renders OK: {}  Failed: {}".format(renders_ok, renders_fail))
     summary_lines.append("CSV log: {}".format(csv_log))
@@ -629,6 +705,9 @@ def execute_batch(
         "Plugin log:   {}".format(log_path),
     ]
     short_text = "\n".join(short_lines)
+
+    if aps_executor is not None:
+        aps_executor.shutdown(wait=True)
 
     try:
         uip.set_progress(ins, 100, 100)

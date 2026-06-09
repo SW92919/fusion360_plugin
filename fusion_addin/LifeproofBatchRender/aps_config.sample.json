@@ -2,6 +2,11 @@
   "client_id": "YOUR_APS_CLIENT_ID",
   "client_secret": "YOUR_APS_CLIENT_SECRET",
   "scopes": "data:read data:write bucket:create bucket:read",
-  "bucket_key": "",
-  "workflow_notes": "bucket_key + OSS upload + your render job API must be implemented in plugin/renderer_aps.py for APS mode to produce images."
+  "bucket_key": "your-unique-lowercase-bucket-name",
+  "bucket_policy": "transient",
+  "auto_create_bucket": true,
+  "render_mode": "fusion_viewport",
+  "render_quality": 60,
+  "max_retries": 2,
+  "workflow_notes": "Copy to aps_config.json (gitignored). render_mode: fusion_viewport (recommended) uploads job package to OSS then viewport-captures in Fusion; fusion_raytrace is slow on decal-heavy models; automation requires Fusion Automation API setup."
 }
