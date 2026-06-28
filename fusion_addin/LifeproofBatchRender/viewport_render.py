@@ -260,7 +260,7 @@ EXCLUDE_VIEW_NAME_TOKENS = ("macro", "iso", "top", "bottom")
 # the applied decal texture, so captures are clean product stills with only
 # slightly flatter lighting (no ray-traced GI / soft shadows). Set False to
 # allow the dialog-selected ray-traced backend again.
-FORCE_VIEWPORT_CAPTURE: bool = True
+FORCE_VIEWPORT_CAPTURE: bool = False
 
 # Distinct product-hero angles rendered per color set when
 # FORCE_ISOMETRIC_VIEW is on. Each entry is
@@ -916,7 +916,7 @@ def save_fusion_local_render(
     width: int,
     height: int,
     *,
-    render_quality: int = 60,
+    render_quality: int = 90,
     timeout_sec: float = 1800.0,
     poll_sec: float = 0.25,
 ) -> bool:

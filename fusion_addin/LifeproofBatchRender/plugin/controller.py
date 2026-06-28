@@ -101,10 +101,52 @@ def execute_batch(
     concurrency: int,
     aps_fallback: bool,
     max_named_views: int,
+    decal_scale_plane_xy: float,
     addin_dir: Path,
 ) -> None:
     log_path = logutil.default_log_path(texture_root)
     logutil.append_log(log_path, "execute_batch start backend={}".format(render_backend))
+
+    texture_pipeline.set_runtime_decal_scale_plane_xy(decal_scale_plane_xy)
+    try:
+        _execute_batch_inner(
+            fui,
+            ins,
+            texture_root,
+            models,
+            render_width,
+            render_height,
+            output_ext,
+            pipeline_selection,
+            render_backend,
+            concurrency,
+            aps_fallback,
+            max_named_views,
+            decal_scale_plane_xy,
+            addin_dir,
+            log_path,
+        )
+    finally:
+        texture_pipeline.set_runtime_decal_scale_plane_xy(None)
+
+
+def _execute_batch_inner(
+    fui: adsk.core.UserInterface,
+    ins: adsk.core.CommandInputs,
+    texture_root: Path,
+    models: List[Path],
+    render_width: int,
+    render_height: int,
+    output_ext: str,
+    pipeline_selection: str,
+    render_backend: str,
+    concurrency: int,
+    aps_fallback: bool,
+    max_named_views: int,
+    decal_scale_plane_xy: float,
+    addin_dir: Path,
+    log_path: Path,
+) -> None:
 
     try:
         color_sets = support_paths.scan_texture_root(texture_root)
@@ -178,6 +220,7 @@ def execute_batch(
                 max_named_views, max_named_views
             )
         ),
+        "Decal Scale Plane XY: {:.2f}".format(decal_scale_plane_xy),
         "",
         "Delivery swatches (texture copies per color folder):",
     ]
@@ -335,8 +378,18 @@ def execute_batch(
                     "  Decal projection skipped: no color-set image available"
                 )
             else:
+                _neutralize = getattr(
+                    texture_pipeline, "neutralize_dark_body_appearances", None
+                )
+                body_appearance_snap = texture_pipeline.capture_body_appearances(
+                    design
+                )
+                if callable(_neutralize):
+                    _, neut_lines = _neutralize(design)
+                    for line in neut_lines:
+                        summary_lines.append("  " + line)
                 batch_decals, decal_lines = texture_pipeline.create_batch_decals_for_all_bodies(
-                    design, first_image
+                    design, first_image, appearance_snap=body_appearance_snap, model_path=mp
                 )
                 for line in decal_lines:
                     summary_lines.append("  " + line)
@@ -397,13 +450,16 @@ def execute_batch(
                     _neutralize = getattr(
                         texture_pipeline, "neutralize_dark_body_appearances", None
                     )
+                    body_appearance_snap = texture_pipeline.capture_body_appearances(
+                        design
+                    )
                     if callable(_neutralize):
-                        body_appearance_snap, neut_lines = _neutralize(design)
+                        _, neut_lines = _neutralize(design)
                         for line in neut_lines:
                             summary_lines.append("  " + line)
                     batch_decals, decal_lines = (
                         texture_pipeline.create_batch_decals_for_all_bodies(
-                            design, fb_image
+                            design, fb_image, appearance_snap=body_appearance_snap, model_path=mp
                         )
                     )
                     for line in decal_lines:
@@ -423,10 +479,16 @@ def execute_batch(
             tex_lines: List[str] = []
             if batch_decals:
                 decal_image = s1 or cs.slot1
-                n_tex, dec_lines = texture_pipeline.update_batch_decal_images(
+                n_tex, dec_lines, batch_decals = texture_pipeline.update_batch_decal_images(
                     batch_decals, decal_image
                 )
                 tex_lines.extend(dec_lines)
+                if mode == "appearance":
+                    n_app, app_lines = texture_pipeline.apply_hybrid_appearance_for_batch(
+                        design, s1, s2
+                    )
+                    n_tex += n_app
+                    tex_lines.extend(app_lines)
                 # Optionally also swap imageFilename on user-authored decals
                 # in the .f3d. Disabled by default — every extra decal write
                 # triggers a Fusion re-projection that grows the freeze
@@ -629,10 +691,15 @@ def execute_batch(
         visibility_apply.restore_visibility(occ_snap, body_snap, mesh_snap, decal_snap)
 
         if batch_decals:
-            n_removed = texture_pipeline.cleanup_batch_decals(batch_decals)
-            summary_lines.append(
-                "  Decal teardown: {} batch decal(s) removed".format(n_removed)
-            )
+            if texture_pipeline.SKIP_BATCH_DECAL_CLEANUP:
+                summary_lines.append(
+                    "  Decal teardown: skipped (SKIP_BATCH_DECAL_CLEANUP=True — inspect in Fusion)"
+                )
+            else:
+                n_removed = texture_pipeline.cleanup_batch_decals(batch_decals)
+                summary_lines.append(
+                    "  Decal teardown: {} batch decal(s) removed".format(n_removed)
+                )
 
         if body_appearance_snap and texture_pipeline.RESTORE_BODY_APPEARANCES_ON_FINISH:
             n_restored = texture_pipeline.restore_body_appearances(body_appearance_snap)

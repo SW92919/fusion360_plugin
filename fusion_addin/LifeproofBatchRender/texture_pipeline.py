@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import adsk.core
 import adsk.fusion
@@ -21,33 +21,18 @@ from visibility_apply import (
 )
 
 # --- User template: exact Fusion names for each slot (Appearance mode) ---
+# Client allowlist — only these appearances receive batch color images; foam,
+# steel, paint, and all other document appearances are left unchanged.
 SLOT1_APPEARANCE_NAMES: FrozenSet[str] = frozenset(
     {
-        "custom_appearance_1",
-        "Batch_Slot_1",
-        "Wood_1",
-        "Texture_1",
-        # Common species names used as the primary wood appearance:
-        "Pine",
-        "Oak",
-        "Maple",
-        "Walnut",
-        "Ash",
-        "Cherry",
-        "Birch",
-        "Hickory",
-        "Wood",
-        "Wood-1",
-        "Wood_1",
+        "Vinyl_1",
+        "Vinyl Skin - 1",
     }
 )
 SLOT2_APPEARANCE_NAMES: FrozenSet[str] = frozenset(
     {
-        "custom_appearance_2",
-        "Batch_Slot_2",
-        "Wood_2",
-        "Texture_2",
-        "Wood-2",
+        "Vinyl_2",
+        "Vinyl Skin - 2",
     }
 )
 
@@ -82,13 +67,9 @@ SLOT2_DECAL_NAMES: FrozenSet[str] = frozenset(
 # strict naming.
 DECAL_POSITIONAL_FALLBACK: bool = True
 
-# When True, slot 1 is also pushed into EVERY appearance in the design that
-# already has a texture slot, in addition to (or instead of) explicit name
-# matching. This is what gives "100% coverage" on templates whose
-# appearance names you haven't pre-configured. Set to False if you want
-# strict per-name control (e.g. when a model has wood + steel + glass
-# textures and you only want to swap the wood).
-APPEARANCE_BROADCAST: bool = True
+# Strict per-name control: only SLOT1/SLOT2 appearance names are updated.
+# Do not push slot 1 into every textured appearance (foam, Pine, steel, etc.).
+APPEARANCE_BROADCAST: bool = False
 
 # When True, every body in the model is force-assigned to a single "carrier"
 # appearance whose texture is swapped per color set. This gives a real
@@ -98,15 +79,10 @@ APPEARANCE_BROADCAST: bool = True
 # the original mixed materials preserved (some bodies will not change).
 FORCE_BODY_COVERAGE: bool = True
 
-# When True, every body gets a freshly-created decal of the user's color-set
-# image projected onto its largest planar face. Disabled by default because
-# the Fusion 360 builds we tested on silently reject every decal-sizing API
-# (width/height on input, post-add, scaleX/Y, scaleFactor, transform matrix
-# scaling) — decals are created at Fusion's default ~5cm patch size and
-# can't be made to cover the face. With this flag False, the plugin runs
-# the appearance pipeline against ``SLOT1_APPEARANCE_NAMES`` (the prepared-
-# template path described in docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md).
-BODY_COVERAGE_VIA_DECALS: bool = False
+# When True, batch decals (chain faces + Scale Plane XY) texture visible tread
+# bodies even when a library carrier is available. Keeps manual-decal-like
+# placement instead of blanketing the whole assembly with one carrier UV.
+BODY_COVERAGE_VIA_DECALS: bool = True
 
 # When True, every face of every body gets its own decal so the image wraps
 # the WHOLE model — top, sides, ends, curved nose, etc. When False (default),
@@ -125,19 +101,18 @@ BATCH_DECAL_ALL_FACES: bool = False
 # and delete them at end-of-batch without touching decals authored in the .f3d.
 BATCH_DECAL_NAME_PREFIX: str = "LifeproofBatchDecal_"
 
-# Multiplier applied to the face's longest bounding-box side when sizing each
-# decal. Fusion clips decals at the face boundary, so over-sizing the decal
-# guarantees full-face coverage even when the build auto-fits to the image
-# aspect ratio. Set this aggressively — even when Fusion ignores it, the
-# tiling fallback below picks up the slack.
-DECAL_OVERSIZE_FACTOR: float = 20.0
+# Multiplier applied when computing uniform Scale Plane XY (see
+# ``BATCH_DECAL_SCALE_COVER_FACTOR``). Legacy name kept for docs only.
+DECAL_OVERSIZE_FACTOR: float = 2
 
 # When True, decals are TILED across the face's longest direction in a grid
 # of step-sized cells, instead of one decal centered on the face. This is
 # the workaround for Fusion builds that ignore every decal-sizing API:
 # place many small default-sized decals next to each other and let them
 # collectively cover the face.
-BATCH_DECAL_TILE: bool = True
+# NOTE: ignored when ``BATCH_DECAL_CHAIN_FACES`` is True — chain-wrapped
+# decals must be one per face, not a tile grid.
+BATCH_DECAL_TILE: bool = False
 
 # Grid step in cm for tiling. Each decal is a ~5 cm patch; with image
 # slicing OFF every tile shows the full swatch. 4 cm is denser than 5 cm and
@@ -156,7 +131,7 @@ BATCH_DECAL_MAX_TILES_PER_FACE: int = 120
 #   * higher (e.g. 800)→ fuller coverage, slower (can freeze on weak PCs).
 # 500 + largest-face-first + gap-fill retries: better automatic coverage on
 # unknown client models without per-.f3d appearance prep.
-BATCH_DECAL_MAX_TOTAL: int = 500
+BATCH_DECAL_MAX_TOTAL: int = 20
 
 # When a tile placement fails (off-face), try alternate on-surface anchors
 # before counting a skip. Helps curved noses and chamfered tread edges.
@@ -211,6 +186,180 @@ BATCH_DECAL_TILE_SLICE_IMAGE: bool = False
 # Pump Fusion's UI message loop every N decal operations so the application
 # stays responsive. Tighter = smoother UI, marginally more overhead.
 BATCH_DECAL_UI_PUMP_INTERVAL: int = 8
+
+# Fusion DECAL dialog "Z Angle" — used on flat/chain-wrapped faces (End Cap strips).
+BATCH_DECAL_Z_ANGLE_DEG: float = 90.0
+
+# Z angle on curved tops when chain faces is off (align-grain handles orientation).
+BATCH_DECAL_Z_ANGLE_CURVED_DEG: float = 0.0
+
+# Re-apply cached transform after each imageFilename swap (Fusion may reset UV).
+# Ignored when BATCH_DECAL_RECREATE_ON_COLOR_SWAP is True.
+BATCH_DECAL_REAPPLY_TRANSFORM_ON_IMAGE_SWAP: bool = True
+
+# Recreate batch decals per color set (full DecalInput orientation + scale).
+# Reliable when ``decal.transform`` is read-only after ``add()``.
+BATCH_DECAL_RECREATE_ON_COLOR_SWAP: bool = True
+
+# Fusion DECAL dialog "Chain Faces" — wrap the decal onto connected faces of
+# the body (top flat + curved nose, etc.). Requires a single primary face in
+# ``DecalInput.faces``; defaults to True in recent Fusion API builds.
+# When True, tiling is disabled (one scaled decal per face).
+# Also enables one chain-wrapped decal per body on the primary show face
+# (largest planar top — not end caps).
+BATCH_DECAL_CHAIN_FACES: bool = True
+
+# Disabled — chain ON + corrected auto-fit covers connected show faces (End Cap incl.).
+BATCH_DECAL_EXTRUSION_PROFILE_TOKENS: Tuple[str, ...] = ()
+
+# Min |n·Y| for extrusion top-face whitelist (flat exterior tops only).
+BATCH_DECAL_EXTRUSION_TOP_MIN_Y_DOT: float = 0.95
+
+# Auto-fit: legacy ``2.0 * axis_len`` undershot render ~2× on this Fusion build.
+# Use ``1.0 * axis_len`` as default decal footprint for fit (UI=1 ≈ old UI=2).
+BATCH_DECAL_FIT_DEFAULT_AXIS_MULTIPLIER: float = 1.0
+
+# Uniform Scale Plane XY via ``DecalInput.transform`` axis magnitudes (same
+# effect as the Fusion gizmo / Keep Aspect Ratio — NOT separate width/height).
+BATCH_DECAL_USE_SCALE_PLANE_XY: bool = True
+
+# Fusion DECAL dialog **Scale Plane XY** slider — uniform multiplier applied
+# after auto-fit to the body bbox in decal-local axes (manual bullnose ~1.8).
+# Overridden per batch from the plugin UI when set.
+BATCH_DECAL_SCALE_PLANE_XY: float = 1
+
+# Set by controller from UI; None = use ``BATCH_DECAL_SCALE_PLANE_XY`` above.
+_RUNTIME_DECAL_SCALE_PLANE_XY: Optional[float] = None
+
+
+def get_decal_scale_plane_xy() -> float:
+    if _RUNTIME_DECAL_SCALE_PLANE_XY is not None:
+        return float(_RUNTIME_DECAL_SCALE_PLANE_XY)
+    return float(BATCH_DECAL_SCALE_PLANE_XY)
+
+
+def set_runtime_decal_scale_plane_xy(value: Optional[float]) -> None:
+    global _RUNTIME_DECAL_SCALE_PLANE_XY
+    _RUNTIME_DECAL_SCALE_PLANE_XY = value
+
+# Margin on auto-fit before the UI multiplier (1.0 = none).
+BATCH_DECAL_SCALE_AUTO_FIT_MARGIN: float = 1.0
+
+# Skip end-cap / cut faces at the start & end of long bodies (normal parallel
+# to the body's longest axis). Show faces (top, nose, back, sides) are kept.
+BATCH_DECAL_SKIP_END_CAP_FACES: bool = True
+BATCH_DECAL_END_CAP_NORMAL_DOT: float = 0.82
+
+# Skip long vertical side faces (tread front/back, width-facing bands). Uses
+# world Z-up (Fusion default) plus body-local bbox heuristics.
+BATCH_DECAL_SKIP_VERTICAL_SIDES: bool = True
+BATCH_DECAL_VERTICAL_SIDE_LENGTH_DOT: float = 0.35
+BATCH_DECAL_VERTICAL_SIDE_THICKNESS_DOT: float = 0.55
+BATCH_DECAL_SKIP_WORLD_VERTICAL: bool = True
+BATCH_DECAL_WORLD_VERTICAL_Z_DOT: float = 0.35
+
+# Primary chain-decal anchor: tread walking surface (+Y or +Z in this template).
+BATCH_DECAL_PRIMARY_USE_WORLD_UP: bool = True
+BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT: float = 0.65
+# Nearly flat tread (rejects 45° chamfers). Relaxed 0.65; strict tier uses 0.85.
+BATCH_DECAL_PRIMARY_MIN_FLAT_Z_DOT: float = 0.65
+BATCH_DECAL_PRIMARY_STRICT_SHOW_DOT: float = 0.85
+# Never anchor chain decals on sliver/chamfer faces.
+BATCH_DECAL_PRIMARY_MIN_FACE_AREA_CM2: float = 100.0
+# Plank/Nose tread tops face ±Y in this assembly (Y-up show surfaces).
+BATCH_DECAL_PRIMARY_ALLOW_Y_SHOW: bool = True
+
+# When True, rotate decal local X to body length. Curved tops: before Z=0.
+# Flat chain-wrapped tops: after Z=90 so orientation works for all body poses.
+BATCH_DECAL_ALIGN_GRAIN_TO_LENGTH: bool = True
+
+# False = align local X (Fusion grain / image U); True = align local Y (Height).
+BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS: bool = False
+
+# Probe template decals for logging; chain/Z inherit flags below are separate.
+BATCH_DECAL_INHERIT_TEMPLATE_DECAL: bool = True
+
+# Do not copy template Chain Faces — geometry/curvature decides (template uses multi-face).
+BATCH_DECAL_INHERIT_TEMPLATE_CHAIN: bool = False
+
+# Do not copy template Z — flat+chain uses BATCH_DECAL_Z_ANGLE_DEG instead.
+BATCH_DECAL_INHERIT_TEMPLATE_Z_ANGLE: bool = False
+
+# When no template hint: disable chain faces on curved show faces (arched 3-in-1 tops).
+BATCH_DECAL_CHAIN_FACES_CURVED_MAX_DEG: float = 25.0
+
+# Keep batch decals after run so you can inspect EDIT DECAL in Fusion (debug).
+SKIP_BATCH_DECAL_CLEANUP: bool = False
+
+# When chain-faces scaling, floor required span to the body bbox's two largest axes.
+BATCH_DECAL_SCALE_USE_BBOX_FLOOR: bool = True
+
+# Panoramic color-set images (e.g. 2500×685): max aspect boost on auto-fit scale.
+BATCH_DECAL_PANORAMIC_SCALE_MAX: float = 6.0
+
+# Legacy alias — use BATCH_DECAL_SCALE_PLANE_XY instead.
+BATCH_DECAL_SCALE_COVER_FACTOR: float = 1.8
+
+# When chain-faces mode is on, place one decal on the largest show body per
+# occurrence (Plank, Nose, …) instead of every sub-body (foam, wear, paint).
+BATCH_DECAL_ONE_PER_OCCURRENCE: bool = True
+
+# Body / occurrence name tokens that are never primary show surfaces.
+BATCH_DECAL_BODY_SKIP_KEYWORDS: Tuple[str, ...] = (
+    "foam",
+    "pad",
+    "substrate",
+    "light",
+    "lcd",
+    "main light",
+    "paint",
+)
+
+# Appearance-name fragments that must never receive wood swatches (broadcast or
+# neutralization). Foam/substrate stay white/grey in renders and in the .f3d.
+PROTECTED_SUBSTRATE_APPEARANCE_FRAGMENTS: Tuple[str, ...] = (
+    "foam",
+    "substrate",
+)
+
+# Prefer these exact body names (Browser) over area / appearance heuristics.
+BATCH_DECAL_BODY_PREFER_NAMES: Tuple[str, ...] = ("Body1",)
+BATCH_DECAL_BODY_PREFER_NAME_RANK: float = 100.0
+
+# Hard map: occurrence label → body name (Option B — no scoring guesswork).
+# Keys match Fusion occurrence names, e.g. ``Plank:1``, ``Nose1.125:1``.
+BATCH_DECAL_OCCURRENCE_BODY: Dict[str, str] = {
+    "Plank:1": "Body1",
+    "Nose1.125:1": "Body1",
+}
+
+# Square Nose / similar: tread nose bodies live at document root (not Nose1.125:1).
+# Exact name match only; try in order until decal create succeeds.
+BATCH_DECAL_ROOT_ANCHOR_BODIES: Tuple[str, ...] = (
+    "Nose Wear Layer",
+    "Nose",
+)
+
+# Match main show body from .f3d filename (e.g. ``End Cap - Decal.f3d`` → ``End Cap:1``).
+BATCH_DECAL_MAIN_BODY_FROM_FILENAME: bool = True
+
+# Delete pre-existing decals on the main-body component before batch placement.
+BATCH_DECAL_REMOVE_EXISTING_ON_MAIN: bool = True
+
+# Occurrence name tokens that never receive batch decals (Track keeps template decal).
+BATCH_DECAL_OCCURRENCE_SKIP_KEYWORDS: Tuple[str, ...] = (
+    "track",
+    "rail",
+    "foam pad",
+    "main light",
+)
+
+# Prefer wear-layer bodies (steel shell) when no name / occurrence rule applies.
+BATCH_DECAL_BODY_PREFER_KEYWORDS: Tuple[str, ...] = (
+    "steel",
+    "satin",
+    "striped",
+)
 
 # When True, the plugin also rewrites ``imageFilename`` on every user-
 # authored decal in the .f3d (anything not named ``LifeproofBatchDecal_*``).
@@ -324,6 +473,60 @@ _decal_shift_pil_warning_emitted: bool = False
 # the same way when updating per-decal imageFilename. Populated by the tile
 # loop in create_batch_decals_for_all_bodies; cleared by cleanup_batch_decals.
 _TILE_METADATA: dict = {}
+
+# Cached Decal.transform after placement — reapplied when imageFilename changes.
+_DECAL_TRANSFORM_CACHE: dict = {}
+
+# Placement record for recreate-on-swap (face, body, chain, template hint, …).
+_DECAL_PLACEMENT_CACHE: dict = {}
+
+
+class TemplateDecalHint:
+    """Settings read from a user-authored decal before batch replacement."""
+
+    __slots__ = ("chain_faces", "z_angle_deg", "name")
+
+    def __init__(
+        self,
+        chain_faces: Optional[bool] = None,
+        z_angle_deg: Optional[float] = None,
+        name: str = "",
+    ) -> None:
+        self.chain_faces = chain_faces
+        self.z_angle_deg = z_angle_deg
+        self.name = name or ""
+
+
+class DecalPlacementRecord:
+    """Enough state to recreate a batch decal with the same orientation."""
+
+    __slots__ = (
+        "decals_collection",
+        "face",
+        "body",
+        "decal_name",
+        "chain_faces",
+        "template_hint",
+        "center_override",
+    )
+
+    def __init__(
+        self,
+        decals_collection: Any,
+        face: Any,
+        body: Optional[Any],
+        decal_name: str,
+        chain_faces: Optional[bool],
+        template_hint: Optional[TemplateDecalHint],
+        center_override: Optional[adsk.core.Point3D] = None,
+    ) -> None:
+        self.decals_collection = decals_collection
+        self.face = face
+        self.body = body
+        self.decal_name = decal_name
+        self.chain_faces = chain_faces
+        self.template_hint = template_hint
+        self.center_override = center_override
 
 # Temp PNG paths produced by _slice_image_for_tile. Deleted at batch end.
 _TILE_TEMP_PATHS: List[str] = []
@@ -1040,6 +1243,1323 @@ def _largest_planar_face(body: adsk.fusion.BRepBody) -> Optional[adsk.fusion.BRe
     return best_planar or best_any
 
 
+def _vector_length(v: adsk.core.Vector3D) -> float:
+    return math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+
+
+def _body_bbox_dims_cm(
+    body: adsk.fusion.BRepBody,
+) -> Tuple[float, float, float]:
+    """Body axis-aligned bounding box extents (cm)."""
+    try:
+        bbox = body.boundingBox
+        if bbox is None:
+            return 0.0, 0.0, 0.0
+        dx = abs(bbox.maxPoint.x - bbox.minPoint.x)
+        dy = abs(bbox.maxPoint.y - bbox.minPoint.y)
+        dz = abs(bbox.maxPoint.z - bbox.minPoint.z)
+        return dx, dy, dz
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
+def _body_unit_length_axis(
+    body: adsk.fusion.BRepBody,
+) -> Tuple[float, float, float]:
+    """Unit vector along the body's longest bbox axis (plank length)."""
+    length, _width, _thickness = _body_bbox_axes(body)
+    return length
+
+
+def _body_bbox_axes(
+    body: adsk.fusion.BRepBody,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]:
+    """Unit vectors along length (longest), width (mid), thickness (shortest) bbox axes."""
+    dx, dy, dz = _body_bbox_dims_cm(body)
+    ranked = sorted(
+        ((dx, (1.0, 0.0, 0.0)), (dy, (0.0, 1.0, 0.0)), (dz, (0.0, 0.0, 1.0))),
+        key=lambda t: t[0],
+        reverse=True,
+    )
+    return ranked[0][1], ranked[1][1], ranked[2][1]
+
+
+def _vec3_dot(
+    a: Tuple[float, float, float], b: Tuple[float, float, float]
+) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vec3_cross(
+    a: Tuple[float, float, float], b: Tuple[float, float, float]
+) -> Tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _vec3_normalize(
+    v: Tuple[float, float, float],
+) -> Optional[Tuple[float, float, float]]:
+    mag = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    if mag <= 1e-9:
+        return None
+    return (v[0] / mag, v[1] / mag, v[2] / mag)
+
+
+def _vec3_from_vector3d(v: adsk.core.Vector3D) -> Tuple[float, float, float]:
+    return (float(v.x), float(v.y), float(v.z))
+
+
+def _appearance_snap_name_map(
+    snap: Optional[List[Tuple[Any, Any]]],
+) -> Dict[int, str]:
+    """Map ``id(body)`` → appearance name from a pre-neutralization snapshot."""
+    out: Dict[int, str] = {}
+    if not snap:
+        return out
+    for body, ap in snap:
+        try:
+            out[id(body)] = (ap.name if ap is not None else "") or ""
+        except Exception:
+            out[id(body)] = ""
+    return out
+
+
+def _body_filter_haystack(
+    body: adsk.fusion.BRepBody,
+    label: str,
+    original_appearance_names: Optional[Dict[int, str]] = None,
+) -> str:
+    """Name tokens for skip/prefer — uses pre-neutralization appearance when given."""
+    try:
+        name = (body.name or "").lower()
+    except Exception:
+        name = ""
+    label_l = (label or "").lower()
+    ap_name = ""
+    if original_appearance_names is not None:
+        orig = original_appearance_names.get(id(body))
+        if orig:
+            ap_name = orig.lower()
+    if not ap_name:
+        try:
+            ap = body.appearance
+            ap_name = (ap.name if ap is not None else "").lower()
+        except Exception:
+            ap_name = ""
+    return " ".join((name, label_l, ap_name))
+
+
+def _normalize_occurrence_name(label: str) -> str:
+    """``End Cap:1`` → ``End Cap``."""
+    s = (label or "").strip()
+    m = re.match(r"^(.+):\d+$", s)
+    return (m.group(1) if m else s).strip()
+
+
+def _main_product_token_from_model_path(model_path: Optional[Path]) -> str:
+    """Primary product name from ``End Cap - Decal.f3d`` → ``End Cap``."""
+    if model_path is None:
+        return ""
+    stem = (model_path.stem or "").strip()
+    if not stem:
+        return ""
+    s = stem
+    # ``Treads Plus Bullnose - Appearance1`` → ``Treads Plus Bullnose``
+    s = re.sub(r"\s*-\s*Appearance\s*\d+\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*(Decal|Appearance|Appearances)\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+Appearance\s*\d+\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+Decal\s*$", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
+def _normalize_product_name_key(name: str) -> str:
+    """Lowercase key with spaces/hyphens/underscores collapsed for matching."""
+    s = (name or "").strip().lower()
+    return re.sub(r"[\s\-_]+", "-", s).strip("-")
+
+
+def _name_matches_product_token(name: str, token: str) -> bool:
+    if not name or not token:
+        return False
+    n = _normalize_product_name_key(name)
+    t = _normalize_product_name_key(token)
+    return n == t or n.startswith(t + "-") or n.startswith(t)
+
+
+def _normalize_fusion_body_name(name: str) -> str:
+    """Collapse Fusion browser spacing (incl. NBSP) for name comparisons."""
+    s = (name or "").strip().replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", s)
+
+
+def _body_base_name(name: str) -> str:
+    """``Body1 (7)`` / ``Body1(7)`` / ``body1`` → ``Body1``."""
+    s = _normalize_fusion_body_name(name)
+    if not s:
+        return ""
+    m = re.match(r"^(.+?)\s*\(\s*\d+\s*\)\s*$", s, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m2 = re.match(r"^(.+?)\(\s*\d+\s*\)\s*$", s, re.IGNORECASE)
+    if m2:
+        return m2.group(1).strip()
+    return s
+
+
+def _body_name_matches_map_anchor(name: str, anchor: str) -> bool:
+    """Case-insensitive ``Body1`` ≡ ``Body1 (7)`` ≡ ``Body1(7)``."""
+    if not name or not anchor:
+        return False
+    return _body_base_name(name).lower() == _body_base_name(anchor).lower()
+
+
+def _body_name_exact_matches(name: str, expected: str) -> bool:
+    """Exact body name match (ignores Fusion ``Body1 (1)`` copy suffix)."""
+    return _body_name_matches_map_anchor(name, expected)
+
+
+def _body_name_matches_forced(
+    body: adsk.fusion.BRepBody,
+    expected: str,
+    *,
+    exact: bool,
+) -> bool:
+    try:
+        actual = (body.name or "").strip()
+    except Exception:
+        actual = ""
+    if exact:
+        return _body_name_exact_matches(actual, expected)
+    return _name_matches_product_token(actual, expected)
+
+
+def _find_body_matching_token(
+    comp: adsk.fusion.Component,
+    main_token: str,
+) -> Optional[str]:
+    """First body on ``comp`` whose name matches the filename product token."""
+    if not main_token:
+        return None
+    try:
+        bodies = comp.bRepBodies
+        n = bodies.count
+    except Exception:
+        return None
+    for bi in range(n):
+        try:
+            body = bodies.item(bi)
+            bname = body.name or ""
+        except Exception:
+            continue
+        if _name_matches_product_token(bname, main_token):
+            return bname
+    return None
+
+
+def _main_token_is_treads_plus_assembly(main_token: str) -> bool:
+    key = _normalize_product_name_key(main_token)
+    return bool(key) and "treads-plus" in key
+
+
+def _body_matches_root_anchor(name: str) -> bool:
+    for anchor in BATCH_DECAL_ROOT_ANCHOR_BODIES:
+        if _body_name_exact_matches(name, anchor):
+            return True
+    return False
+
+
+def _find_body_by_exact_anchor_name(
+    comp: adsk.fusion.Component,
+    anchor: str,
+) -> Optional[adsk.fusion.BRepBody]:
+    if not anchor:
+        return None
+    try:
+        bodies = comp.bRepBodies
+        n = bodies.count
+    except Exception:
+        return None
+    for bi in range(n):
+        try:
+            body = bodies.item(bi)
+            bname = body.name or ""
+        except Exception:
+            continue
+        if not _body_name_exact_matches(bname, anchor):
+            continue
+        if _body_hide_for_batch(body, include_face_uv_pins=False):
+            continue
+        if not _entity_is_visible(body, default=True):
+            continue
+        return body
+    return None
+
+
+def _find_body_by_anchor_names(
+    comp: adsk.fusion.Component,
+    anchor_names: Tuple[str, ...],
+) -> Optional[str]:
+    """First visible anchor body on ``comp`` (exact name match)."""
+    for anchor in anchor_names:
+        body = _find_body_by_exact_anchor_name(comp, anchor)
+        if body is not None:
+            try:
+                return body.name or anchor
+            except Exception:
+                return anchor
+    return None
+
+
+def _resolve_root_batch_anchor_body(
+    comp: adsk.fusion.Component,
+    main_token: str,
+) -> Optional[str]:
+    """Root anchor: filename body match (L-End Cap) or tread nose body names."""
+    matched = _find_body_matching_token(comp, main_token)
+    if matched:
+        return matched
+    if _main_token_is_treads_plus_assembly(main_token):
+        return _find_body_by_anchor_names(comp, BATCH_DECAL_ROOT_ANCHOR_BODIES)
+    return None
+
+
+def _occurrence_forced_body_name_from_map(occurrence_label: str) -> Optional[str]:
+    """Explicit multi-part map (Bullnose Plank / Nose)."""
+    if not BATCH_DECAL_OCCURRENCE_BODY:
+        return None
+    label = (occurrence_label or "").strip()
+    if not label:
+        return None
+    direct = BATCH_DECAL_OCCURRENCE_BODY.get(label)
+    if direct:
+        return direct
+    label_l = label.lower()
+    for key, body_name in BATCH_DECAL_OCCURRENCE_BODY.items():
+        if key.lower() == label_l:
+            return body_name
+    return None
+
+
+def _occurrence_label_in_explicit_map(occurrence_label: str) -> bool:
+    return _occurrence_forced_body_name_from_map(occurrence_label) is not None
+
+
+def _occurrence_is_batch_target(
+    occurrence_label: str,
+    main_token: str,
+    comp: Optional[adsk.fusion.Component] = None,
+) -> bool:
+    """True when this occurrence should get the batch color-set decal."""
+    label = (occurrence_label or "").strip()
+    if not label:
+        return False
+    if label == "(root)":
+        if not BATCH_DECAL_MAIN_BODY_FROM_FILENAME or not main_token or comp is None:
+            return False
+        return _resolve_root_batch_anchor_body(comp, main_token) is not None
+    if _occurrence_label_in_explicit_map(label):
+        return True
+    if not BATCH_DECAL_MAIN_BODY_FROM_FILENAME:
+        return True
+    if not main_token:
+        return True
+    occ = _normalize_occurrence_name(label)
+    hay = occ.lower()
+    for kw in BATCH_DECAL_OCCURRENCE_SKIP_KEYWORDS:
+        if kw.lower() in hay:
+            return False
+    return _name_matches_product_token(occ, main_token)
+
+
+def _resolve_forced_body_name(
+    occurrence_label: str,
+    main_token: str,
+    comp: adsk.fusion.Component,
+) -> Optional[str]:
+    """Pinned body for chain decal — map, filename token, or body name scan."""
+    mapped = _occurrence_forced_body_name_from_map(occurrence_label)
+    if mapped:
+        return mapped
+    label = (occurrence_label or "").strip()
+    if label == "(root)" and BATCH_DECAL_MAIN_BODY_FROM_FILENAME and main_token:
+        return _resolve_root_batch_anchor_body(comp, main_token)
+    if BATCH_DECAL_MAIN_BODY_FROM_FILENAME and main_token:
+        if _occurrence_is_batch_target(occurrence_label, main_token, comp):
+            occ = _normalize_occurrence_name(occurrence_label)
+            if _name_matches_product_token(occ, main_token):
+                return occ
+            matched = _find_body_matching_token(comp, main_token)
+            if matched:
+                return matched
+    return None
+
+
+def _read_decal_chain_faces_flag(decal: adsk.fusion.Decal) -> Optional[bool]:
+    for attr in ("isChainFaces", "chainFaces"):
+        try:
+            return bool(getattr(decal, attr))
+        except Exception:
+            continue
+    return None
+
+
+def _read_decal_z_angle_deg(decal: adsk.fusion.Decal) -> Optional[float]:
+    for attr in ("zAngle", "z_angle", "angleZ"):
+        try:
+            val = getattr(decal, attr)
+            if val is not None:
+                return float(val)
+        except Exception:
+            continue
+    return None
+
+
+def _probe_template_decals_on_component(
+    comp: adsk.fusion.Component,
+) -> Optional[TemplateDecalHint]:
+    """Read chain/Z from the largest user decal on ``comp`` (before removal)."""
+    if not BATCH_DECAL_INHERIT_TEMPLATE_DECAL:
+        return None
+    try:
+        decals = comp.decals
+        n = decals.count
+    except Exception:
+        return None
+    best: Optional[TemplateDecalHint] = None
+    best_score = -1.0
+    for i in range(n):
+        try:
+            d = decals.item(i)
+        except Exception:
+            continue
+        try:
+            d_name = d.name or ""
+        except Exception:
+            d_name = ""
+        if d_name.startswith(BATCH_DECAL_NAME_PREFIX):
+            continue
+        score = 1.0
+        try:
+            m = d.transform
+            if m is not None:
+                _o, x_axis, y_axis, _z = m.getAsCoordinateSystem()
+                score = max(_vector_length(x_axis), _vector_length(y_axis))
+        except Exception:
+            pass
+        hint = TemplateDecalHint(
+            chain_faces=_read_decal_chain_faces_flag(d),
+            z_angle_deg=_read_decal_z_angle_deg(d),
+            name=d_name,
+        )
+        if score > best_score:
+            best_score = score
+            best = hint
+    return best
+
+
+def _resolve_chain_faces_for_decal(
+    face: adsk.fusion.BRepFace,
+    body: Optional[adsk.fusion.BRepBody],
+    template_hint: Optional[TemplateDecalHint],
+) -> bool:
+    if (
+        BATCH_DECAL_INHERIT_TEMPLATE_CHAIN
+        and template_hint is not None
+        and template_hint.chain_faces is not None
+    ):
+        return bool(template_hint.chain_faces)
+    if not BATCH_DECAL_CHAIN_FACES:
+        return False
+    if face is not None:
+        spread = _face_curvature_spread_deg(face)
+        if spread > float(BATCH_DECAL_CHAIN_FACES_CURVED_MAX_DEG):
+            return False
+    return True
+
+
+def _resolve_decal_grain_orientation(
+    face: adsk.fusion.BRepFace,
+    body: Optional[adsk.fusion.BRepBody],
+    use_chain: bool,
+    template_hint: Optional[TemplateDecalHint],
+) -> Tuple[float, bool, bool]:
+    """Return ``(z_angle_deg, use_align_grain, align_after_z)`` for this face."""
+    use_align = bool(BATCH_DECAL_ALIGN_GRAIN_TO_LENGTH) and body is not None
+    if (
+        BATCH_DECAL_INHERIT_TEMPLATE_Z_ANGLE
+        and template_hint is not None
+        and template_hint.z_angle_deg is not None
+    ):
+        z_deg = float(template_hint.z_angle_deg)
+        if use_align and use_chain:
+            return z_deg, True, True
+        if use_align and not use_chain and abs(z_deg) < 1e-9:
+            return z_deg, True, False
+        return z_deg, False, False
+    if use_chain:
+        # Z=90 first for chain wrap; align X to body length after (body orientation varies).
+        return float(BATCH_DECAL_Z_ANGLE_DEG), use_align, True
+    return float(BATCH_DECAL_Z_ANGLE_CURVED_DEG), use_align, False
+
+
+def _record_decal_placement(
+    decal: adsk.fusion.Decal,
+    record: DecalPlacementRecord,
+) -> None:
+    try:
+        _DECAL_PLACEMENT_CACHE[id(decal)] = record
+    except Exception:
+        pass
+
+
+def _remove_existing_decals_on_component(
+    comp: adsk.fusion.Component,
+    lines: List[str],
+    label: str,
+) -> Optional[TemplateDecalHint]:
+    """Remove user-authored decals on main body; return probed template hint."""
+    template_hint = _probe_template_decals_on_component(comp)
+    if template_hint and template_hint.name:
+        parts: List[str] = []
+        if template_hint.chain_faces is not None:
+            parts.append("chain={}".format(template_hint.chain_faces))
+        if template_hint.z_angle_deg is not None:
+            parts.append("Z={:.1f}°".format(template_hint.z_angle_deg))
+        if parts:
+            inherit_note = ""
+            if not (
+                BATCH_DECAL_INHERIT_TEMPLATE_CHAIN
+                or BATCH_DECAL_INHERIT_TEMPLATE_Z_ANGLE
+            ):
+                inherit_note = " (reference only — using geometry rules)"
+            lines.append(
+                "  {}: template decal '{}' → {}{}".format(
+                    label, template_hint.name, ", ".join(parts), inherit_note
+                )
+            )
+    if not BATCH_DECAL_REMOVE_EXISTING_ON_MAIN:
+        return template_hint
+    removed = 0
+    try:
+        decals = comp.decals
+        n = decals.count
+    except Exception:
+        return template_hint
+    for i in range(n - 1, -1, -1):
+        try:
+            d = decals.item(i)
+        except Exception:
+            continue
+        try:
+            d_name = d.name or ""
+        except Exception:
+            d_name = ""
+        if d_name.startswith(BATCH_DECAL_NAME_PREFIX):
+            continue
+        try:
+            d.deleteMe()
+            removed += 1
+        except Exception:
+            continue
+    if removed:
+        lines.append(
+            "  {}: removed {} existing decal(s) before batch placement".format(
+                label, removed
+            )
+        )
+    return template_hint
+
+
+def _occurrence_forced_body_name(
+    occurrence_label: str,
+    main_token: str = "",
+    comp: Optional[adsk.fusion.Component] = None,
+) -> Optional[str]:
+    """Return pinned body name for this occurrence, if any."""
+    if comp is not None:
+        return _resolve_forced_body_name(occurrence_label, main_token, comp)
+    mapped = _occurrence_forced_body_name_from_map(occurrence_label)
+    if mapped:
+        return mapped
+    if BATCH_DECAL_MAIN_BODY_FROM_FILENAME and main_token:
+        occ = _normalize_occurrence_name(occurrence_label)
+        if _name_matches_product_token(occ, main_token):
+            return occ
+    return None
+
+
+def _body_name_matches(body: adsk.fusion.BRepBody, expected: str) -> bool:
+    try:
+        actual = (body.name or "").strip()
+    except Exception:
+        actual = ""
+    if _body_matches_root_anchor(expected):
+        return _body_name_exact_matches(actual, expected)
+    return _name_matches_product_token(actual, expected)
+
+
+def _forced_body_uses_exact_match(label: str, forced_body: Optional[str]) -> bool:
+    if not forced_body:
+        return False
+    if _occurrence_label_in_explicit_map(label):
+        return True
+    if label == "(root)" and _body_matches_root_anchor(forced_body):
+        return True
+    return False
+
+
+def _find_body_by_map_anchor_name(
+    comp: adsk.fusion.Component,
+    anchor: str,
+) -> Optional[adsk.fusion.BRepBody]:
+    """Visible body named ``Body1`` / ``Body1 (7)`` on ``comp``."""
+    if not anchor:
+        return None
+    try:
+        bodies = comp.bRepBodies
+        n = bodies.count
+    except Exception:
+        return None
+    for bi in range(n):
+        try:
+            body = bodies.item(bi)
+            bname = body.name or ""
+        except Exception:
+            continue
+        if not _body_name_matches_map_anchor(bname, anchor):
+            continue
+        if not _entity_is_visible(body, default=True):
+            continue
+        return body
+    return None
+
+
+def _body_decal_rank_multiplier(
+    body: adsk.fusion.BRepBody,
+    label: str,
+    original_appearance_names: Optional[Dict[int, str]] = None,
+) -> float:
+    """Rank bodies for per-occurrence decal anchor selection."""
+    try:
+        body_name = (body.name or "").strip()
+    except Exception:
+        body_name = ""
+    for prefer in BATCH_DECAL_BODY_PREFER_NAMES:
+        if _body_name_matches_map_anchor(body_name, prefer):
+            return float(BATCH_DECAL_BODY_PREFER_NAME_RANK)
+    haystack = _body_filter_haystack(body, label, original_appearance_names)
+    for kw in BATCH_DECAL_BODY_PREFER_KEYWORDS:
+        if kw.lower() in haystack:
+            return 4.0
+    return 1.0
+
+
+def _face_normal_unit(
+    face: adsk.fusion.BRepFace,
+) -> Optional[Tuple[float, float, float]]:
+    pt = _on_face_point(face)
+    if pt is None:
+        return None
+    return _face_normal_at_point(face, pt)
+
+
+def _is_world_vertical_face(face: adsk.fusion.BRepFace) -> bool:
+    """True when face normal is horizontal in Fusion Z-up (vertical wall)."""
+    if not BATCH_DECAL_SKIP_WORLD_VERTICAL:
+        return False
+    normal = _face_normal_unit(face)
+    if normal is None:
+        return False
+    return abs(normal[2]) < float(BATCH_DECAL_WORLD_VERTICAL_Z_DOT)
+
+
+def _tread_show_alignment(
+    normal: Tuple[float, float, float],
+) -> float:
+    """How much the face normal points toward a show surface (+Z or ±Y tread)."""
+    z_up = max(0.0, normal[2])
+    if not BATCH_DECAL_PRIMARY_ALLOW_Y_SHOW:
+        return z_up
+    y_show = abs(normal[1])
+    if y_show >= float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT):
+        return max(z_up, y_show)
+    return z_up
+
+
+def _is_vertical_side_face(
+    face: adsk.fusion.BRepFace,
+    body: adsk.fusion.BRepBody,
+) -> bool:
+    """True for side bands — not tread tops facing +Z or ±Y (Full Front show)."""
+    normal = _face_normal_unit(face)
+    if normal is None:
+        return False
+    if _tread_show_alignment(normal) >= float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT):
+        return False
+    if abs(normal[2]) < float(BATCH_DECAL_WORLD_VERTICAL_Z_DOT):
+        return True
+    if not BATCH_DECAL_SKIP_VERTICAL_SIDES:
+        return False
+    length, _width, thickness = _body_bbox_axes(body)
+    dot_len = abs(_vec3_dot(normal, length))
+    dot_thick = abs(_vec3_dot(normal, thickness))
+    return (
+        dot_len < float(BATCH_DECAL_VERTICAL_SIDE_LENGTH_DOT)
+        and dot_thick < float(BATCH_DECAL_VERTICAL_SIDE_THICKNESS_DOT)
+        and abs(normal[2]) < float(BATCH_DECAL_WORLD_VERTICAL_Z_DOT)
+    )
+
+
+def _is_chamfer_or_slope_face(
+    face: adsk.fusion.BRepFace,
+) -> bool:
+    """True when the normal is not axis-aligned (45° chamfers, etc.)."""
+    normal = _face_normal_unit(face)
+    if normal is None:
+        return True
+    peak = max(abs(normal[0]), abs(normal[1]), abs(normal[2]))
+    return peak < float(BATCH_DECAL_PRIMARY_STRICT_SHOW_DOT)
+
+
+def _qualifies_primary_anchor_face(
+    face: adsk.fusion.BRepFace,
+    body: adsk.fusion.BRepBody,
+) -> bool:
+    """Stricter filter for chain-mode tread-top anchor."""
+    if _face_area(face) < float(BATCH_DECAL_PRIMARY_MIN_FACE_AREA_CM2):
+        return False
+    if _is_chamfer_or_slope_face(face):
+        return False
+    if body is not None and _is_end_cap_face(face, body):
+        return False
+    if body is not None and _is_vertical_side_face(face, body):
+        return False
+    if BATCH_DECAL_SKIP_DOWN_FACING and (
+        _face_up_score(face) < BATCH_DECAL_DOWN_FACE_THRESHOLD
+    ):
+        return False
+    if BATCH_DECAL_SKIP_CURVED_FACES and (
+        _face_curvature_spread_deg(face) > BATCH_DECAL_CURVED_FACE_MAX_DEG
+    ):
+        return False
+    if not BATCH_DECAL_PRIMARY_USE_WORLD_UP:
+        return True
+    normal = _face_normal_unit(face)
+    if normal is None:
+        return False
+    align = _tread_show_alignment(normal)
+    if align < float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT):
+        return False
+    return align >= float(BATCH_DECAL_PRIMARY_STRICT_SHOW_DOT)
+
+
+def _body_bbox_show_plane_floor_cm(
+    body: adsk.fusion.BRepBody,
+    face_normal: Optional[Tuple[float, float, float]] = None,
+) -> Tuple[float, float]:
+    """Length × width in the tread show plane — lower bound for chain-face scale."""
+    dx, dy, dz = _body_bbox_dims_cm(body)
+    if face_normal is None:
+        ranked = sorted((dx, dy, dz), reverse=True)
+        return ranked[0], ranked[1]
+
+    nx, ny, nz = face_normal
+    abs_n = (abs(nx), abs(ny), abs(nz))
+    if abs_n[1] >= max(abs_n[0], abs_n[2]) and abs_n[1] >= 0.5:
+        in_plane = (dx, dz)
+    elif abs_n[2] >= max(abs_n[0], abs_n[1]) and abs_n[2] >= 0.5:
+        in_plane = (dx, dy)
+    elif abs_n[0] >= 0.5:
+        in_plane = (dy, dz)
+    else:
+        ranked = sorted((dx, dy, dz), reverse=True)
+        return ranked[0], ranked[1]
+    return max(in_plane), min(in_plane)
+
+
+def _face_exterior_along_normal(
+    face: adsk.fusion.BRepFace,
+    body: adsk.fusion.BRepBody,
+) -> float:
+    """Positive when the face points outward from the body bbox center."""
+    pt = _on_face_point(face)
+    normal = _face_normal_unit(face)
+    if pt is None or normal is None:
+        return 0.0
+    try:
+        bbox = body.boundingBox
+        if bbox is None:
+            return 0.0
+        cx = (bbox.minPoint.x + bbox.maxPoint.x) * 0.5
+        cy = (bbox.minPoint.y + bbox.maxPoint.y) * 0.5
+        cz = (bbox.minPoint.z + bbox.maxPoint.z) * 0.5
+        vx = pt.x - cx
+        vy = pt.y - cy
+        vz = pt.z - cz
+        return vx * normal[0] + vy * normal[1] + vz * normal[2]
+    except Exception:
+        return 0.0
+
+
+def _primary_show_face_score(
+    face: adsk.fusion.BRepFace,
+    body: adsk.fusion.BRepBody,
+) -> float:
+    """Rank faces for tread-top anchoring (area × show alignment × exterior)."""
+    area = _face_area(face)
+    normal = _face_normal_unit(face)
+    score = area
+    if normal is not None:
+        align = _tread_show_alignment(normal)
+        score *= 1.0 + 4.0 * align
+        if align >= float(BATCH_DECAL_PRIMARY_STRICT_SHOW_DOT):
+            score *= 2.0
+    exterior = _face_exterior_along_normal(face, body)
+    if exterior > 0.0:
+        score *= 1.5
+    elif exterior < 0.0:
+        score *= 0.25
+    try:
+        if isinstance(face.geometry, adsk.core.Plane):
+            score *= 1.25
+    except Exception:
+        pass
+    return score
+
+
+def _face_show_diagnostic_line(
+    face: adsk.fusion.BRepFace,
+    body: adsk.fusion.BRepBody,
+) -> str:
+    normal = _face_normal_unit(face)
+    if normal is None:
+        return "normal=?"
+    show = _tread_show_alignment(normal)
+    return "normal=({:+.2f},{:+.2f},{:+.2f}) show={:.2f} |n·z|={:.2f} |n·y|={:.2f}".format(
+        normal[0],
+        normal[1],
+        normal[2],
+        show,
+        abs(normal[2]),
+        abs(normal[1]),
+    )
+
+
+def _is_end_cap_face(
+    face: adsk.fusion.BRepFace,
+    body: adsk.fusion.BRepBody,
+) -> bool:
+    """True for short cut faces at the ends of a long body (plank length axis)."""
+    if not BATCH_DECAL_SKIP_END_CAP_FACES:
+        return False
+    pt = _on_face_point(face)
+    if pt is None:
+        return False
+    normal = _face_normal_at_point(face, pt)
+    if normal is None:
+        return False
+    lx, ly, lz = _body_unit_length_axis(body)
+    dot = abs(normal[0] * lx + normal[1] * ly + normal[2] * lz)
+    return dot >= float(BATCH_DECAL_END_CAP_NORMAL_DOT)
+
+
+def _face_qualifies_for_decal(
+    face: adsk.fusion.BRepFace,
+    body: Optional[adsk.fusion.BRepBody] = None,
+) -> bool:
+    """Shared filters for show faces (not end caps / vertical sides / undersides)."""
+    if _face_area(face) < BATCH_DECAL_MIN_FACE_AREA_CM2:
+        return False
+    if body is not None and _is_end_cap_face(face, body):
+        return False
+    if body is not None and _is_vertical_side_face(face, body):
+        return False
+    if BATCH_DECAL_SKIP_DOWN_FACING and (
+        _face_up_score(face) < BATCH_DECAL_DOWN_FACE_THRESHOLD
+    ):
+        return False
+    if BATCH_DECAL_SKIP_CURVED_FACES and (
+        _face_curvature_spread_deg(face) > BATCH_DECAL_CURVED_FACE_MAX_DEG
+    ):
+        return False
+    return True
+
+
+def _pick_relaxed_face_for_forced_body(
+    body: adsk.fusion.BRepBody,
+    *,
+    permissive: bool = False,
+) -> Optional[adsk.fusion.BRepFace]:
+    """Fallback for occurrence-mapped bodies (curved bullnose, split tops)."""
+    min_area = float(BATCH_DECAL_MIN_FACE_AREA_CM2)
+    best: Optional[adsk.fusion.BRepFace] = None
+    best_score = 0.0
+    largest_any: Optional[adsk.fusion.BRepFace] = None
+    largest_area = 0.0
+    try:
+        faces = body.faces
+        n = faces.count
+    except Exception:
+        return None
+    for i in range(n):
+        try:
+            f = faces.item(i)
+        except Exception:
+            continue
+        area = _face_area(f)
+        if area > largest_area:
+            largest_area = area
+            largest_any = f
+        if area < min_area:
+            continue
+        if not permissive:
+            if _is_vertical_side_face(f, body):
+                continue
+            if BATCH_DECAL_SKIP_DOWN_FACING and (
+                _face_up_score(f) < BATCH_DECAL_DOWN_FACE_THRESHOLD
+            ):
+                continue
+        normal = _face_normal_unit(f)
+        align = _tread_show_alignment(normal) if normal is not None else 0.0
+        score = area * (0.25 + align)
+        if score > best_score:
+            best_score = score
+            best = f
+    if best is not None:
+        return best
+    if permissive and largest_any is not None:
+        return largest_any
+    return largest_any
+
+
+def _pick_primary_show_face_for_body(
+    body: adsk.fusion.BRepBody,
+    *,
+    occurrence_mapped: bool = False,
+) -> Optional[adsk.fusion.BRepFace]:
+    """Best tread-top anchor — large +Z or ±Y show face (Plank + Nose)."""
+    strict_best: Optional[adsk.fusion.BRepFace] = None
+    strict_score = 0.0
+    relaxed_best: Optional[adsk.fusion.BRepFace] = None
+    relaxed_score = 0.0
+    try:
+        faces = body.faces
+        n = faces.count
+    except Exception:
+        return None
+    for i in range(n):
+        try:
+            f = faces.item(i)
+        except Exception:
+            continue
+        if _face_area(f) < float(BATCH_DECAL_PRIMARY_MIN_FACE_AREA_CM2):
+            continue
+        if _is_chamfer_or_slope_face(f):
+            continue
+        if _is_end_cap_face(f, body):
+            continue
+        if _is_vertical_side_face(f, body):
+            continue
+        if BATCH_DECAL_SKIP_DOWN_FACING and (
+            _face_up_score(f) < BATCH_DECAL_DOWN_FACE_THRESHOLD
+        ):
+            continue
+        normal = _face_normal_unit(f)
+        if normal is None:
+            continue
+        align = _tread_show_alignment(normal)
+        if align < float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT):
+            continue
+        score = _primary_show_face_score(f, body)
+        if align >= float(BATCH_DECAL_PRIMARY_STRICT_SHOW_DOT):
+            if score > strict_score:
+                strict_score = score
+                strict_best = f
+        elif score > relaxed_score:
+            relaxed_score = score
+            relaxed_best = f
+    result = strict_best if strict_best is not None else relaxed_best
+    if result is not None or not occurrence_mapped:
+        return result
+    result = _pick_relaxed_face_for_forced_body(body, permissive=False)
+    if result is not None:
+        return result
+    return _pick_relaxed_face_for_forced_body(body, permissive=True)
+
+
+def _body_corners_cm(body: adsk.fusion.BRepBody) -> List[adsk.core.Point3D]:
+    """Eight corners of the body bounding box."""
+    out: List[adsk.core.Point3D] = []
+    try:
+        bbox = body.boundingBox
+        if bbox is None:
+            return out
+        mn, mx = bbox.minPoint, bbox.maxPoint
+        for x in (mn.x, mx.x):
+            for y in (mn.y, mx.y):
+                for z in (mn.z, mx.z):
+                    out.append(adsk.core.Point3D.create(x, y, z))
+    except Exception:
+        pass
+    return out
+
+
+def _is_extrusion_profile_product(
+    model_path: Optional[Path],
+    main_token: str,
+) -> bool:
+    """End Cap–style extrusions: chain off, exterior top face set."""
+    parts: List[str] = []
+    if main_token:
+        parts.append(main_token)
+    if model_path is not None:
+        try:
+            parts.append(model_path.stem or "")
+        except Exception:
+            pass
+    hay = " ".join(parts).lower()
+    for tok in BATCH_DECAL_EXTRUSION_PROFILE_TOKENS:
+        if tok.lower() in hay:
+            return True
+    return False
+
+
+def _chain_faces_for_product(
+    model_path: Optional[Path],
+    main_token: str,
+    occurrence_label: str,
+) -> bool:
+    """Chain ON for tread/bullnose; OFF for extrusion-profile products."""
+    if not BATCH_DECAL_CHAIN_FACES:
+        return False
+    if _is_extrusion_profile_product(model_path, main_token):
+        return False
+    if _occurrence_label_in_explicit_map(occurrence_label):
+        return True
+    hay = ((occurrence_label or "") + " " + (main_token or "")).lower()
+    for kw in ("nose", "bullnose", "plank", "tread"):
+        if kw in hay:
+            return True
+    return bool(BATCH_DECAL_CHAIN_FACES)
+
+
+def _adjacent_faces_same_body(
+    face: adsk.fusion.BRepFace,
+) -> List[adsk.fusion.BRepFace]:
+    """Faces sharing an edge with ``face``."""
+    out: List[adsk.fusion.BRepFace] = []
+    seen: set = set()
+    try:
+        edges = face.edges
+        n_e = edges.count
+    except Exception:
+        return out
+    for ei in range(n_e):
+        try:
+            edge = edges.item(ei)
+            adj_faces = edge.faces
+            n_f = adj_faces.count
+        except Exception:
+            continue
+        for fi in range(n_f):
+            try:
+                nf = adj_faces.item(fi)
+            except Exception:
+                continue
+            try:
+                key = id(nf)
+            except Exception:
+                key = None
+            if nf is face or key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            out.append(nf)
+    return out
+
+
+def _face_qualifies_extrusion_top(
+    face: adsk.fusion.BRepFace,
+    body: adsk.fusion.BRepBody,
+) -> bool:
+    """Exterior flat +Y top band — no slopes, cuts, or cavity walls."""
+    if _face_area(face) < float(BATCH_DECAL_MIN_FACE_AREA_CM2):
+        return False
+    if _is_end_cap_face(face, body):
+        return False
+    if _is_vertical_side_face(face, body):
+        return False
+    if BATCH_DECAL_SKIP_DOWN_FACING and (
+        _face_up_score(face) < BATCH_DECAL_DOWN_FACE_THRESHOLD
+    ):
+        return False
+    normal = _face_normal_unit(face)
+    if normal is None:
+        return False
+    if abs(normal[1]) < float(BATCH_DECAL_EXTRUSION_TOP_MIN_Y_DOT):
+        return False
+    if _face_exterior_along_normal(face, body) <= 0.0:
+        return False
+    return True
+
+
+def _pick_extrusion_top_faces(
+    body: adsk.fusion.BRepBody,
+    seed: Optional[adsk.fusion.BRepFace],
+) -> List[adsk.fusion.BRepFace]:
+    """Connected exterior +Y tops (chain-off multi-face decal, no inner/cut)."""
+    if seed is None:
+        seed = _pick_primary_show_face_for_body(body, occurrence_mapped=True)
+    if seed is None:
+        return []
+    picked: List[adsk.fusion.BRepFace] = []
+    seen: set = set()
+    queue: List[adsk.fusion.BRepFace] = [seed]
+    while queue:
+        f = queue.pop(0)
+        try:
+            fid = id(f)
+        except Exception:
+            continue
+        if fid in seen:
+            continue
+        seen.add(fid)
+        if not _face_qualifies_extrusion_top(f, body):
+            continue
+        picked.append(f)
+        for nb in _adjacent_faces_same_body(f):
+            try:
+                nid = id(nb)
+            except Exception:
+                continue
+            if nid not in seen:
+                queue.append(nb)
+    picked.sort(key=lambda ff: _face_area(ff), reverse=True)
+    return picked
+
+
+def _apply_bbox_floor_to_decal_needs(
+    need_x: float,
+    need_y: float,
+    x_axis: adsk.core.Vector3D,
+    y_axis: adsk.core.Vector3D,
+    body: adsk.fusion.BRepBody,
+    face_normal: Optional[Tuple[float, float, float]],
+) -> Tuple[float, float]:
+    """Apply body bbox floor along decal long/short axes (not blind X/Y)."""
+    floor_long, floor_short = _body_bbox_show_plane_floor_cm(body, face_normal)
+    length = _body_unit_length_axis(body)
+    x_u = _vec3_normalize(_vec3_from_vector3d(x_axis))
+    y_u = _vec3_normalize(_vec3_from_vector3d(y_axis))
+    if x_u is None or y_u is None:
+        return max(need_x, floor_long), max(need_y, floor_short)
+    x_al = abs(_vec3_dot(x_u, length))
+    y_al = abs(_vec3_dot(y_u, length))
+    if y_al >= x_al:
+        return max(need_x, floor_short), max(need_y, floor_long)
+    return max(need_x, floor_long), max(need_y, floor_short)
+
+
+def _decal_axes_extents_needed_cm(
+    trf: adsk.core.Matrix3D,
+    face: adsk.fusion.BRepFace,
+    body: Optional[adsk.fusion.BRepBody],
+    *,
+    chain_faces: Optional[bool] = None,
+) -> Tuple[float, float]:
+    """Span along decal X/Y required to cover body (chain faces) or face."""
+    use_chain = (
+        bool(BATCH_DECAL_CHAIN_FACES)
+        if chain_faces is None
+        else bool(chain_faces)
+    )
+    try:
+        origin, x_axis, y_axis, _z_axis = trf.getAsCoordinateSystem()
+    except Exception:
+        return _face_long_dims(face)
+
+    x_len = _vector_length(x_axis)
+    y_len = _vector_length(y_axis)
+    if x_len < 1e-9 or y_len < 1e-9:
+        return _face_long_dims(face)
+
+    x_u = adsk.core.Vector3D.create(
+        x_axis.x / x_len, x_axis.y / x_len, x_axis.z / x_len
+    )
+    y_u = adsk.core.Vector3D.create(
+        y_axis.x / y_len, y_axis.y / y_len, y_axis.z / y_len
+    )
+
+    points: List[adsk.core.Point3D] = []
+    if body is not None and use_chain:
+        points = _body_corners_cm(body)
+    if not points:
+        try:
+            bbox = face.boundingBox
+            if bbox is not None:
+                mn, mx = bbox.minPoint, bbox.maxPoint
+                for x in (mn.x, mx.x):
+                    for y in (mn.y, mx.y):
+                        for z in (mn.z, mx.z):
+                            points.append(adsk.core.Point3D.create(x, y, z))
+        except Exception:
+            pass
+    if not points:
+        return _face_long_dims(face)
+
+    x_vals: List[float] = []
+    y_vals: List[float] = []
+    for p in points:
+        vx = p.x - origin.x
+        vy = p.y - origin.y
+        vz = p.z - origin.z
+        x_vals.append(vx * x_u.x + vy * x_u.y + vz * x_u.z)
+        y_vals.append(vx * y_u.x + vy * y_u.y + vz * y_u.z)
+    need_x = max(x_vals) - min(x_vals)
+    need_y = max(y_vals) - min(y_vals)
+    if body is not None and BATCH_DECAL_SCALE_USE_BBOX_FLOOR:
+        face_normal = _face_normal_unit(face)
+        need_x, need_y = _apply_bbox_floor_to_decal_needs(
+            need_x, need_y, x_axis, y_axis, body, face_normal
+        )
+    if need_x < 0.1 or need_y < 0.1:
+        return _face_long_dims(face)
+    return need_x, need_y
+
+
+def _batch_decal_one_per_body_chain() -> bool:
+    """One chain-wrapped decal per body on the primary show face."""
+    return bool(BATCH_DECAL_CHAIN_FACES) and not bool(BATCH_DECAL_ALL_FACES)
+
+
+def _body_is_show_surface(
+    body: adsk.fusion.BRepBody,
+    label: str,
+    original_appearance_names: Optional[Dict[int, str]] = None,
+    *,
+    trust_map_anchor: bool = False,
+) -> bool:
+    """Skip foam pads, substrate (bamboo/paint/vinyl), lights, etc."""
+    if trust_map_anchor:
+        try:
+            haystack = (body.name or "").lower()
+        except Exception:
+            haystack = ""
+    else:
+        haystack = _body_filter_haystack(body, label, original_appearance_names)
+    for kw in BATCH_DECAL_BODY_SKIP_KEYWORDS:
+        k = kw.lower()
+        if k in haystack:
+            return False
+    return True
+
+
+_PROTECTED_SUBSTRATE_BODY_KEYWORDS: Tuple[str, ...] = (
+    "foam",
+    "pad",
+    "substrate",
+)
+
+
+def _body_is_protected_substrate_body(
+    body: adsk.fusion.BRepBody,
+    label: str = "",
+) -> bool:
+    """True for foam-pad / substrate bodies that must keep white/grey materials."""
+    haystack = _body_filter_haystack(body, label, None)
+    for kw in _PROTECTED_SUBSTRATE_BODY_KEYWORDS:
+        if kw in haystack:
+            return True
+    return False
+
+
+def _image_pixel_size(image_path: Optional[Path]) -> Optional[Tuple[int, int]]:
+    """Return (width, height) for fit logging / aspect hints."""
+    if not image_path or not image_path.is_file():
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(str(image_path)) as im:
+            return int(im.size[0]), int(im.size[1])
+    except Exception:
+        return None
+
+
+def _matrix_from_axes(
+    origin: adsk.core.Point3D,
+    x_axis: adsk.core.Vector3D,
+    y_axis: adsk.core.Vector3D,
+    z_axis: adsk.core.Vector3D,
+) -> Tuple[Optional[adsk.core.Matrix3D], Optional[str]]:
+    """Build a Matrix3D from a decal coordinate system (multi-method fallback)."""
+    m = adsk.core.Matrix3D.create()
+    for method_name in (
+        "setWithCoordinateSystem",
+        "setToCoordinateSystem",
+        "setToAlignCoordinateSystems",
+    ):
+        try:
+            method = getattr(m, method_name)
+            method(origin, x_axis, y_axis, z_axis)
+            return m, None
+        except TypeError:
+            continue
+        except Exception as ex:
+            return None, "{}: {}".format(method_name, ex)
+    return None, "no coordinate-system setter on Matrix3D"
+
+
+def _apply_xy_scale_to_transform(
+    trf: adsk.core.Matrix3D,
+    origin: adsk.core.Point3D,
+    scale_xy: float,
+) -> Tuple[Optional[adsk.core.Matrix3D], Optional[str]]:
+    """Scale decal X/Y uniformly via transformBy (works when setToAlign fails)."""
+    if scale_xy <= 1e-9:
+        try:
+            return trf.copy(), None
+        except Exception:
+            return trf, None
+
+    scaled = trf.copy()
+    last_err = "scale transformBy failed"
+
+    scale_vec = adsk.core.Vector3D.create(scale_xy, scale_xy, 1.0)
+    for method_name, args in (
+        ("setWithScale", (scale_vec, origin)),
+        ("setToScale", (scale_xy, origin)),
+    ):
+        try:
+            scale_mat = adsk.core.Matrix3D.create()
+            getattr(scale_mat, method_name)(*args)
+            scaled.transformBy(scale_mat)
+            return scaled, None
+        except Exception as ex:
+            last_err = "{}: {}".format(method_name, ex)
+
+    try:
+        _o, x_axis, y_axis, z_axis = trf.getAsCoordinateSystem()
+        new_x = adsk.core.Vector3D.create(
+            x_axis.x * scale_xy, x_axis.y * scale_xy, x_axis.z * scale_xy
+        )
+        new_y = adsk.core.Vector3D.create(
+            y_axis.x * scale_xy, y_axis.y * scale_xy, y_axis.z * scale_xy
+        )
+        rebuilt, err = _matrix_from_axes(origin, new_x, new_y, z_axis)
+        if rebuilt is not None:
+            return rebuilt, None
+        if err:
+            last_err = err
+    except Exception as ex:
+        last_err = str(ex)
+    return None, last_err
+
+
 def _slice_image_for_tile(
     src_path: Path, ix: int, iy: int, nx: int, ny: int
 ) -> Optional[Path]:
@@ -1267,6 +2787,14 @@ def _collect_decal_anchor_points(
     seen: set = set()
     out: List[adsk.core.Point3D] = []
 
+    # API-provided on-face point — trust even when distance check is finicky.
+    pon = _on_face_point(face)
+    if pon is not None:
+        key = _point_key(pon)
+        if key not in seen:
+            seen.add(key)
+            out.append(pon)
+
     def _add(pt: Optional[adsk.core.Point3D]) -> None:
         if pt is None or len(out) >= max_points:
             return
@@ -1354,51 +2882,501 @@ def _on_face_point(face: adsk.fusion.BRepFace) -> Optional[adsk.core.Point3D]:
     return None
 
 
+def _face_normal_at_point(
+    face: adsk.fusion.BRepFace,
+    point: adsk.core.Point3D,
+) -> Optional[Tuple[float, float, float]]:
+    """Unit surface normal at ``point`` on ``face``, or None."""
+    try:
+        ev = face.evaluator
+        if ev is None:
+            return None
+        param: Optional[adsk.core.Point2D] = None
+        try:
+            ok, param = ev.getParameterAtPoint(point)
+        except Exception:
+            ok = False
+        if not ok or param is None:
+            ok, prange = ev.parametricRange()
+            if not ok or prange is None:
+                return None
+            param = adsk.core.Point2D.create(
+                (prange.minPoint.x + prange.maxPoint.x) / 2.0,
+                (prange.minPoint.y + prange.maxPoint.y) / 2.0,
+            )
+        ok2, n = ev.getNormalAtParameter(param)
+        if not ok2 or n is None:
+            return None
+        mag = math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z)
+        if mag <= 1e-9:
+            return None
+        return (n.x / mag, n.y / mag, n.z / mag)
+    except Exception:
+        return None
+
+
+def _batch_decal_use_tiling() -> bool:
+    """Tiling and chain-faces conflict — chain faces wins (one decal per face)."""
+    return bool(BATCH_DECAL_TILE) and not bool(BATCH_DECAL_CHAIN_FACES)
+
+
+def _build_scale_fit_diag_lines(
+    *,
+    need_x: float,
+    need_y: float,
+    default_x_cm: float,
+    default_y_cm: float,
+    fit_x: float,
+    fit_y: float,
+    fit_base: float,
+    panoramic_mult: float,
+    axis_mult: float,
+    margin: float,
+    ui_mult: float,
+    scale_xy: float,
+    image_path: Optional[Path],
+    chain_faces: bool,
+) -> List[str]:
+    """Summary lines: model span (cm), Fusion default decal (cm), image (px), scale."""
+    model_long = max(need_x, need_y)
+    model_short = min(need_x, need_y)
+    decal_long = max(default_x_cm, default_y_cm)
+    decal_short = min(default_x_cm, default_y_cm)
+    ratio_long = model_long / max(decal_long, 1e-9)
+
+    px = _image_pixel_size(image_path)
+    if px is not None:
+        img_w, img_h = px
+        img_long = max(img_w, img_h)
+        img_short = min(img_w, img_h)
+        img_line = "image={}x{}px (long={}px short={}px)".format(
+            img_w, img_h, img_long, img_short
+        )
+    else:
+        img_line = "image=(unavailable)"
+
+    lines = [
+        "  DIAG scale fit: model_need={:.1f}x{:.1f}cm (long={:.1f} short={:.1f}) chain={}".format(
+            need_x, need_y, model_long, model_short, "on" if chain_faces else "off"
+        ),
+        "    default_decal={:.2f}x{:.2f}cm (long={:.2f} short={:.2f}) "
+        "model_long/decal_long={:.2f}".format(
+            default_x_cm, default_y_cm, decal_long, decal_short, ratio_long
+        ),
+        "    {} fit_x={:.3f} fit_y={:.3f} fit_base={:.3f} axis_mult={:.1f}".format(
+            img_line, fit_x, fit_y, fit_base, axis_mult
+        ),
+    ]
+    if abs(panoramic_mult - 1.0) > 1e-6:
+        lines.append("    panoramic_mult={:.3f}".format(panoramic_mult))
+    lines.append(
+        "    margin={:.2f} ui_mult={:.2f} -> scale_xy={:.3f}".format(
+            margin, ui_mult, scale_xy
+        )
+    )
+    return lines
+
+
+def _apply_scale_plane_xy_to_matrix(
+    trf: adsk.core.Matrix3D,
+    face: adsk.fusion.BRepFace,
+    body: Optional[adsk.fusion.BRepBody] = None,
+    image_path: Optional[Path] = None,
+    *,
+    chain_faces: Optional[bool] = None,
+) -> Tuple[Optional[str], float, Optional[adsk.core.Matrix3D], float, float, List[str]]:
+    """Uniform Scale Plane XY via transform axis scaling (not width/height).
+
+    Auto-fits to body bbox in decal-local X/Y after orientation, then applies
+    ``BATCH_DECAL_SCALE_PLANE_XY``. Returns ``(err, scale_xy, trf, need_x, need_y, diag)``.
+    """
+    need_x = 0.0
+    need_y = 0.0
+    empty_diag: List[str] = []
+    use_chain = (
+        bool(BATCH_DECAL_CHAIN_FACES)
+        if chain_faces is None
+        else bool(chain_faces)
+    )
+    try:
+        origin, x_axis, y_axis, z_axis = trf.getAsCoordinateSystem()
+    except Exception as ex:
+        return "scale plane XY: {}".format(ex), 1.0, None, need_x, need_y, empty_diag
+
+    x_len = _vector_length(x_axis)
+    y_len = _vector_length(y_axis)
+    if x_len < 1e-9 or y_len < 1e-9:
+        return "degenerate decal axes", 1.0, None, need_x, need_y, empty_diag
+
+    need_x, need_y = _decal_axes_extents_needed_cm(
+        trf, face, body, chain_faces=use_chain
+    )
+    if need_x < 0.1 or need_y < 0.1:
+        return None, 1.0, None, need_x, need_y, empty_diag
+
+    axis_mult = max(float(BATCH_DECAL_FIT_DEFAULT_AXIS_MULTIPLIER), 1e-9)
+    default_x_cm = axis_mult * x_len
+    default_y_cm = axis_mult * y_len
+    fit_x = need_x / max(default_x_cm, 1e-9)
+    fit_y = need_y / max(default_y_cm, 1e-9)
+    fit_base = max(fit_x, fit_y)
+    fit = fit_base
+    panoramic_mult = 1.0
+    px = _image_pixel_size(image_path)
+    if px is not None:
+        img_w, img_h = px
+        if img_w > 0 and img_h > 0:
+            img_ar = float(img_w) / float(img_h)
+            body_ar = need_x / max(need_y, 0.1)
+            if img_ar > body_ar * 1.15:
+                cap = max(float(BATCH_DECAL_PANORAMIC_SCALE_MAX), 1.0)
+                panoramic_mult = min(img_ar / max(body_ar, 0.1), cap)
+                fit *= panoramic_mult
+
+    margin = max(float(BATCH_DECAL_SCALE_AUTO_FIT_MARGIN), 0.01)
+    ui_mult = max(get_decal_scale_plane_xy(), 0.01)
+    scale_xy = fit * margin * ui_mult
+    if scale_xy < 1e-6:
+        scale_xy = 1.0
+
+    diag = _build_scale_fit_diag_lines(
+        need_x=need_x,
+        need_y=need_y,
+        default_x_cm=default_x_cm,
+        default_y_cm=default_y_cm,
+        fit_x=fit_x,
+        fit_y=fit_y,
+        fit_base=fit_base,
+        panoramic_mult=panoramic_mult,
+        axis_mult=axis_mult,
+        margin=margin,
+        ui_mult=ui_mult,
+        scale_xy=scale_xy,
+        image_path=image_path,
+        chain_faces=use_chain,
+    )
+
+    scaled_trf, scale_err = _apply_xy_scale_to_transform(trf, origin, scale_xy)
+    if scaled_trf is not None:
+        return None, scale_xy, scaled_trf, need_x, need_y, diag
+    return scale_err or "scale plane XY apply failed", scale_xy, None, need_x, need_y, diag
+
+
+def _decal_x_axis_angle_in_face_plane_deg(
+    m: adsk.core.Matrix3D,
+) -> Optional[float]:
+    """Approximate in-plane rotation of decal local X (degrees) for logging."""
+    try:
+        _o, x_axis, _y_axis, z_axis = m.getAsCoordinateSystem()
+        x = _vec3_normalize(_vec3_from_vector3d(x_axis))
+        n = _vec3_normalize(_vec3_from_vector3d(z_axis))
+        if x is None or n is None:
+            return None
+        dot = _vec3_dot(x, n)
+        px = (
+            x[0] - dot * n[0],
+            x[1] - dot * n[1],
+            x[2] - dot * n[2],
+        )
+        pm = math.sqrt(px[0] * px[0] + px[1] * px[1] + px[2] * px[2])
+        if pm < 1e-9:
+            return None
+        px = (px[0] / pm, px[1] / pm, px[2] / pm)
+        ref = (1.0, 0.0, 0.0)
+        rdot = _vec3_dot(ref, n)
+        rx = (
+            ref[0] - rdot * n[0],
+            ref[1] - rdot * n[1],
+            ref[2] - rdot * n[2],
+        )
+        rm = math.sqrt(rx[0] * rx[0] + rx[1] * rx[1] + rx[2] * rx[2])
+        if rm < 1e-9:
+            ref = (0.0, 0.0, 1.0)
+            rdot = _vec3_dot(ref, n)
+            rx = (
+                ref[0] - rdot * n[0],
+                ref[1] - rdot * n[1],
+                ref[2] - rdot * n[2],
+            )
+            rm = math.sqrt(rx[0] * rx[0] + rx[1] * rx[1] + rx[2] * rx[2])
+        if rm < 1e-9:
+            return None
+        rx = (rx[0] / rm, rx[1] / rm, rx[2] / rm)
+        sin_a = _vec3_dot(_vec3_cross(rx, px), n)
+        cos_a = _vec3_dot(rx, px)
+        return math.degrees(math.atan2(sin_a, cos_a))
+    except Exception:
+        return None
+
+
+def _apply_entity_transform(
+    entity: Any,
+    trf: adsk.core.Matrix3D,
+) -> Optional[str]:
+    """Assign ``transform`` on DecalInput or Decal."""
+    try:
+        entity.transform = trf.copy()
+        return None
+    except Exception as ex:
+        return "transform assign: {}".format(ex)
+
+
+def _cache_decal_transform(decal: adsk.fusion.Decal, trf: adsk.core.Matrix3D) -> None:
+    try:
+        _DECAL_TRANSFORM_CACHE[id(decal)] = trf.copy()
+    except Exception:
+        pass
+
+
+def _reapply_cached_decal_transform(decal: adsk.fusion.Decal) -> Optional[str]:
+    trf = _DECAL_TRANSFORM_CACHE.get(id(decal))
+    if trf is None:
+        return None
+    return _apply_entity_transform(decal, trf)
+
+
+def _decal_readback_log_line(decal: adsk.fusion.Decal) -> str:
+    """One-line API read-back for summary logging (chain faces + scale proxy)."""
+    parts: List[str] = []
+    for attr in ("isChainFaces", "chainFaces"):
+        try:
+            parts.append("{}={}".format(attr, getattr(decal, attr)))
+            break
+        except Exception:
+            continue
+    try:
+        m = decal.transform
+        if m is not None:
+            _o, x_axis, y_axis, _z = m.getAsCoordinateSystem()
+            parts.append(
+                "decalSizeXY=({:.2f}x{:.2f} cm)".format(
+                    _vector_length(x_axis) * 2.0,
+                    _vector_length(y_axis) * 2.0,
+                )
+            )
+            uv_deg = _decal_x_axis_angle_in_face_plane_deg(m)
+            if uv_deg is not None:
+                parts.append("grainAngle={:.1f}°".format(uv_deg))
+    except Exception:
+        parts.append("transform=unreadable")
+    return ", ".join(parts) if parts else "(no read-back)"
+
+
+def _set_decal_input_chain_faces(decal_input: Any, chain_faces: bool) -> bool:
+    """Set Fusion ``DecalInput`` chain-faces flag; tolerate API name variants."""
+    for attr in ("isChainFaces", "chainFaces"):
+        try:
+            setattr(decal_input, attr, bool(chain_faces))
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _apply_align_grain_to_body_length(
+    trf: adsk.core.Matrix3D,
+    face: adsk.fusion.BRepFace,
+    center: adsk.core.Point3D,
+    body: adsk.fusion.BRepBody,
+    *,
+    align_y_axis: bool = False,
+) -> adsk.core.Matrix3D:
+    """Rotate decal in the face plane so local X or Y follows plank length."""
+    normal = _face_normal_at_point(face, center)
+    if normal is None:
+        return trf
+    length = _body_unit_length_axis(body)
+    dot_nl = _vec3_dot(normal, length)
+    proj = (
+        length[0] - dot_nl * normal[0],
+        length[1] - dot_nl * normal[1],
+        length[2] - dot_nl * normal[2],
+    )
+    target_axis = _vec3_normalize(proj)
+    if target_axis is None:
+        return trf
+    try:
+        _origin, x_axis, y_axis, _z_axis = trf.getAsCoordinateSystem()
+    except Exception:
+        return trf
+    if align_y_axis:
+        current = _vec3_normalize(_vec3_from_vector3d(y_axis))
+    else:
+        current = _vec3_normalize(_vec3_from_vector3d(x_axis))
+    if current is None:
+        return trf
+    cross = _vec3_cross(current, target_axis)
+    sin_a = _vec3_dot(cross, normal)
+    cos_a = max(-1.0, min(1.0, _vec3_dot(current, target_axis)))
+    angle = math.atan2(sin_a, cos_a)
+    if abs(angle) < 1e-6:
+        return trf
+    try:
+        z_axis = adsk.core.Vector3D.create(normal[0], normal[1], normal[2])
+        rot = adsk.core.Matrix3D.create()
+        rot.setToRotation(angle, z_axis, center)
+        aligned = trf.copy()
+        aligned.transformBy(rot)
+        return aligned
+    except Exception:
+        return trf
+
+
+def _configure_decal_create_input(
+    decal_input: Any,
+    face: adsk.fusion.BRepFace,
+    center: adsk.core.Point3D,
+    body: Optional[adsk.fusion.BRepBody] = None,
+    image_path: Optional[Path] = None,
+    *,
+    chain_faces: Optional[bool] = None,
+    template_hint: Optional[TemplateDecalHint] = None,
+) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[adsk.core.Matrix3D], List[str], Optional[bool]]:
+    """Apply chain faces, grain align, Z angle, and Scale Plane XY on ``DecalInput``.
+
+    Returns ``(error, scale_xy_factor, scale_warning, final_transform, scale_diag, use_chain)``.
+    """
+    empty_diag: List[str] = []
+    use_chain = (
+        _resolve_chain_faces_for_decal(face, body, template_hint)
+        if chain_faces is None
+        else bool(chain_faces)
+    )
+    _set_decal_input_chain_faces(decal_input, use_chain)
+
+    z_deg, use_align, align_after_z = _resolve_decal_grain_orientation(
+        face, body, use_chain, template_hint
+    )
+    needs_transform = (
+        BATCH_DECAL_USE_SCALE_PLANE_XY
+        or abs(z_deg) > 1e-9
+        or use_align
+    )
+    transform = getattr(decal_input, "transform", None)
+    if transform is None:
+        if needs_transform:
+            return "DecalInput.transform not available", None, None, None, empty_diag, use_chain
+        return None, None, None, None, empty_diag, use_chain
+
+    try:
+        trf = transform.copy()
+    except Exception as ex:
+        return "transform copy: {}".format(ex), None, None, None, empty_diag, use_chain
+
+    if use_align and not align_after_z:
+        trf = _apply_align_grain_to_body_length(
+            trf,
+            face,
+            center,
+            body,
+            align_y_axis=bool(BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS),
+        )
+
+    if abs(z_deg) > 1e-9:
+        normal = _face_normal_at_point(face, center)
+        if normal is None:
+            return "face normal unavailable for Z angle", None, None, None, empty_diag, use_chain
+        try:
+            z_axis = adsk.core.Vector3D.create(normal[0], normal[1], normal[2])
+            rot = adsk.core.Matrix3D.create()
+            rot.setToRotation(math.radians(z_deg), z_axis, center)
+            trf.transformBy(rot)
+        except Exception as ex:
+            return "Z angle transform: {}".format(ex), None, None, None, empty_diag, use_chain
+
+    if use_align and align_after_z:
+        trf = _apply_align_grain_to_body_length(
+            trf,
+            face,
+            center,
+            body,
+            align_y_axis=bool(BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS),
+        )
+
+    scale_xy: Optional[float] = None
+    scale_warn: Optional[str] = None
+    scale_diag: List[str] = []
+    need_x = 0.0
+    need_y = 0.0
+    if BATCH_DECAL_USE_SCALE_PLANE_XY:
+        scale_err, scale_xy, scaled_trf, need_x, need_y, scale_diag = (
+            _apply_scale_plane_xy_to_matrix(
+                trf, face, body, image_path, chain_faces=use_chain
+            )
+        )
+        if scaled_trf is not None:
+            trf = scaled_trf
+        elif scale_err:
+            scale_warn = scale_err
+    if scale_xy is not None and scale_warn is None:
+        scale_warn = "scale_xy={:.2f} need={:.0f}x{:.0f}cm".format(
+            scale_xy, need_x, need_y
+        )
+
+    assign_err = _apply_entity_transform(decal_input, trf)
+    if assign_err:
+        return assign_err, scale_xy, scale_warn, trf, scale_diag, use_chain
+    return None, scale_xy, scale_warn, trf, scale_diag, use_chain
+
+
 def _create_decal_on_face(
     decals_collection: Any,
     image_win_path: str,
     face: adsk.fusion.BRepFace,
     decal_name: str,
     center_override: Optional[adsk.core.Point3D] = None,
-) -> Tuple[Optional[adsk.fusion.Decal], str]:
-    """Create one decal on ``face`` using the known-working call shape:
-    ``createInput(filename, [face], point_on_face)``. Keep API calls to the
-    minimum — every extra ``getattr``/``setattr`` on a Fusion API object can
-    trigger a compute/redraw and 100+ decals × extra calls freezes the UI.
+    body: Optional[adsk.fusion.BRepBody] = None,
+    image_path: Optional[Path] = None,
+    *,
+    faces: Optional[List[adsk.fusion.BRepFace]] = None,
+    chain_faces: Optional[bool] = None,
+    template_hint: Optional[TemplateDecalHint] = None,
+    record_placement: bool = True,
+) -> Tuple[Optional[adsk.fusion.Decal], str, List[str]]:
+    """Create one decal on ``face`` (or ``faces``) using ``createInput``.
 
-    When ``center_override`` is provided, the decal is placed at that point
-    (used by tiling to spread decals across the face). Otherwise we pick the
-    face's natural centre point.
+    Applies chain faces, Z angle, and Scale Plane XY via ``DecalInput`` before
+    ``add``. When ``center_override`` is provided, the decal is placed at that
+    point (tiling grid only when tiling is enabled); otherwise the face centre.
     """
+    face_list = list(faces) if faces else [face]
+    primary = face_list[0]
     retries = max(1, int(BATCH_DECAL_CREATE_RETRIES))
     anchors = _collect_decal_anchor_points(
-        face,
+        primary,
         center_override,
         max_points=max(retries, 8),
     )
     if not anchors:
-        return None, "no on-face point"
+        return None, "no on-face point", []
 
     last_err = "no on-face point"
+    last_diag: List[str] = []
     for center in anchors[:retries]:
-        # MINIMAL fast path: createInput + add + name. Nothing else.
-        #
-        # Earlier iterations tried width/height/scaleX/Y/scaleFactor/xDirection
-        # setattr on both DecalCreateInput AND Decal, plus a transform-matrix
-        # get+set as a "last resort". On this Fusion build NONE of those took
-        # effect (verified by the user — visible decal size never changed) but
-        # `decal.transform = new_m` and the readbacks each triggered a full
-        # Fusion re-projection per decal (~100-300ms × hundreds of tile decals =
-        # the UI freeze the user kept hitting). Coverage now comes from the
-        # tiling grid (BATCH_DECAL_TILE), not from per-decal sizing.
         try:
-            decal_input = decals_collection.createInput(image_win_path, [face], center)
+            decal_input = decals_collection.createInput(
+                image_win_path, face_list, center
+            )
         except Exception as ex:
             last_err = "createInput: {}".format(ex)
             continue
         if decal_input is None:
             last_err = "createInput returned None"
             continue
+
+        orient_err, _scale_xy, scale_warn, final_trf, scale_diag, use_chain = _configure_decal_create_input(
+            decal_input,
+            primary,
+            center,
+            body,
+            image_path,
+            chain_faces=chain_faces,
+            template_hint=template_hint,
+        )
+        if orient_err:
+            last_err = orient_err
+            continue
+        last_diag = scale_diag
 
         try:
             decal = decals_collection.add(decal_input)
@@ -1409,23 +3387,46 @@ def _create_decal_on_face(
             last_err = "decals.add returned None"
             continue
 
+        if final_trf is not None:
+            _cache_decal_transform(decal, final_trf)
+            post_err = _apply_entity_transform(decal, final_trf)
+            if post_err:
+                scale_warn = (scale_warn + "; " if scale_warn else "") + "post-add " + post_err
+
         try:
             decal.name = decal_name
         except Exception:
             pass
-        return decal, ""
-    return None, last_err
+        if record_placement:
+            _record_decal_placement(
+                decal,
+                DecalPlacementRecord(
+                    decals_collection=decals_collection,
+                    face=primary,
+                    body=body,
+                    decal_name=decal_name,
+                    chain_faces=use_chain,
+                    template_hint=template_hint,
+                    center_override=center_override if center_override is not None else center,
+                ),
+            )
+        if scale_warn:
+            return decal, scale_warn, scale_diag
+        return decal, "", scale_diag
+    return None, last_err, last_diag
 
 
 def create_batch_decals_for_all_bodies(
-    design: adsk.fusion.Design, image_path: Path
+    design: adsk.fusion.Design,
+    image_path: Path,
+    appearance_snap: Optional[List[Tuple[Any, Any]]] = None,
+    model_path: Optional[Path] = None,
 ) -> Tuple[List[adsk.fusion.Decal], List[str]]:
-    """Project ``image_path`` onto every body as a decal on its largest face.
+    """Project ``image_path`` onto main show bodies as chain-wrapped decals.
 
-    Returns ``(decals_created, log_lines)``. The decals are added to whichever
-    component the body belongs to (root or sub-occurrence). All created decals
-    are named ``BATCH_DECAL_NAME_PREFIX<index>`` so ``cleanup_batch_decals``
-    can find and remove them without touching pre-existing decals.
+    When ``model_path`` is given and ``BATCH_DECAL_MAIN_BODY_FROM_FILENAME`` is
+    on, only occurrences matching the file stem (e.g. ``End Cap - Decal.f3d`` →
+    ``End Cap:1``) are decaled; secondary parts (Track, …) keep template decals.
     """
     lines: List[str] = []
     created: List[adsk.fusion.Decal] = []
@@ -1433,23 +3434,185 @@ def create_batch_decals_for_all_bodies(
         lines.append("Decal projection skipped: image not found ({})".format(image_path))
         return created, lines
 
-    image_win = _win_path(image_path)
+    main_token = _main_product_token_from_model_path(model_path)
+    if BATCH_DECAL_MAIN_BODY_FROM_FILENAME and main_token:
+        lines.append(
+            "Main body from filename: '{}' (only matching occurrence(s) get batch decal)".format(
+                main_token
+            )
+        )
+    use_tiling = _batch_decal_use_tiling()
+    one_per_body = _batch_decal_one_per_body_chain()
+    if one_per_body and BATCH_DECAL_ONE_PER_OCCURRENCE:
+        mode_label = "one/occurrence+chain"
+    elif one_per_body:
+        mode_label = "one/body+chain"
+    else:
+        mode_label = "per-face"
+    lines.append(
+        "Decal placement: flat Z={:.1f}° curved Z={:.1f}° chain≤{:.0f}° spread, "
+        "Chain default={}, Scale Plane XY={:.2f}, align grain={} ({} axis), "
+        "template inherit chain={} z={}, mode={}, tiling={}, axis_fit_mult={:.1f}".format(
+            float(BATCH_DECAL_Z_ANGLE_DEG),
+            float(BATCH_DECAL_Z_ANGLE_CURVED_DEG),
+            float(BATCH_DECAL_CHAIN_FACES_CURVED_MAX_DEG),
+            "on" if BATCH_DECAL_CHAIN_FACES else "off",
+            float(get_decal_scale_plane_xy()),
+            "on" if BATCH_DECAL_ALIGN_GRAIN_TO_LENGTH else "off",
+            "Y" if BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS else "X",
+            "on" if BATCH_DECAL_INHERIT_TEMPLATE_CHAIN else "off",
+            "on" if BATCH_DECAL_INHERIT_TEMPLATE_Z_ANGLE else "off",
+            mode_label,
+            "on" if use_tiling else "off",
+            float(BATCH_DECAL_FIT_DEFAULT_AXIS_MULTIPLIER),
+        )
+    )
 
-    # (area, face, decals_collection, body_label) gathered across the WHOLE
-    # model in phase 1, then decaled biggest-first in phase 2. Collecting
-    # globally (not per body) is what stops a small first-processed body
-    # like "Foam Pad" eating the whole budget and starving the visible
-    # tread / nose faces.
+    image_win = _win_path(image_path)
+    readback_logged = False
+    scale_diag_logged = False
+    original_appearance_names = _appearance_snap_name_map(appearance_snap)
+
+    # Per-face candidates (tiling / non-chain) OR one entry per body (chain).
     candidates: List[Tuple[float, Any, Any, str]] = []
+    body_candidates: List[Tuple[float, Any, Any, str, Any, Optional[TemplateDecalHint]]] = []
+    comp_template_hints: Dict[int, Optional[TemplateDecalHint]] = {}
 
     def _handle_component(
         comp: adsk.fusion.Component, label: str
     ) -> None:
+        if not _occurrence_is_batch_target(label, main_token, comp):
+            if label and label != "(root)":
+                lines.append(
+                    "  {}: skipped (secondary part — keeping template decal(s))".format(
+                        label
+                    )
+                )
+            return
+
+        local_picks: List[Tuple[float, Any, Any, str, Any, Optional[TemplateDecalHint]]] = []
+        template_hint = _remove_existing_decals_on_component(comp, lines, label)
+        comp_template_hints[id(comp)] = template_hint
+        forced_body = _resolve_forced_body_name(label, main_token, comp)
+        explicit_map = _occurrence_label_in_explicit_map(label)
+        if forced_body and one_per_body:
+            if _occurrence_label_in_explicit_map(label):
+                lines.append(
+                    "  {}: explicit map → anchor '{}' only".format(label, forced_body)
+                )
+            elif label == "(root)" and _body_matches_root_anchor(forced_body):
+                if not _main_token_is_treads_plus_assembly(main_token or ""):
+                    lines.append(
+                        "  {}: tread root anchor → '{}' only".format(
+                            label, forced_body
+                        )
+                    )
+            elif main_token:
+                lines.append(
+                    "  {}: main body (token '{}') → anchor '{}' only".format(
+                        label, main_token, forced_body
+                    )
+                )
+            else:
+                lines.append(
+                    "  {}: occurrence map → anchor '{}' only".format(label, forced_body)
+                )
         try:
             decals_coll = comp.decals
         except Exception as ex:
             lines.append("  {}: decals collection error: {}".format(label, ex))
             return
+        exact_forced = _forced_body_uses_exact_match(label, forced_body)
+
+        if (
+            label == "(root)"
+            and _main_token_is_treads_plus_assembly(main_token or "")
+            and one_per_body
+        ):
+            for anchor in BATCH_DECAL_ROOT_ANCHOR_BODIES:
+                if len(created) >= BATCH_DECAL_MAX_TOTAL:
+                    lines.append(
+                        "  Global decal budget {} reached".format(
+                            BATCH_DECAL_MAX_TOTAL
+                        )
+                    )
+                    break
+                body = _find_body_by_exact_anchor_name(comp, anchor)
+                if body is None:
+                    continue
+                body_label = "{}/{}".format(label, anchor)
+                if not _body_is_show_surface(
+                    body, body_label, original_appearance_names
+                ):
+                    continue
+                primary = _pick_primary_show_face_for_body(
+                    body, occurrence_mapped=True
+                )
+                if primary is None:
+                    lines.append(
+                        "  {}: no show tread face (area>={:.0f} cm², show>={:.2f})".format(
+                            body_label,
+                            float(BATCH_DECAL_PRIMARY_MIN_FACE_AREA_CM2),
+                            float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT),
+                        )
+                    )
+                    continue
+                lines.append(
+                    "  {}: tread root anchor → '{}' only".format(label, anchor)
+                )
+                name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
+                chain_note = ""
+                spread = _face_curvature_spread_deg(primary)
+                resolved_chain = _resolve_chain_faces_for_decal(
+                    primary, body, template_hint
+                )
+                if not resolved_chain and spread > float(
+                    BATCH_DECAL_CHAIN_FACES_CURVED_MAX_DEG
+                ):
+                    chain_note = ", chain=off (curved {:.0f}°)".format(spread)
+                elif resolved_chain:
+                    chain_note = ", chain=on (flat)"
+                else:
+                    chain_note = ", chain=off"
+                decal, err, scale_diag = _create_decal_on_face(
+                    decals_coll,
+                    image_win,
+                    primary,
+                    name,
+                    center_override=None,
+                    body=body,
+                    image_path=image_path,
+                    template_hint=template_hint,
+                )
+                if decal is None:
+                    lines.append(
+                        "  {}: chain decal failed ({})".format(body_label, err)
+                    )
+                    continue
+                created.append(decal)
+                nonlocal scale_diag_logged, readback_logged
+                if scale_diag and not scale_diag_logged:
+                    lines.extend(scale_diag)
+                    scale_diag_logged = True
+                rb = _decal_readback_log_line(decal)
+                extra = " ({})".format(err) if err else ""
+                face_diag = _face_show_diagnostic_line(primary, body)
+                lines.append(
+                    "  {}: 1 chain decal on primary face ({:.0f} cm², {}){}{}{}".format(
+                        body_label,
+                        _face_area(primary),
+                        face_diag,
+                        extra,
+                        chain_note,
+                        ", " + rb if rb else "",
+                    )
+                )
+                if not readback_logged:
+                    lines.append("  Decal API read-back (first): {}".format(rb))
+                    readback_logged = True
+                break
+            return
+
         try:
             bodies = comp.bRepBodies
             n_bodies = bodies.count
@@ -1460,14 +3623,27 @@ def create_batch_decals_for_all_bodies(
                 body = bodies.item(bi)
             except Exception:
                 continue
-            if _body_hide_for_batch(body, include_face_uv_pins=False):
+            try:
+                bname = body.name or ""
+            except Exception:
+                bname = ""
+            is_map_anchor = bool(
+                explicit_map
+                and forced_body
+                and _body_name_matches_map_anchor(bname, forced_body)
+            )
+            if forced_body and one_per_body and not is_map_anchor and not _body_name_matches_forced(
+                body, forced_body, exact=exact_forced
+            ):
+                continue
+            if _body_hide_for_batch(body, include_face_uv_pins=False) and not is_map_anchor:
                 continue
             # Skip bodies the designer hid in the .f3d — they are not in the
             # render, so spending the decal budget on them leaves the
             # visible geometry bare.
             if not _entity_is_visible(body, default=True):
                 continue
-            body_label = "{}/{}".format(label, body.name or "?")
+            body_label = "{}/{}".format(label, bname or "?")
 
             if BATCH_DECAL_ALL_FACES:
                 try:
@@ -1486,7 +3662,7 @@ def create_batch_decals_for_all_bodies(
                         body_fail += 1
                         continue
                     name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
-                    decal, info = _create_decal_on_face(decals_coll, image_win, face, name)
+                    decal, info, _scale_diag = _create_decal_on_face(decals_coll, image_win, face, name)
                     if decal is None:
                         body_fail += 1
                         if not first_err:
@@ -1503,12 +3679,54 @@ def create_batch_decals_for_all_bodies(
                     )
                 )
             else:
-                # Phase 1: just COLLECT this body's worthwhile faces. Decals
-                # are created later (phase 2) biggest-face-first across the
-                # WHOLE model, so the global budget always lands on the
-                # visible show surfaces regardless of which body/occurrence
-                # they belong to (a small first-processed body like the Foam
-                # Pad must not eat the whole budget).
+                if one_per_body:
+                    is_forced = is_map_anchor or (
+                        forced_body is not None
+                        and _body_name_matches_forced(
+                            body, forced_body, exact=exact_forced
+                        )
+                    )
+                    if forced_body and one_per_body and not is_forced:
+                        continue
+                    if not _body_is_show_surface(
+                        body,
+                        body_label,
+                        original_appearance_names,
+                        trust_map_anchor=is_map_anchor,
+                    ):
+                        continue
+                    primary = _pick_primary_show_face_for_body(
+                        body, occurrence_mapped=is_forced
+                    )
+                    if primary is None:
+                        lines.append(
+                            "  {}: no show tread face (area>={:.0f} cm², show>={:.2f})".format(
+                                body_label,
+                                float(BATCH_DECAL_PRIMARY_MIN_FACE_AREA_CM2),
+                                float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT),
+                            )
+                        )
+                        continue
+                    face_score = _primary_show_face_score(primary, body)
+                    body_rank = _body_decal_rank_multiplier(
+                        body, body_label, original_appearance_names
+                    )
+                    pick = (
+                        face_score * body_rank,
+                        primary,
+                        decals_coll,
+                        body_label,
+                        body,
+                        template_hint,
+                    )
+                    if is_forced:
+                        pick = (pick[0] + 1e12,) + pick[1:]
+                    if BATCH_DECAL_ONE_PER_OCCURRENCE:
+                        local_picks.append(pick)
+                    else:
+                        body_candidates.append(pick)
+                    continue
+                # Phase 1: collect worthwhile faces (per-face mode).
                 try:
                     faces = body.faces
                     n_faces = faces.count
@@ -1520,26 +3738,90 @@ def create_batch_decals_for_all_bodies(
                         f = faces.item(fi)
                     except Exception:
                         continue
-                    a = _face_area(f)
-                    if a < BATCH_DECAL_MIN_FACE_AREA_CM2:
-                        continue  # sliver / fillet — not worth a decal
-                    # Skip clearly downward-facing faces: the top camera never
-                    # sees them, so decaling them steals budget from the
-                    # visible top (which was showing light patches where its
-                    # decals ran out).
-                    if BATCH_DECAL_SKIP_DOWN_FACING and (
-                        _face_up_score(f) < BATCH_DECAL_DOWN_FACE_THRESHOLD
-                    ):
+                    if not _face_qualifies_for_decal(f, body):
                         continue
-                    # Skip tightly curved faces (rounded nose return): decals
-                    # project flat and would smear into streaks. The wood-tone
-                    # neutral shows there instead — a clean undertone.
-                    if BATCH_DECAL_SKIP_CURVED_FACES and (
-                        _face_curvature_spread_deg(f)
-                        > BATCH_DECAL_CURVED_FACE_MAX_DEG
-                    ):
-                        continue
-                    candidates.append((a, f, decals_coll, body_label))
+                    candidates.append(
+                        (_face_area(f), f, decals_coll, body_label)
+                    )
+
+        if BATCH_DECAL_ONE_PER_OCCURRENCE and one_per_body and local_picks:
+            best = max(local_picks, key=lambda t: t[0])
+            body_candidates.append(best)
+            skipped = len(local_picks) - 1
+            if skipped > 0:
+                lines.append(
+                    "  {}: one decal on largest show body (skipped {} sub-bodies)".format(
+                        label, skipped
+                    )
+                )
+        elif (
+            explicit_map
+            and forced_body
+            and one_per_body
+            and BATCH_DECAL_ONE_PER_OCCURRENCE
+            and not local_picks
+        ):
+            anchor_body = _find_body_by_map_anchor_name(comp, forced_body)
+            if anchor_body is None:
+                body_names: List[str] = []
+                try:
+                    for bi in range(bodies.count):
+                        body_names.append(bodies.item(bi).name or "?")
+                except Exception:
+                    pass
+                msg = (
+                    "  {}: occurrence map '{}' — no body named {} found".format(
+                        label, forced_body, forced_body
+                    )
+                )
+                if body_names:
+                    msg += " (bodies: {})".format(", ".join(body_names))
+                lines.append(msg)
+            else:
+                body_label = "{}/{}".format(label, anchor_body.name or forced_body)
+                if not _body_is_show_surface(
+                    anchor_body,
+                    body_label,
+                    original_appearance_names,
+                    trust_map_anchor=True,
+                ):
+                    lines.append(
+                        "  {}: map anchor skipped (non-show body keyword)".format(
+                            body_label
+                        )
+                    )
+                else:
+                    primary = _pick_primary_show_face_for_body(
+                        anchor_body, occurrence_mapped=True
+                    )
+                    if primary is None:
+                        lines.append(
+                            "  {}: no show tread face (area>={:.0f} cm², show>={:.2f})".format(
+                                body_label,
+                                float(BATCH_DECAL_PRIMARY_MIN_FACE_AREA_CM2),
+                                float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT),
+                            )
+                        )
+                    else:
+                        face_score = _primary_show_face_score(primary, anchor_body)
+                        body_rank = _body_decal_rank_multiplier(
+                            anchor_body, body_label, original_appearance_names
+                        )
+                        pick = (
+                            face_score * body_rank + 1e12,
+                            primary,
+                            decals_coll,
+                            body_label,
+                            anchor_body,
+                            template_hint,
+                        )
+                        body_candidates.append(pick)
+        elif forced_body and one_per_body and BATCH_DECAL_ONE_PER_OCCURRENCE:
+            lines.append(
+                "  {}: occurrence map '{}' — no qualifying show face on that body".format(
+                    label, forced_body
+                )
+            )
 
     try:
         _handle_component(design.rootComponent, "(root)")
@@ -1575,7 +3857,77 @@ def create_batch_decals_for_all_bodies(
             continue
         _handle_component(comp, occ.name)
 
-    # ---- Phase 2: decal the biggest faces in the WHOLE model first ----
+    # ---- Phase 2a: one chain-wrapped decal per body (primary show face) ----
+    if body_candidates:
+        body_candidates.sort(key=lambda t: t[0], reverse=True)
+        for _score, face, decals_coll, body_label, body, template_hint in body_candidates:
+            if len(created) >= BATCH_DECAL_MAX_TOTAL:
+                lines.append(
+                    "  Global decal budget {} reached".format(BATCH_DECAL_MAX_TOTAL)
+                )
+                break
+            name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
+            chain_note = ""
+            if face is not None:
+                spread = _face_curvature_spread_deg(face)
+                resolved_chain = _resolve_chain_faces_for_decal(
+                    face, body, template_hint
+                )
+                if not resolved_chain and spread > float(
+                    BATCH_DECAL_CHAIN_FACES_CURVED_MAX_DEG
+                ):
+                    chain_note = ", chain=off (curved {:.0f}°)".format(spread)
+                elif resolved_chain:
+                    chain_note = ", chain=on (flat)"
+                else:
+                    chain_note = ", chain=off"
+            decal, err, scale_diag = _create_decal_on_face(
+                decals_coll,
+                image_win,
+                face,
+                name,
+                center_override=None,
+                body=body,
+                image_path=image_path,
+                template_hint=template_hint,
+            )
+            if decal is None:
+                lines.append(
+                    "  {}: chain decal failed ({})".format(body_label, err)
+                )
+                continue
+            created.append(decal)
+            if scale_diag and not scale_diag_logged:
+                lines.extend(scale_diag)
+                scale_diag_logged = True
+            rb = _decal_readback_log_line(decal)
+            extra = ""
+            if err:
+                extra = " ({})".format(err)
+            face_diag = _face_show_diagnostic_line(face, body)
+            lines.append(
+                "  {}: 1 chain decal on primary face ({:.0f} cm², {}){}{}{}".format(
+                    body_label,
+                    _face_area(face),
+                    face_diag,
+                    extra,
+                    chain_note,
+                    ", " + rb if rb else "",
+                )
+            )
+            if not readback_logged:
+                lines.append("  Decal API read-back (first): {}".format(rb))
+                readback_logged = True
+            if (
+                BATCH_DECAL_UI_PUMP_INTERVAL > 0
+                and len(created) % BATCH_DECAL_UI_PUMP_INTERVAL == 0
+            ):
+                try:
+                    adsk.doEvents()
+                except Exception:
+                    pass
+
+    # ---- Phase 2b: per-face decals (tiling or non-chain fallback) ----
     # candidates is empty in BATCH_DECAL_ALL_FACES mode (that path creates
     # decals itself above), so this is a no-op there.
     if candidates:
@@ -1606,9 +3958,10 @@ def create_batch_decals_for_all_bodies(
 
             d_long = _face_long_dims(face)[0]
             big = (
-                BATCH_DECAL_TILE
+                use_tiling
                 and d_long > BATCH_DECAL_SINGLE_DECAL_MAX_CM
             )
+            step_eff = BATCH_DECAL_TILE_STEP_CM
             if big:
                 # This face's fair share of the global budget (by area),
                 # clamped to [1, per-face cap].
@@ -1669,12 +4022,13 @@ def create_batch_decals_for_all_bodies(
                 decal_image_str = (
                     _win_path(slice_path) if slice_path else image_win
                 )
-                decal, err = _create_decal_on_face(
+                decal, err, scale_diag = _create_decal_on_face(
                     decals_coll,
                     decal_image_str,
                     face,
                     name,
                     center_override=tile_pt,
+                    image_path=image_path,
                 )
                 if decal is None:
                     face_fail += 1
@@ -1685,9 +4039,19 @@ def create_batch_decals_for_all_bodies(
                         first_err = err
                     continue
                 created.append(decal)
+                if scale_diag and not scale_diag_logged:
+                    lines.extend(scale_diag)
+                    scale_diag_logged = True
                 _TILE_METADATA[id(decal)] = (iu, iv, nu, nv)
                 per_body_ok[body_label] = per_body_ok.get(body_label, 0) + 1
                 used_face = True
+                if not readback_logged:
+                    lines.append(
+                        "  Decal API read-back (first): {}".format(
+                            _decal_readback_log_line(decal)
+                        )
+                    )
+                    readback_logged = True
                 if (
                     BATCH_DECAL_UI_PUMP_INTERVAL > 0
                     and len(created) % BATCH_DECAL_UI_PUMP_INTERVAL == 0
@@ -1698,7 +4062,8 @@ def create_batch_decals_for_all_bodies(
                         pass
 
             if (
-                BATCH_DECAL_GAP_FILL_ON_FAIL
+                use_tiling
+                and BATCH_DECAL_GAP_FILL_ON_FAIL
                 and face_fail > 0
                 and len(created) < BATCH_DECAL_MAX_TOTAL
             ):
@@ -1713,18 +4078,22 @@ def create_batch_decals_for_all_bodies(
                         continue
                     tried_anchors.add(_point_key(anchor))
                     name = "{}{}".format(BATCH_DECAL_NAME_PREFIX, len(created))
-                    decal, err = _create_decal_on_face(
+                    decal, err, scale_diag = _create_decal_on_face(
                         decals_coll,
                         image_win,
                         face,
                         name,
                         center_override=anchor,
+                        image_path=image_path,
                     )
                     if decal is None:
                         if not first_err:
                             first_err = err
                         continue
                     created.append(decal)
+                    if scale_diag and not scale_diag_logged:
+                        lines.extend(scale_diag)
+                        scale_diag_logged = True
                     per_body_ok[body_label] = per_body_ok.get(body_label, 0) + 1
                     used_face = True
                     gap_added += 1
@@ -1755,7 +4124,12 @@ def create_batch_decals_for_all_bodies(
                 if fail:
                     extra += " ({} off-face skipped)".format(fail)
                 lines.append(
-                    "  {}: {} tile decal(s) added{}".format(bl, ok, extra)
+                    "  {}: {} {} decal(s) added{}".format(
+                        bl,
+                        ok,
+                        "scaled" if not use_tiling else "tile",
+                        extra,
+                    )
                 )
         if budget_hit:
             lines.append(
@@ -1769,6 +4143,124 @@ def create_batch_decals_for_all_bodies(
 
 def update_batch_decal_images(
     decals: List[adsk.fusion.Decal], image_path: Path
+) -> Tuple[int, List[str], List[adsk.fusion.Decal]]:
+    """Update every tracked batch decal for a new color-set image.
+
+    When ``BATCH_DECAL_RECREATE_ON_COLOR_SWAP`` is True, each decal is deleted
+    and recreated with full orientation/scale (reliable on read-only Decal API).
+    Otherwise falls back to ``imageFilename`` swap + cached transform re-apply.
+    """
+    if BATCH_DECAL_RECREATE_ON_COLOR_SWAP:
+        return _update_batch_decals_via_recreate(decals, image_path)
+    n, lines = _update_batch_decals_via_image_swap(decals, image_path)
+    return n, lines, decals
+
+
+def _resolve_recreate_face(record: DecalPlacementRecord) -> Any:
+    """Re-pick anchor face from body; cached ``record.face`` goes stale after CS01."""
+    body = record.body
+    if body is not None:
+        face = _pick_primary_show_face_for_body(body, occurrence_mapped=True)
+        if face is not None:
+            return face
+    return record.face
+
+
+def _update_batch_decals_via_recreate(
+    decals: List[adsk.fusion.Decal], image_path: Path
+) -> Tuple[int, List[str], List[adsk.fusion.Decal]]:
+    lines: List[str] = []
+    if not image_path or not image_path.is_file():
+        lines.append("Decal update skipped: image not found ({})".format(image_path))
+        return 0, lines, decals
+    image_win = _win_path(image_path)
+    out: List[adsk.fusion.Decal] = []
+    pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
+    for idx, d in enumerate(decals):
+        old_id = id(d)
+        record = _DECAL_PLACEMENT_CACHE.get(old_id)
+        meta = _TILE_METADATA.get(old_id)
+        try:
+            dn = d.name or "?"
+        except Exception:
+            dn = "?"
+        if record is None:
+            lines.append(
+                "  Decal '{}': recreate skipped (no placement cache)".format(dn)
+            )
+            out.append(d)
+            continue
+        face = _resolve_recreate_face(record)
+        new_decal, err, _scale_diag = _create_decal_on_face(
+            record.decals_collection,
+            image_win,
+            face,
+            record.decal_name,
+            center_override=record.center_override,
+            body=record.body,
+            image_path=image_path,
+            chain_faces=record.chain_faces,
+            template_hint=record.template_hint,
+        )
+        if new_decal is None:
+            ok, swap_err = _set_decal_image(d, image_win)
+            if ok:
+                lines.append(
+                    "  Decal '{}': recreate FAILED ({}); kept via imageFilename swap".format(
+                        dn, err
+                    )
+                )
+                out.append(d)
+            else:
+                lines.append(
+                    "  Decal '{}': recreate FAILED ({}); swap fallback FAILED ({})".format(
+                        dn, err, swap_err
+                    )
+                )
+                out.append(d)
+            if (idx + 1) % pump_every == 0:
+                try:
+                    adsk.doEvents()
+                except Exception:
+                    pass
+            continue
+        try:
+            d.deleteMe()
+        except Exception as ex:
+            lines.append(
+                "  Decal '{}': recreated but old delete failed ({})".format(dn, ex)
+            )
+        _DECAL_PLACEMENT_CACHE.pop(old_id, None)
+        _DECAL_TRANSFORM_CACHE.pop(old_id, None)
+        _TILE_METADATA.pop(old_id, None)
+        if meta is not None:
+            _TILE_METADATA[id(new_decal)] = meta
+        try:
+            new_name = new_decal.name or record.decal_name
+        except Exception:
+            new_name = record.decal_name
+        rb = _decal_readback_log_line(new_decal)
+        msg = "  Decal '{}': recreated".format(new_name)
+        if err:
+            msg += " ({})".format(err)
+        if rb:
+            msg += " — {}".format(rb)
+        lines.append(msg)
+        out.append(new_decal)
+        if (idx + 1) % pump_every == 0:
+            try:
+                adsk.doEvents()
+            except Exception:
+                pass
+    lines.insert(
+        0,
+        "Batch decal update: {} / {} recreate(s)".format(len(out), len(decals)),
+    )
+    return len(out), lines, out
+
+
+def _update_batch_decals_via_image_swap(
+    decals: List[adsk.fusion.Decal], image_path: Path
 ) -> Tuple[int, List[str]]:
     """Swap ``imageFilename`` on every tracked decal. When per-decal grid
     metadata exists in ``_TILE_METADATA``, each decal receives its own slice
@@ -1781,9 +4273,6 @@ def update_batch_decal_images(
     base_target = _win_path(image_path)
     n = 0
     pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
-    # Cache slice paths so we only run PIL once per (iu, iv, nu, nv) — many
-    # decals share the same grid coords if a face yields the same cell across
-    # passes (defensive; usually each decal has a unique tuple).
     slice_cache: dict = {}
     for idx, d in enumerate(decals):
         meta = _TILE_METADATA.get(id(d))
@@ -1805,6 +4294,28 @@ def update_batch_decal_images(
         try:
             d.imageFilename = target
             n += 1
+            try:
+                dn = d.name or "?"
+            except Exception:
+                dn = "?"
+            had_cache = id(d) in _DECAL_TRANSFORM_CACHE
+            if BATCH_DECAL_REAPPLY_TRANSFORM_ON_IMAGE_SWAP:
+                re_err = _reapply_cached_decal_transform(d)
+                if re_err:
+                    lines.append(
+                        "  Decal '{}': transform re-apply FAILED ({})".format(
+                            dn, re_err
+                        )
+                    )
+                elif not had_cache:
+                    lines.append(
+                        "  Decal '{}': transform re-apply skipped (no cache)".format(
+                            dn
+                        )
+                    )
+            rb = _decal_readback_log_line(d)
+            if rb:
+                lines.append("  Decal '{}' after swap: {}".format(dn, rb))
         except Exception as ex:
             try:
                 dn = d.name
@@ -1890,6 +4401,8 @@ def cleanup_batch_decals(decals: List[adsk.fusion.Decal]) -> int:
         except Exception:
             pass
     _TILE_METADATA.clear()
+    _DECAL_TRANSFORM_CACHE.clear()
+    _DECAL_PLACEMENT_CACHE.clear()
     for p in _TILE_TEMP_PATHS:
         _unlink_silent(p)
     _TILE_TEMP_PATHS.clear()
@@ -2019,6 +4532,14 @@ def apply_decal_color_set(
     return total, lines
 
 
+def _appearance_is_protected_substrate(ap_name: str) -> bool:
+    """True for foam/substrate appearances that must keep their original colour."""
+    n = (ap_name or "").strip().lower()
+    if not n:
+        return False
+    return any(frag in n for frag in PROTECTED_SUBSTRATE_APPEARANCE_FRAGMENTS)
+
+
 def broadcast_to_textured_appearances(
     design: adsk.fusion.Design,
     slot1: Optional[Path],
@@ -2026,8 +4547,9 @@ def broadcast_to_textured_appearances(
     """Push slot 1 into every appearance that already exposes a texture slot.
 
     Skips appearances with no AppearanceTexture properties so plain colour
-    appearances (and most metals/plastics) are left untouched. This is the
-    "fill everything textureable" pass used to get 100% coverage when the
+    appearances (and most metals/plastics) are left untouched. Also skips
+    foam/substrate appearances so pad and core layers stay white/grey. This is
+    the "fill everything textureable" pass used to get 100% coverage when the
     template hasn't been named to match SLOT*_NAMES.
     """
     lines: List[str] = []
@@ -2038,6 +4560,11 @@ def broadcast_to_textured_appearances(
     apps = design.appearances
     for i in range(apps.count):
         ap = apps.item(i)
+        if _appearance_is_protected_substrate(ap.name):
+            lines.append(
+                'Appearance "{}" (broadcast): skipped (protected substrate)'.format(ap.name)
+            )
+            continue
         n = _apply_image_to_appearance_textures(ap, img)
         if n > 0:
             total += n
@@ -2526,13 +5053,11 @@ def capture_body_appearances(design: adsk.fusion.Design) -> List[Tuple[Any, Any]
     return snap
 
 
-# When True, bodies with steel/reflective/decorative appearances are
-# temporarily swapped to a wood-tone neutral while decals project, so decal
-# gaps blend into the swatch instead of a grey steel stripe. Originals
-# restored at end of batch.
-BATCH_DECAL_NEUTRALIZE_APPEARANCES: bool = True
+# Disabled: client requires foam/steel/paint to stay as authored; only
+# Vinyl_1 / Vinyl_2 (and Vinyl Skin variants) receive batch textures.
+BATCH_DECAL_NEUTRALIZE_APPEARANCES: bool = False
 
-# Also neutralize steel/satin/striped/foam bodies (common on decal templates).
+# Also neutralize steel/satin/striped bodies (common on decal templates).
 BATCH_DECAL_NEUTRALIZE_STEEL_LIKE: bool = True
 
 # Appearance-name fragments that trigger neutralization (dark / decorative).
@@ -2545,11 +5070,10 @@ _NEUTRALIZE_APPEARANCE_FRAGMENTS = (
     "display",
 )
 
-# Procedural steel / foam bodies on decal templates — gaps used to show grey.
+# Procedural steel bodies on decal templates — gaps used to show grey.
 _STEEL_LIKE_APPEARANCE_FRAGMENTS = (
     "steel",
     "striped",
-    "foam",
     "plastic - matte",
 )
 
@@ -2573,6 +5097,8 @@ def _appearance_should_neutralize(ap_name: str) -> bool:
     """True when a body appearance should be swapped to the wood-tone backdrop."""
     n = (ap_name or "").lower()
     if not n:
+        return False
+    if _appearance_is_protected_substrate(ap_name):
         return False
     if n in {x.lower() for x in SLOT1_APPEARANCE_NAMES}:
         return False
@@ -2649,6 +5175,8 @@ def neutralize_dark_body_appearances(
     for body in _walk_bodies(design):
         try:
             if not _entity_is_visible(body, default=True):
+                continue
+            if _body_is_protected_substrate_body(body):
                 continue
             ap = body.appearance
             if ap is None:
@@ -2735,6 +5263,9 @@ def _apply_to_component_contents(
             continue
         if _body_hide_for_batch(body, include_face_uv_pins=False):
             lines.append('  Body "{}": skipped (batch helper surface)'.format(label))
+            continue
+        if not _body_is_show_surface(body, prefix):
+            lines.append('  Body "{}": skipped (non-show / substrate body)'.format(label))
             continue
         body_ok, faces_ok, faces_fail = _set_body_and_faces(body, carrier, label, lines)
         stats["bodies_ok" if body_ok else "bodies_fail"] += 1
@@ -3008,6 +5539,29 @@ def apply_color_set_for_open_design(
         total += b_total
         lines += b_lines
 
+    return total, lines
+
+
+def apply_hybrid_appearance_for_batch(
+    design: adsk.fusion.Design,
+    slot1: Optional[Path],
+    slot2: Optional[Path],
+) -> Tuple[int, List[str]]:
+    """Appearance pass for bodies not covered by batch decals (e.g. Bullnose nose)."""
+    total = 0
+    lines: List[str] = []
+    a_total, a_lines = apply_appearance_color_set(design, slot1, slot2)
+    total += a_total
+    lines += a_lines
+    if APPEARANCE_BROADCAST and slot1:
+        b_total, b_lines = broadcast_to_textured_appearances(design, slot1)
+        total += b_total
+        lines += b_lines
+    if total:
+        lines.insert(
+            0,
+            "Hybrid appearance pass: {} texture slot(s) updated".format(total),
+        )
     return total, lines
 
 

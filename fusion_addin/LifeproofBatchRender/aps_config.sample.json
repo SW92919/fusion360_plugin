@@ -6,7 +6,7 @@
   "bucket_policy": "transient",
   "auto_create_bucket": true,
   "render_mode": "fusion_viewport",
-  "render_quality": 60,
+  "render_quality": 90,
   "max_retries": 2,
   "workflow_notes": "Copy to aps_config.json (gitignored). render_mode: fusion_viewport (recommended) uploads job package to OSS then viewport-captures in Fusion; fusion_raytrace is slow on decal-heavy models; automation requires Fusion Automation API setup."
 }

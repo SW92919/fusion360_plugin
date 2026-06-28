@@ -32,7 +32,7 @@ class APSConfig:
     bucket_policy: str = "transient"
     auto_create_bucket: bool = True
     render_mode: str = "fusion_viewport"
-    render_quality: int = 60
+    render_quality: int = 90
     max_retries: int = 2
     workflow_notes: str = ""
 

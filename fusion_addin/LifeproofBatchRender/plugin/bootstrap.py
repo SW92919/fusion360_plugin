@@ -215,6 +215,7 @@ def run(context):
                     conc = uip.read_concurrency(ins, 3)
                     aps_fb = uip.read_aps_fallback(ins)
                     max_named_views = uip.read_max_named_views(ins, 0)
+                    decal_scale_xy = uip.read_decal_scale_plane_xy(ins, 2.5)
 
                     controller.execute_batch(
                         fui,
@@ -229,6 +230,7 @@ def run(context):
                         conc,
                         aps_fb,
                         max_named_views,
+                        decal_scale_xy,
                         _ADDIN_DIR,
                     )
                 except Exception:

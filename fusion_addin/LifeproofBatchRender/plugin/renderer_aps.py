@@ -504,27 +504,14 @@ def submit_render_job(
         except (OSError, FileNotFoundError):
             pass
 
-    output_key = manifest["output_key"]
-    out_up = upload_bytes(
-        token,
-        bucket_key,
-        output_key,
-        output_bytes,
-        content_type="image/png",
-        max_retries=cfg.max_retries,
-    )
-    if not out_up.ok:
-        return APSRenderOutcome(
-            True,
-            "Rendered locally but OSS output upload failed: {}".format(out_up.message),
-            output_bytes=output_bytes,
-            job_prefix=job_prefix,
-            bucket_key=bucket_key,
-        )
-
+    # Per SOW, the rendered image is saved to the local color folder by the
+    # controller (caller writes ``output_bytes``). The OSS bucket only holds the
+    # job inputs (manifest + textures) — we do NOT upload the rendered output.
     return APSRenderOutcome(
         True,
-        "APS job complete (oss://{}/{}).".format(bucket_key, output_key),
+        "APS job complete (inputs uploaded to oss://{}/{}; image saved locally).".format(
+            bucket_key, job_prefix
+        ),
         output_bytes=output_bytes,
         job_prefix=job_prefix,
         bucket_key=bucket_key,
@@ -570,7 +557,7 @@ def load_aps_config(addin_dir: Path) -> APSConfig:
         "bucket_policy": "transient",
         "auto_create_bucket": true,
         "render_mode": "fusion_viewport",
-        "render_quality": 60,
+        "render_quality": 90,
         "max_retries": 2,
         "workflow_notes": ""
       }
@@ -589,9 +576,9 @@ def load_aps_config(addin_dir: Path) -> APSConfig:
     if render_mode not in aps_oss.VALID_RENDER_MODES:
         render_mode = "fusion_viewport"
     try:
-        render_quality = int(raw.get("render_quality") or 60)
+        render_quality = int(raw.get("render_quality") or 90)
     except (TypeError, ValueError):
-        render_quality = 60
+        render_quality = 90
     try:
         max_retries = int(raw.get("max_retries") or 2)
     except (TypeError, ValueError):

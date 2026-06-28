@@ -19,6 +19,7 @@ INPUT_RENDER_BACKEND = "lbr_renderBackend"
 INPUT_CONCURRENCY = "lbr_concurrency"
 INPUT_APS_FALLBACK = "lbr_apsFallbackLocal"
 INPUT_MAX_NAMED_VIEWS = "lbr_maxNamedViews"
+INPUT_DECAL_SCALE_XY = "lbr_decalScaleXY"
 INPUT_PROGRESS = "lbr_progress"
 INPUT_STATUS = "lbr_status"
 
@@ -105,6 +106,27 @@ def read_max_named_views(ins: adsk.core.CommandInputs, default: int = 0) -> int:
         return default
 
 
+def read_decal_scale_plane_xy(ins: adsk.core.CommandInputs, default: float = 1.0) -> float:
+    """Fusion Decal Scale Plane XY multiplier (after auto-fit)."""
+    inp = ins.itemById(INPUT_DECAL_SCALE_XY)
+    if inp is None:
+        return default
+    try:
+        from batch_config import parse_bounded_float, read_textbox_or_string
+
+        raw = read_textbox_or_string(inp).strip()
+        if not raw:
+            try:
+                raw = str(inp.value or "").strip()
+            except Exception:
+                raw = ""
+        if not raw:
+            return default
+        return parse_bounded_float(raw, default, 0.1, 20.0)
+    except Exception:
+        return default
+
+
 def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
     inputs.addBoolValueInput(
         INPUT_USE_BROWSE,
@@ -141,6 +163,12 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
         INPUT_MAX_NAMED_VIEWS,
         "Max named views per color set (0 = all; e.g. 2 = first two views only)",
         "0",
+    )
+
+    inputs.addStringValueInput(
+        INPUT_DECAL_SCALE_XY,
+        "Decal Scale Plane XY (multiplier after auto-fit; 1.0 = auto-fit only)",
+        "1.0",
     )
 
     fmt = inputs.addDropDownCommandInput(

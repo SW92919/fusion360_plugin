@@ -53,6 +53,14 @@ def parse_positive_int(s: str, default: int, min_v: int, max_v: int) -> int:
     return max(min_v, min(max_v, v))
 
 
+def parse_bounded_float(s: str, default: float, min_v: float, max_v: float) -> float:
+    try:
+        v = float(str(s).strip())
+    except Exception:
+        v = default
+    return max(min_v, min(max_v, v))
+
+
 def parse_bounded_int(s: str, default: int, min_v: int, max_v: int) -> int:
     """Alias for bounded integer parsing (concurrency, etc.)."""
     return parse_positive_int(s, default, min_v, max_v)
