@@ -7,6 +7,11 @@ __pycache__/
 *.jpeg
 *.png
 *.tif
-
+*.txt
+*.log
+*.md
+*.csv
+*.env
+fusion_addin/LifeproofBatchRender/*.log
 # APS secrets (copy aps_config.sample.json → aps_config.json locally)
 fusion_addin/LifeproofBatchRender/aps_config.json
