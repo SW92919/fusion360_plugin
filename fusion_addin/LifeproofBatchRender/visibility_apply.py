@@ -21,8 +21,10 @@ EXACT_BATCH_HIDE_DECAL_NAMES: FrozenSet[str] = frozenset()
 # (after baseline restore). Use Fusion descriptions ``hide:batch`` / ``hide:render``
 # on helper surfaces, or name them with one of the substrings below.
 _BATCH_HIDE_DESCRIPTION_MARKERS: Tuple[str, ...] = ("hide:batch", "hide:render")
-# Fusion Render workspace often inserts placeholder solids under occurrences named like
-# ``Main Light:1``. Hide those during viewport capture (same as toggling the eye off).
+# Helper geometry to hide during viewport capture. NOTE: scene lights
+# (``Main Light``, key/fill/rim, etc.) are intentionally NOT hidden — turning a
+# light's bulb off disables its illumination and makes renders too dark (client
+# feedback). Only UV / reference / explicit batch-hide helpers are listed here.
 _BATCH_HIDE_OCCURRENCE_NAME_SUBSTRINGS: Tuple[str, ...] = (
     "uv plane",
     "uv_plane",
@@ -30,19 +32,6 @@ _BATCH_HIDE_OCCURRENCE_NAME_SUBSTRINGS: Tuple[str, ...] = (
     "render hide",
     "batch hide",
     "batch_render_hide",
-    # Studio / scene lights (Render workspace proxies become visible mesh).
-    "main light",
-    "main_light",
-    "key light",
-    "fill light",
-    "rim light",
-    "studio light",
-    "studio_light",
-    "render light",
-    "physical light",
-    "photometric light",
-    "light rig",
-    "light proxy",
 )
 _BATCH_HIDE_BODY_NAME_SUBSTRINGS: Tuple[str, ...] = (
     "uv plane",
@@ -63,12 +52,6 @@ _BATCH_HIDE_BODY_NAME_SUBSTRINGS: Tuple[str, ...] = (
     "carrier plane",
     "substrate",
     "batch_render_hide",
-    # Light proxy solids (often under ``Main Light`` occurrences).
-    "main light",
-    "main_light",
-    "studio_light",
-    "light rig",
-    "light proxy",
 )
 _BATCH_HIDE_DECAL_NAME_SUBSTRINGS: Tuple[str, ...] = (
     "uv plane",
@@ -91,12 +74,6 @@ _BATCH_HIDE_APPEARANCE_NAME_SUBSTRINGS: Tuple[str, ...] = (
     "pattern grid",
     "orientation grid",
 )
-
-# Fusion locale/browser quirks: narrow NBSP, odd punctuation around ``Main Light:1``.
-_BATCH_HIDE_MAIN_LIGHT_RE = re.compile(r"\bmain[-_\s]*light\b", re.IGNORECASE)
-# Browser suffix rows such as ``Key Light:1``, ``Fill Light:2``.
-_BATCH_HIDE_LIGHT_INSTANCE_RE = re.compile(r"\blight\s*:\s*\d+", re.IGNORECASE)
-
 
 def _norm_exact(name: str) -> str:
     return (name or "").strip().lower()
@@ -253,12 +230,10 @@ def _occurrence_hide_for_batch(occ: adsk.fusion.Occurrence) -> bool:
         fp = getattr(occ, "fullPathName", "") or ""
     except Exception:
         fp = ""
-    # Match browser label (``Main Light:1``), internal component name, and browser path.
+    # Match browser label, internal component name, and browser path. Scene
+    # lights are intentionally not matched here — see the comment on
+    # ``_BATCH_HIDE_OCCURRENCE_NAME_SUBSTRINGS`` (keep lights on for brightness).
     blob = re.sub(r"\s+", " ", "{} {} {}".format(occ_name, comp_name, fp)).strip().lower()
-    if _BATCH_HIDE_MAIN_LIGHT_RE.search(blob):
-        return True
-    if _BATCH_HIDE_LIGHT_INSTANCE_RE.search(blob):
-        return True
     if EXACT_BATCH_HIDE_OCCURRENCE_NAMES:
         if _norm_exact(occ_name) in EXACT_BATCH_HIDE_OCCURRENCE_NAMES:
             return True

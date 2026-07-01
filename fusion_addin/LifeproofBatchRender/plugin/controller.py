@@ -362,6 +362,12 @@ def _execute_batch_inner(
         carrier: Optional[adsk.fusion.Appearance] = None
         body_appearance_snap: list = []
         batch_decals: List[Any] = []
+        # Force decal/carrier coverage is REQUIRED on the client's Fusion build:
+        # changeTextureImage finds no editable slot on the Vinyl Skin-1/-2
+        # appearances (they keep their baked look), so the color-set image only
+        # shows when projected as a decal. The slot-1 vs slot-2 split is handled
+        # *inside* the decal path (decals inherit their body's appearance slot),
+        # not by swapping document appearances.
         use_decal_coverage = (
             texture_pipeline.FORCE_BODY_COVERAGE
             and texture_pipeline.BODY_COVERAGE_VIA_DECALS
@@ -479,8 +485,9 @@ def _execute_batch_inner(
             tex_lines: List[str] = []
             if batch_decals:
                 decal_image = s1 or cs.slot1
+                # slot-2 bodies (Vinyl Skin-2) receive the _2 raster; the rest _1.
                 n_tex, dec_lines, batch_decals = texture_pipeline.update_batch_decal_images(
-                    batch_decals, decal_image
+                    batch_decals, decal_image, s2
                 )
                 tex_lines.extend(dec_lines)
                 if mode == "appearance":

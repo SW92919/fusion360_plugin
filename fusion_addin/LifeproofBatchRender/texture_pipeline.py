@@ -11,8 +11,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
-import adsk.core
-import adsk.fusion
+import adsk.core  # type: ignore
+import adsk.fusion  # type: ignore
 
 from visibility_apply import (
     _body_hide_for_batch,
@@ -23,18 +23,61 @@ from visibility_apply import (
 # --- User template: exact Fusion names for each slot (Appearance mode) ---
 # Client allowlist — only these appearances receive batch color images; foam,
 # steel, paint, and all other document appearances are left unchanged.
+#
+# Matching is NORMALIZED (see ``appearance_name_slot``): spacing and separator
+# drift don't matter, so "Vinyl Skin - 1", "Vinyl Skin-1" and "Vinyl_1" all map
+# to slot 1. The client's models are inconsistent across files:
+#   Treads Plus Bullnose - Appearance (2).f3d → "Vinyl Skin-1" / "Vinyl Skin-2"
+#   Treads Plus Bullnose - Appearance1.f3d    → "Vinyl"        / "Vinyl Skin - 2"
+#   Treads Plus Bullnose - Appearance2.f3d    → "Vinyl Skin - 1" / "Vinyl Skin - 2"
+# All three are handled by the entries below.
 SLOT1_APPEARANCE_NAMES: FrozenSet[str] = frozenset(
     {
         "Vinyl_1",
         "Vinyl Skin - 1",
+        "Vinyl Skin-1",
+        "Vinyl",
     }
 )
 SLOT2_APPEARANCE_NAMES: FrozenSet[str] = frozenset(
     {
         "Vinyl_2",
         "Vinyl Skin - 2",
+        "Vinyl Skin-2",
     }
 )
+
+
+def _normalize_appearance_slot_name(name: str) -> str:
+    """Collapse spacing / separator drift for slot-name comparison.
+
+    Lowercases, folds NBSP, and reduces any run of space / underscore / hyphen
+    to a single ``-`` so ``"Vinyl Skin - 1"``, ``"Vinyl Skin-1"`` and
+    ``"Vinyl_1"`` all normalize to ``"vinyl-skin-1"`` / ``"vinyl-1"``.
+    """
+    s = (name or "").strip().lower().replace(" ", " ")
+    s = re.sub(r"[\s_\-]+", "-", s)
+    return s.strip("-")
+
+
+_SLOT1_APPEARANCE_NAMES_NORM: FrozenSet[str] = frozenset(
+    _normalize_appearance_slot_name(n) for n in SLOT1_APPEARANCE_NAMES
+)
+_SLOT2_APPEARANCE_NAMES_NORM: FrozenSet[str] = frozenset(
+    _normalize_appearance_slot_name(n) for n in SLOT2_APPEARANCE_NAMES
+)
+
+
+def appearance_name_slot(name: str) -> Optional[int]:
+    """Return 1 or 2 if ``name`` matches a slot-1 / slot-2 appearance, else None."""
+    n = _normalize_appearance_slot_name(name)
+    if not n:
+        return None
+    if n in _SLOT1_APPEARANCE_NAMES_NORM:
+        return 1
+    if n in _SLOT2_APPEARANCE_NAMES_NORM:
+        return 2
+    return None
 
 # --- User template: exact Fusion names for each slot (Decal mode) ---
 SLOT1_DECAL_NAMES: FrozenSet[str] = frozenset(
@@ -480,6 +523,14 @@ _DECAL_TRANSFORM_CACHE: dict = {}
 # Placement record for recreate-on-swap (face, body, chain, template hint, …).
 _DECAL_PLACEMENT_CACHE: dict = {}
 
+# Maps id(decal) -> appearance slot (1 or 2) of the body the decal sits on,
+# derived from that body's ORIGINAL appearance name (Vinyl Skin-1 -> 1,
+# Vinyl Skin-2 -> 2). Lets update_batch_decal_images route the _1 image onto
+# slot-1 bodies and the _2 image onto slot-2 bodies (e.g. dark front / light
+# back) even though every body is textured via decals, not appearances.
+# Default when a decal id is absent: slot 1.
+_DECAL_SLOT: Dict[int, int] = {}
+
 
 class TemplateDecalHint:
     """Settings read from a user-authored decal before batch replacement."""
@@ -581,7 +632,7 @@ def _roll_image_horizontal_to_temp_png(src: Path, dx_px: int) -> Optional[str]:
     if dx_px == 0:
         return None
     try:
-        from PIL import Image
+        from PIL import Image # type: ignore
     except ImportError:
         if not _decal_shift_pil_warning_emitted:
             _decal_shift_pil_warning_emitted = True
@@ -981,9 +1032,10 @@ def apply_appearance_color_set(
     for i in range(apps.count):
         ap = apps.item(i)
         target_path: Optional[str] = None
-        if ap.name in SLOT1_APPEARANCE_NAMES and slot1:
+        slot = appearance_name_slot(ap.name)
+        if slot == 1 and slot1:
             target_path = _win_path(slot1)
-        elif ap.name in SLOT2_APPEARANCE_NAMES and slot2:
+        elif slot == 2 and slot2:
             target_path = _win_path(slot2)
         if not target_path:
             continue
@@ -2482,7 +2534,7 @@ def _image_pixel_size(image_path: Optional[Path]) -> Optional[Tuple[int, int]]:
     if not image_path or not image_path.is_file():
         return None
     try:
-        from PIL import Image
+        from PIL import Image # type: ignore
 
         with Image.open(str(image_path)) as im:
             return int(im.size[0]), int(im.size[1])
@@ -2571,7 +2623,7 @@ def _slice_image_for_tile(
     instead of repeating the full image once per tile.
     """
     try:
-        from PIL import Image
+        from PIL import Image # type: ignore
     except ImportError:
         return None
     if nx < 1 or ny < 1 or not src_path or not src_path.is_file():
@@ -3430,6 +3482,7 @@ def create_batch_decals_for_all_bodies(
     """
     lines: List[str] = []
     created: List[adsk.fusion.Decal] = []
+    _DECAL_SLOT.clear()
     if not image_path or not image_path.is_file():
         lines.append("Decal projection skipped: image not found ({})".format(image_path))
         return created, lines
@@ -4137,22 +4190,140 @@ def create_batch_decals_for_all_bodies(
                 "(anti-freeze cap)".format(BATCH_DECAL_MAX_TOTAL)
             )
 
+    # Tag each created decal with the appearance slot of the body it sits on so
+    # update_batch_decal_images can route the _1 vs _2 raster. Resolve the body's
+    # ORIGINAL appearance robustly: match by entityToken first (Fusion hands back
+    # a fresh wrapper each traversal, so id() is NOT stable across the snapshot
+    # and the decal body), then the id map, then a live read (valid when
+    # appearance neutralization is off).
+    orig_by_token: Dict[str, str] = {}
+    for snap_body, snap_ap in (appearance_snap or []):
+        try:
+            tok = snap_body.entityToken
+        except Exception:
+            tok = None
+        if tok:
+            try:
+                orig_by_token[tok] = (snap_ap.name if snap_ap is not None else "") or ""
+            except Exception:
+                orig_by_token[tok] = ""
+
+    def _orig_appearance_name_for_body(body: Any) -> str:
+        if body is None:
+            return ""
+        try:
+            tok = body.entityToken
+        except Exception:
+            tok = None
+        if tok and orig_by_token.get(tok):
+            return orig_by_token[tok]
+        nm = original_appearance_names.get(id(body), "")
+        if nm:
+            return nm
+        try:
+            ap = body.appearance
+            return (ap.name if ap is not None else "") or ""
+        except Exception:
+            return ""
+
+    def _face_appearance_slot(face: Any) -> Tuple[Optional[int], str]:
+        """Slot from the decal's anchor face appearance (skins are often pinned
+        per-face, not on the body). Returns (slot_or_None, appearance_name)."""
+        if face is None:
+            return None, ""
+        try:
+            fa = face.appearance
+            fname = (fa.name if fa is not None else "") or ""
+        except Exception:
+            fname = ""
+        return appearance_name_slot(fname), fname
+
+    n_slot2 = 0
+    for d in created:
+        rec = _DECAL_PLACEMENT_CACHE.get(id(d))
+        body = rec.body if rec is not None else None
+        ap_name = _orig_appearance_name_for_body(body)
+        slot = appearance_name_slot(ap_name)
+        src = "body"
+        if slot is None and rec is not None:
+            fslot, fname = _face_appearance_slot(rec.face)
+            if fslot is not None:
+                slot, ap_name, src = fslot, fname, "face"
+        if slot not in (1, 2):
+            slot = 1
+        _DECAL_SLOT[id(d)] = slot
+        if slot == 2:
+            n_slot2 += 1
+        try:
+            bn = body.name if body is not None else "?"
+        except Exception:
+            bn = "?"
+        lines.append(
+            "  Slot tag: decal on body '{}' appearance '{}' (via {}) → slot {}".format(
+                bn, ap_name or "(none)", src, slot
+            )
+        )
+    # Also log every snapshot body that wears a slot appearance, so we can see
+    # whether a slot-2 surface exists at all (and on which body).
+    for snap_body, snap_ap in (appearance_snap or []):
+        try:
+            ap_nm = (snap_ap.name if snap_ap is not None else "") or ""
+        except Exception:
+            ap_nm = ""
+        s = appearance_name_slot(ap_nm)
+        if s:
+            try:
+                bn = snap_body.name
+            except Exception:
+                bn = "?"
+            lines.append(
+                "  Slot map: body '{}' wears '{}' → slot {}".format(bn, ap_nm, s)
+            )
+    lines.append(
+        "Slot routing: {} of {} decal(s) tagged slot-2 (receive _2 image).".format(
+            n_slot2, len(created)
+        )
+    )
+
     lines.insert(0, "Batch decal projection: {} decal(s) created".format(len(created)))
     return created, lines
 
 
+def _decal_image_for_slot(
+    decal: adsk.fusion.Decal,
+    slot1_image: Optional[Path],
+    slot2_image: Optional[Path],
+) -> Optional[Path]:
+    """Per-decal color-set image: slot-2 bodies get the _2 image, all others _1.
+
+    Falls back to the _1 image when a decal has no slot-2 image available so a
+    missing/one-image color set never leaves a body untextured.
+    """
+    slot = _DECAL_SLOT.get(id(decal), 1)
+    if slot == 2 and slot2_image is not None and slot2_image.is_file():
+        return slot2_image
+    return slot1_image
+
+
 def update_batch_decal_images(
-    decals: List[adsk.fusion.Decal], image_path: Path
+    decals: List[adsk.fusion.Decal],
+    slot1_image: Path,
+    slot2_image: Optional[Path] = None,
 ) -> Tuple[int, List[str], List[adsk.fusion.Decal]]:
-    """Update every tracked batch decal for a new color-set image.
+    """Update every tracked batch decal for a new color set.
+
+    Each decal receives the image for ITS body's appearance slot: slot-2 bodies
+    (e.g. ``Vinyl Skin-2``) get ``slot2_image`` (the ``_2`` raster); every other
+    decal gets ``slot1_image`` (the ``_1`` raster). ``slot2_image`` may be None
+    (one-image models) — those decals fall back to ``slot1_image``.
 
     When ``BATCH_DECAL_RECREATE_ON_COLOR_SWAP`` is True, each decal is deleted
     and recreated with full orientation/scale (reliable on read-only Decal API).
     Otherwise falls back to ``imageFilename`` swap + cached transform re-apply.
     """
     if BATCH_DECAL_RECREATE_ON_COLOR_SWAP:
-        return _update_batch_decals_via_recreate(decals, image_path)
-    n, lines = _update_batch_decals_via_image_swap(decals, image_path)
+        return _update_batch_decals_via_recreate(decals, slot1_image, slot2_image)
+    n, lines = _update_batch_decals_via_image_swap(decals, slot1_image, slot2_image)
     return n, lines, decals
 
 
@@ -4167,17 +4338,24 @@ def _resolve_recreate_face(record: DecalPlacementRecord) -> Any:
 
 
 def _update_batch_decals_via_recreate(
-    decals: List[adsk.fusion.Decal], image_path: Path
+    decals: List[adsk.fusion.Decal],
+    slot1_image: Path,
+    slot2_image: Optional[Path] = None,
 ) -> Tuple[int, List[str], List[adsk.fusion.Decal]]:
     lines: List[str] = []
-    if not image_path or not image_path.is_file():
-        lines.append("Decal update skipped: image not found ({})".format(image_path))
+    if not slot1_image or not slot1_image.is_file():
+        lines.append("Decal update skipped: image not found ({})".format(slot1_image))
         return 0, lines, decals
-    image_win = _win_path(image_path)
     out: List[adsk.fusion.Decal] = []
+    n_slot2 = 0
     pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
     for idx, d in enumerate(decals):
         old_id = id(d)
+        slot = _DECAL_SLOT.get(old_id, 1)
+        image_path = _decal_image_for_slot(d, slot1_image, slot2_image)
+        if image_path is slot2_image and slot2_image is not None:
+            n_slot2 += 1
+        image_win = _win_path(image_path)
         record = _DECAL_PLACEMENT_CACHE.get(old_id)
         meta = _TILE_METADATA.get(old_id)
         try:
@@ -4233,6 +4411,8 @@ def _update_batch_decals_via_recreate(
         _DECAL_PLACEMENT_CACHE.pop(old_id, None)
         _DECAL_TRANSFORM_CACHE.pop(old_id, None)
         _TILE_METADATA.pop(old_id, None)
+        _DECAL_SLOT.pop(old_id, None)
+        _DECAL_SLOT[id(new_decal)] = slot
         if meta is not None:
             _TILE_METADATA[id(new_decal)] = meta
         try:
@@ -4252,36 +4432,47 @@ def _update_batch_decals_via_recreate(
                 adsk.doEvents()
             except Exception:
                 pass
+    slot2_note = " ({} on _2 image)".format(n_slot2) if n_slot2 else ""
     lines.insert(
         0,
-        "Batch decal update: {} / {} recreate(s)".format(len(out), len(decals)),
+        "Batch decal update: {} / {} recreate(s){}".format(
+            len(out), len(decals), slot2_note
+        ),
     )
     return len(out), lines, out
 
 
 def _update_batch_decals_via_image_swap(
-    decals: List[adsk.fusion.Decal], image_path: Path
+    decals: List[adsk.fusion.Decal],
+    slot1_image: Path,
+    slot2_image: Optional[Path] = None,
 ) -> Tuple[int, List[str]]:
-    """Swap ``imageFilename`` on every tracked decal. When per-decal grid
-    metadata exists in ``_TILE_METADATA``, each decal receives its own slice
-    of ``image_path`` so the tiles assemble into one continuous image.
+    """Swap ``imageFilename`` on every tracked decal. Each decal receives the
+    raster for ITS body's appearance slot (slot-2 bodies get ``slot2_image``,
+    all others ``slot1_image``). When per-decal grid metadata exists in
+    ``_TILE_METADATA``, each decal receives its own slice so tiles assemble
+    into one continuous image.
     """
     lines: List[str] = []
-    if not image_path or not image_path.is_file():
-        lines.append("Decal update skipped: image not found ({})".format(image_path))
+    if not slot1_image or not slot1_image.is_file():
+        lines.append("Decal update skipped: image not found ({})".format(slot1_image))
         return 0, lines
-    base_target = _win_path(image_path)
     n = 0
+    n_slot2 = 0
     pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
     slice_cache: dict = {}
     for idx, d in enumerate(decals):
+        image_path = _decal_image_for_slot(d, slot1_image, slot2_image)
+        if image_path is slot2_image and slot2_image is not None:
+            n_slot2 += 1
+        base_target = _win_path(image_path)
         meta = _TILE_METADATA.get(id(d))
         if (
             BATCH_DECAL_TILE_SLICE_IMAGE
             and meta is not None
             and meta[2] * meta[3] > 1
         ):
-            cache_key = meta
+            cache_key = (id(image_path), meta)
             cached = slice_cache.get(cache_key)
             if cached is None:
                 iu, iv, nu, nv = meta
@@ -4327,7 +4518,13 @@ def _update_batch_decals_via_image_swap(
                 adsk.doEvents()
             except Exception:
                 pass
-    lines.insert(0, "Batch decal update: {} / {} imageFilename swap(s)".format(n, len(decals)))
+    slot2_note = " ({} on _2 image)".format(n_slot2) if n_slot2 else ""
+    lines.insert(
+        0,
+        "Batch decal update: {} / {} imageFilename swap(s){}".format(
+            n, len(decals), slot2_note
+        ),
+    )
     return n, lines
 
 
@@ -4403,6 +4600,7 @@ def cleanup_batch_decals(decals: List[adsk.fusion.Decal]) -> int:
     _TILE_METADATA.clear()
     _DECAL_TRANSFORM_CACHE.clear()
     _DECAL_PLACEMENT_CACHE.clear()
+    _DECAL_SLOT.clear()
     for p in _TILE_TEMP_PATHS:
         _unlink_silent(p)
     _TILE_TEMP_PATHS.clear()
@@ -4429,7 +4627,7 @@ def apply_decal_color_set(
     _need_pil = int(DECAL_TEXTURE_IMAGE_SHIFT_PX) != 0 or int(CARRIER_TEXTURE_IMAGE_SHIFT_PX) != 0
     if _need_pil:
         try:
-            import PIL  # noqa: F401
+            import PIL  # noqa: F401 # type: ignore
         except ImportError:
             lines.append(
                 "Texture bitmap shift: install Pillow in Fusion's Python "
@@ -5100,9 +5298,9 @@ def _appearance_should_neutralize(ap_name: str) -> bool:
         return False
     if _appearance_is_protected_substrate(ap_name):
         return False
-    if n in {x.lower() for x in SLOT1_APPEARANCE_NAMES}:
-        return False
-    if n in {x.lower() for x in SLOT2_APPEARANCE_NAMES}:
+    if appearance_name_slot(ap_name) is not None:
+        # Never neutralize a designer slot appearance (Vinyl Skin-1/-2, etc.),
+        # regardless of spacing/separator drift.
         return False
     if any(w in n for w in ("pine", "oak", "wood", "maple", "walnut", "cherry", "birch", "hickory")):
         return False
@@ -5572,11 +5770,35 @@ def list_appearance_and_decal_names(design: adsk.fusion.Design) -> Tuple[List[st
     return anames, dnames
 
 
+def design_has_slot1_target(design: adsk.fusion.Design) -> bool:
+    """True if the document has at least one appearance matching slot-1 names."""
+    apps = design.appearances
+    for i in range(apps.count):
+        if appearance_name_slot(apps.item(i).name) == 1:
+            return True
+    return False
+
+
 def design_has_slot2_target(design: adsk.fusion.Design) -> bool:
     """True if the document has at least one appearance matching slot-2 names."""
     apps = design.appearances
     for i in range(apps.count):
-        if apps.item(i).name in SLOT2_APPEARANCE_NAMES:
+        if appearance_name_slot(apps.item(i).name) == 2:
+            return True
+    return False
+
+
+def design_has_named_appearance_slot(design: adsk.fusion.Design) -> bool:
+    """True if the document has any slot-1 or slot-2 named appearance.
+
+    When this is True for an appearance-mode model, the controller uses the
+    clean per-name appearance swap (slot1 image on slot-1 appearance, slot2 on
+    slot-2) instead of blanketing every body with the slot-1 image via force
+    decals / carrier — which would hide the slot-2 surface.
+    """
+    apps = design.appearances
+    for i in range(apps.count):
+        if appearance_name_slot(apps.item(i).name) is not None:
             return True
     return False
 
