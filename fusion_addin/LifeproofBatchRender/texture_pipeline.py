@@ -142,21 +142,6 @@ def decal_name_slot(name: str) -> Optional[int]:
 # strict naming.
 DECAL_POSITIONAL_FALLBACK: bool = True
 
-# When True (decal mode), instead of only swapping imageFilename on each authored
-# decal — which lets Fusion shrink the image to its own aspect and keeps the
-# designer's honeycomb orientation — the decal is RECREATED in place: same face,
-# same origin, same footprint size (from its own transform), but with the grain
-# rotated so the image's long axis runs along the tread length (SOW 1.1.2
-# "wrap the image in the correct direction and adjust the size to cover the
-# entire decal"). Preserving each decal's own footprint keeps two-tone regions
-# from overlapping. If any step is unsupported on this Fusion build, it falls
-# back to the plain imageFilename swap so nothing crashes.
-# DISABLED: this build does not expose ``decal.faces`` (recreate always fell
-# back). Decal-mode coverage/orientation is handled by the batch projection path
-# instead (FORCE_BODY_COVERAGE, mode-gated in the controller). Kept for a future
-# build that exposes decal faces.
-DECAL_AUTHORED_RECREATE_TO_COVER: bool = False
-
 # Strict per-name control: only SLOT1/SLOT2 appearance names are updated.
 # Do not push slot 1 into every textured appearance (foam, Pine, steel, etc.).
 APPEARANCE_BROADCAST: bool = False
@@ -4668,136 +4653,6 @@ def _decal_entity_token(d: Any) -> str:
         return ""
 
 
-def _collect_all_decals_with_owner(
-    design: adsk.fusion.Design,
-) -> List[Tuple[adsk.fusion.Decal, Any]]:
-    """Every decal paired with the ``decals`` collection that owns it.
-
-    Recreating a decal needs the collection it lives on (root or a
-    sub-component such as ``Plank:1``), so we can't reuse ``_collect_all_decals``.
-    Order matches ``_collect_all_decals`` so slot indices line up.
-    """
-    out: List[Tuple[adsk.fusion.Decal, Any]] = []
-    seen: set = set()
-
-    def _drain(comp: adsk.fusion.Component) -> None:
-        try:
-            key = comp.id
-        except Exception:
-            key = id(comp)
-        if key in seen:
-            return
-        seen.add(key)
-        try:
-            coll = comp.decals
-            n = coll.count
-        except Exception:
-            return
-        for j in range(n):
-            try:
-                out.append((coll.item(j), coll))
-            except Exception:
-                continue
-
-    try:
-        _drain(design.rootComponent)
-    except Exception:
-        return out
-    try:
-        occs = design.rootComponent.allOccurrences
-    except Exception:
-        return out
-    for i in range(occs.count):
-        try:
-            comp = occs.item(i).component
-        except Exception:
-            continue
-        _drain(comp)
-    return out
-
-
-def _recreate_authored_decal_oriented(
-    decals_collection: Any,
-    decal: adsk.fusion.Decal,
-    slot_image_path: Path,
-    name: str,
-) -> Tuple[Optional[adsk.fusion.Decal], str]:
-    """Recreate ``decal`` in place with the slot image, grain aligned to the
-    body length, preserving its face / origin / footprint size.
-
-    Returns ``(new_decal, "")`` on success or ``(None, reason)`` so the caller
-    can fall back to a plain imageFilename swap.
-    """
-    # Faces the decal is projected onto (need at least one to re-project).
-    faces: List[adsk.fusion.BRepFace] = []
-    try:
-        fcoll = decal.faces
-        for k in range(fcoll.count):
-            faces.append(fcoll.item(k))
-    except Exception:
-        faces = []
-    if not faces:
-        return None, "decal exposes no faces on this build"
-    primary = faces[0]
-    try:
-        body = primary.body
-    except Exception:
-        body = None
-
-    # Captured transform = origin (position) + axis magnitudes (footprint size)
-    # + current orientation. Read-only on this build, but readable.
-    try:
-        captured = decal.transform
-        origin, _xa, _ya, _za = captured.getAsCoordinateSystem()
-        trf = captured.copy()
-    except Exception as ex:
-        return None, "transform read failed ({})".format(ex)
-
-    # Rotate in the face plane so the image's long axis runs along tread length,
-    # keeping the same footprint magnitudes and origin.
-    if BATCH_DECAL_ALIGN_GRAIN_TO_LENGTH and body is not None:
-        try:
-            trf = _apply_align_grain_to_body_length(
-                trf,
-                primary,
-                origin,
-                body,
-                align_y_axis=bool(BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS),
-            )
-        except Exception as ex:
-            return None, "grain align failed ({})".format(ex)
-
-    image_win = _win_path_for_decal_image(slot_image_path)
-    if not image_win:
-        return None, "image path unavailable"
-
-    try:
-        di = decals_collection.createInput(image_win, faces, origin)
-    except Exception as ex:
-        return None, "createInput failed ({})".format(ex)
-    if di is None:
-        return None, "createInput returned None"
-    _set_decal_input_chain_faces(di, False)
-    _apply_entity_transform(di, trf)
-    try:
-        new_decal = decals_collection.add(di)
-    except Exception as ex:
-        return None, "decals.add failed ({})".format(ex)
-    if new_decal is None:
-        return None, "decals.add returned None"
-    # Some builds only honor the transform after add.
-    _apply_entity_transform(new_decal, trf)
-    try:
-        decal.deleteMe()
-    except Exception:
-        pass
-    try:
-        new_decal.name = name
-    except Exception:
-        pass
-    return new_decal, ""
-
-
 def apply_decal_color_set(
     design: adsk.fusion.Design,
     slot1: Optional[Path],
@@ -4827,13 +4682,12 @@ def apply_decal_color_set(
             )
     total = 0
 
-    decal_pairs = _collect_all_decals_with_owner(design)
-    decal_list = [d for d, _coll in decal_pairs]
+    decal_list = _collect_all_decals(design)
 
     # Resolve each decal's slot with a STABLE priority so a decal keeps its slot
     # across every color set:
     #   1) cached slot by entityToken (from an earlier color set) — survives the
-    #      rename/recreate cycle;
+    #      rename Fusion applies when imageFilename changes;
     #   2) name match (Honeycomb-1 -> slot 1, etc.);
     #   3) positional fallback (first unassigned -> slot 1, next -> slot 2).
     slot_by_idx: Dict[int, int] = {}
@@ -4877,7 +4731,7 @@ def apply_decal_color_set(
                 src_by_idx[0] = "positional slot, sole decal"
                 assigned.add(2)
 
-    for idx, (d, coll) in enumerate(decal_pairs):
+    for idx, d in enumerate(decal_list):
         slot = slot_by_idx.get(idx)
         if slot == 1 and slot1:
             slot_path: Optional[Path] = slot1
@@ -4885,62 +4739,26 @@ def apply_decal_color_set(
             slot_path = slot2
         else:
             continue
+        target = _win_path_for_decal_image(slot_path)
+        if not target:
+            continue
         which = "{} {}".format(src_by_idx.get(idx, "slot"), slot)
-
-        # Original name — preserved on recreate so name-matching stays stable
-        # across color sets (no drift to "Color Set 0X-1").
-        try:
-            orig_name = d.name or "decal"
-        except Exception:
-            orig_name = "decal"
-
-        recreated = False
-        if DECAL_AUTHORED_RECREATE_TO_COVER:
-            new_decal, rerr = _recreate_authored_decal_oriented(
-                coll, d, slot_path, orig_name
-            )
-            if new_decal is not None:
-                total += 1
-                recreated = True
-                tok = _decal_entity_token(new_decal)
-                if tok:
-                    _AUTHORED_DECAL_SLOT[tok] = slot
-                try:
-                    nn = new_decal.name
-                except Exception:
-                    nn = orig_name
-                lines.append(
-                    'Decal "{}" ({}): recreated grain-aligned to length -> {}'.format(
-                        nn, which, _win_path_for_decal_image(slot_path)
-                    )
-                )
-            else:
-                lines.append(
-                    'Decal "{}" ({}): recreate unavailable ({}) — image-swap fallback'.format(
-                        orig_name, which, rerr
-                    )
-                )
-
-        if not recreated:
-            target = _win_path_for_decal_image(slot_path)
-            if not target:
-                continue
-            ok, err = _set_decal_image(d, target)
-            if ok:
-                total += 1
-                tok = _decal_entity_token(d)
-                if tok:
-                    _AUTHORED_DECAL_SLOT[tok] = slot
-                try:
-                    dn2 = d.name
-                except Exception:
-                    dn2 = "?"
-                lines.append('Decal "{}" ({}): image -> {}'.format(dn2, which, target))
-                nudge_err = _nudge_decal_texture_origin(d)
-                if nudge_err:
-                    lines.append('Decal "{}" ({}): transform nudge — {}'.format(dn2, which, nudge_err))
-            else:
-                lines.append('Decal ({}): failed ({})'.format(which, err))
+        ok, err = _set_decal_image(d, target)
+        if ok:
+            total += 1
+            tok = _decal_entity_token(d)
+            if tok:
+                _AUTHORED_DECAL_SLOT[tok] = slot
+            try:
+                dn2 = d.name
+            except Exception:
+                dn2 = "?"
+            lines.append('Decal "{}" ({}): image -> {}'.format(dn2, which, target))
+            nudge_err = _nudge_decal_texture_origin(d)
+            if nudge_err:
+                lines.append('Decal "{}" ({}): transform nudge — {}'.format(dn2, which, nudge_err))
+        else:
+            lines.append('Decal ({}): failed ({})'.format(which, err))
 
     return total, lines
 
