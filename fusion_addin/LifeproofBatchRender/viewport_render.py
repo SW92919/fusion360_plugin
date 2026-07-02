@@ -172,65 +172,6 @@ def yaw_orbit_camera_about_world_y(app: adsk.core.Application, degrees: float) -
         return False
 
 
-def pitch_camera_toward_horizontal(
-    app: adsk.core.Application, degrees: float
-) -> bool:
-    """Tilt the camera up/down around its horizontal right-axis through the
-    target, WITHOUT changing the azimuth (the 3/4 spin around vertical).
-
-    ``degrees`` > 0 lowers the eye toward the horizon → a low product-
-    photography angle that shows the part's side profile / bullnose curve
-    (the client's hero look). < 0 raises it back toward straight-down.
-    Uses Rodrigues rotation around the (viewDir × up) axis so it works for
-    any model up-axis. If the result tilts the wrong way, negate ``degrees``.
-    """
-    try:
-        vp = app.activeViewport
-        cam = vp.camera
-        if cam is None:
-            return False
-        eye, target, up = cam.eye, cam.target, cam.upVector
-        if not (eye and target and up):
-            return False
-        # View offset (target -> eye) and the camera's horizontal right axis.
-        dx, dy, dz = eye.x - target.x, eye.y - target.y, eye.z - target.z
-        kx = dy * up.z - dz * up.y
-        ky = dz * up.x - dx * up.z
-        kz = dx * up.y - dy * up.x
-        kmag = math.sqrt(kx * kx + ky * ky + kz * kz)
-        if kmag < 1e-9:
-            return False
-        kx, ky, kz = kx / kmag, ky / kmag, kz / kmag
-
-        ang = math.radians(degrees)
-        c, s = math.cos(ang), math.sin(ang)
-
-        def _rodrigues(vx, vy, vz):
-            dot = vx * kx + vy * ky + vz * kz
-            cxx = ky * vz - kz * vy
-            cxy = kz * vx - kx * vz
-            cxz = kx * vy - ky * vx
-            return (
-                vx * c + cxx * s + kx * dot * (1.0 - c),
-                vy * c + cxy * s + ky * dot * (1.0 - c),
-                vz * c + cxz * s + kz * dot * (1.0 - c),
-            )
-
-        nx, ny, nz = _rodrigues(dx, dy, dz)
-        ux, uy, uz = _rodrigues(up.x, up.y, up.z)
-        cam.eye = adsk.core.Point3D.create(
-            target.x + nx, target.y + ny, target.z + nz
-        )
-        cam.upVector = adsk.core.Vector3D.create(ux, uy, uz)
-        cam.isSmoothTransition = False
-        vp.camera = cam
-        vp.refresh()
-        pump_ui()
-        return True
-    except Exception:
-        return False
-
-
 # When True, prefer the .f3d's own SAVED NAMED VIEWS over any computed angle.
 # For the deliverable templates the designer baked the exact product cameras
 # into the file (named "Nose Front" / "Nose Rear", etc.) — they ARE the

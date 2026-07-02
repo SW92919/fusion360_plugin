@@ -1493,37 +1493,6 @@ def _face_curvature_spread_deg(face: adsk.fusion.BRepFace) -> float:
         return 0.0
 
 
-def _largest_planar_face(body: adsk.fusion.BRepBody) -> Optional[adsk.fusion.BRepFace]:
-    """Pick the largest planar face. Falls back to the largest face overall if
-    no planar face exists (some bodies are entirely cylindrical / spline)."""
-    best_planar: Optional[adsk.fusion.BRepFace] = None
-    best_planar_area = 0.0
-    best_any: Optional[adsk.fusion.BRepFace] = None
-    best_any_area = 0.0
-    try:
-        faces = body.faces
-        n = faces.count
-    except Exception:
-        return None
-    for i in range(n):
-        try:
-            f = faces.item(i)
-        except Exception:
-            continue
-        area = _face_area(f)
-        if area > best_any_area:
-            best_any_area = area
-            best_any = f
-        try:
-            is_plane = isinstance(f.geometry, adsk.core.Plane)
-        except Exception:
-            is_plane = False
-        if is_plane and area > best_planar_area:
-            best_planar_area = area
-            best_planar = f
-    return best_planar or best_any
-
-
 def _vector_length(v: adsk.core.Vector3D) -> float:
     return math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
 
@@ -2055,34 +2024,6 @@ def _remove_existing_decals_on_component(
     return template_hint
 
 
-def _occurrence_forced_body_name(
-    occurrence_label: str,
-    main_token: str = "",
-    comp: Optional[adsk.fusion.Component] = None,
-) -> Optional[str]:
-    """Return pinned body name for this occurrence, if any."""
-    if comp is not None:
-        return _resolve_forced_body_name(occurrence_label, main_token, comp)
-    mapped = _occurrence_forced_body_name_from_map(occurrence_label)
-    if mapped:
-        return mapped
-    if BATCH_DECAL_MAIN_BODY_FROM_FILENAME and main_token:
-        occ = _normalize_occurrence_name(occurrence_label)
-        if _name_matches_product_token(occ, main_token):
-            return occ
-    return None
-
-
-def _body_name_matches(body: adsk.fusion.BRepBody, expected: str) -> bool:
-    try:
-        actual = (body.name or "").strip()
-    except Exception:
-        actual = ""
-    if _body_matches_root_anchor(expected):
-        return _body_name_exact_matches(actual, expected)
-    return _name_matches_product_token(actual, expected)
-
-
 def _forced_body_uses_exact_match(label: str, forced_body: Optional[str]) -> bool:
     if not forced_body:
         return False
@@ -2148,16 +2089,6 @@ def _face_normal_unit(
     return _face_normal_at_point(face, pt)
 
 
-def _is_world_vertical_face(face: adsk.fusion.BRepFace) -> bool:
-    """True when face normal is horizontal in Fusion Z-up (vertical wall)."""
-    if not BATCH_DECAL_SKIP_WORLD_VERTICAL:
-        return False
-    normal = _face_normal_unit(face)
-    if normal is None:
-        return False
-    return abs(normal[2]) < float(BATCH_DECAL_WORLD_VERTICAL_Z_DOT)
-
-
 def _tread_show_alignment(
     normal: Tuple[float, float, float],
 ) -> float:
@@ -2204,38 +2135,6 @@ def _is_chamfer_or_slope_face(
         return True
     peak = max(abs(normal[0]), abs(normal[1]), abs(normal[2]))
     return peak < float(BATCH_DECAL_PRIMARY_STRICT_SHOW_DOT)
-
-
-def _qualifies_primary_anchor_face(
-    face: adsk.fusion.BRepFace,
-    body: adsk.fusion.BRepBody,
-) -> bool:
-    """Stricter filter for chain-mode tread-top anchor."""
-    if _face_area(face) < float(BATCH_DECAL_PRIMARY_MIN_FACE_AREA_CM2):
-        return False
-    if _is_chamfer_or_slope_face(face):
-        return False
-    if body is not None and _is_end_cap_face(face, body):
-        return False
-    if body is not None and _is_vertical_side_face(face, body):
-        return False
-    if BATCH_DECAL_SKIP_DOWN_FACING and (
-        _face_up_score(face) < BATCH_DECAL_DOWN_FACE_THRESHOLD
-    ):
-        return False
-    if BATCH_DECAL_SKIP_CURVED_FACES and (
-        _face_curvature_spread_deg(face) > BATCH_DECAL_CURVED_FACE_MAX_DEG
-    ):
-        return False
-    if not BATCH_DECAL_PRIMARY_USE_WORLD_UP:
-        return True
-    normal = _face_normal_unit(face)
-    if normal is None:
-        return False
-    align = _tread_show_alignment(normal)
-    if align < float(BATCH_DECAL_PRIMARY_MIN_WORLD_UP_DOT):
-        return False
-    return align >= float(BATCH_DECAL_PRIMARY_STRICT_SHOW_DOT)
 
 
 def _body_bbox_show_plane_floor_cm(
@@ -2487,140 +2386,6 @@ def _body_corners_cm(body: adsk.fusion.BRepBody) -> List[adsk.core.Point3D]:
     except Exception:
         pass
     return out
-
-
-def _is_extrusion_profile_product(
-    model_path: Optional[Path],
-    main_token: str,
-) -> bool:
-    """End Cap–style extrusions: chain off, exterior top face set."""
-    parts: List[str] = []
-    if main_token:
-        parts.append(main_token)
-    if model_path is not None:
-        try:
-            parts.append(model_path.stem or "")
-        except Exception:
-            pass
-    hay = " ".join(parts).lower()
-    for tok in BATCH_DECAL_EXTRUSION_PROFILE_TOKENS:
-        if tok.lower() in hay:
-            return True
-    return False
-
-
-def _chain_faces_for_product(
-    model_path: Optional[Path],
-    main_token: str,
-    occurrence_label: str,
-) -> bool:
-    """Chain ON for tread/bullnose; OFF for extrusion-profile products."""
-    if not BATCH_DECAL_CHAIN_FACES:
-        return False
-    if _is_extrusion_profile_product(model_path, main_token):
-        return False
-    if _occurrence_label_in_explicit_map(occurrence_label):
-        return True
-    hay = ((occurrence_label or "") + " " + (main_token or "")).lower()
-    for kw in ("nose", "bullnose", "plank", "tread"):
-        if kw in hay:
-            return True
-    return bool(BATCH_DECAL_CHAIN_FACES)
-
-
-def _adjacent_faces_same_body(
-    face: adsk.fusion.BRepFace,
-) -> List[adsk.fusion.BRepFace]:
-    """Faces sharing an edge with ``face``."""
-    out: List[adsk.fusion.BRepFace] = []
-    seen: set = set()
-    try:
-        edges = face.edges
-        n_e = edges.count
-    except Exception:
-        return out
-    for ei in range(n_e):
-        try:
-            edge = edges.item(ei)
-            adj_faces = edge.faces
-            n_f = adj_faces.count
-        except Exception:
-            continue
-        for fi in range(n_f):
-            try:
-                nf = adj_faces.item(fi)
-            except Exception:
-                continue
-            try:
-                key = id(nf)
-            except Exception:
-                key = None
-            if nf is face or key in seen:
-                continue
-            if key is not None:
-                seen.add(key)
-            out.append(nf)
-    return out
-
-
-def _face_qualifies_extrusion_top(
-    face: adsk.fusion.BRepFace,
-    body: adsk.fusion.BRepBody,
-) -> bool:
-    """Exterior flat +Y top band — no slopes, cuts, or cavity walls."""
-    if _face_area(face) < float(BATCH_DECAL_MIN_FACE_AREA_CM2):
-        return False
-    if _is_end_cap_face(face, body):
-        return False
-    if _is_vertical_side_face(face, body):
-        return False
-    if BATCH_DECAL_SKIP_DOWN_FACING and (
-        _face_up_score(face) < BATCH_DECAL_DOWN_FACE_THRESHOLD
-    ):
-        return False
-    normal = _face_normal_unit(face)
-    if normal is None:
-        return False
-    if abs(normal[1]) < float(BATCH_DECAL_EXTRUSION_TOP_MIN_Y_DOT):
-        return False
-    if _face_exterior_along_normal(face, body) <= 0.0:
-        return False
-    return True
-
-
-def _pick_extrusion_top_faces(
-    body: adsk.fusion.BRepBody,
-    seed: Optional[adsk.fusion.BRepFace],
-) -> List[adsk.fusion.BRepFace]:
-    """Connected exterior +Y tops (chain-off multi-face decal, no inner/cut)."""
-    if seed is None:
-        seed = _pick_primary_show_face_for_body(body, occurrence_mapped=True)
-    if seed is None:
-        return []
-    picked: List[adsk.fusion.BRepFace] = []
-    seen: set = set()
-    queue: List[adsk.fusion.BRepFace] = [seed]
-    while queue:
-        f = queue.pop(0)
-        try:
-            fid = id(f)
-        except Exception:
-            continue
-        if fid in seen:
-            continue
-        seen.add(fid)
-        if not _face_qualifies_extrusion_top(f, body):
-            continue
-        picked.append(f)
-        for nb in _adjacent_faces_same_body(f):
-            try:
-                nid = id(nb)
-            except Exception:
-                continue
-            if nid not in seen:
-                queue.append(nb)
-    picked.sort(key=lambda ff: _face_area(ff), reverse=True)
-    return picked
 
 
 def _apply_bbox_floor_to_decal_needs(
@@ -6220,35 +5985,11 @@ def list_appearance_and_decal_names(design: adsk.fusion.Design) -> Tuple[List[st
     return anames, dnames
 
 
-def design_has_slot1_target(design: adsk.fusion.Design) -> bool:
-    """True if the document has at least one appearance matching slot-1 names."""
-    apps = design.appearances
-    for i in range(apps.count):
-        if appearance_name_slot(apps.item(i).name) == 1:
-            return True
-    return False
-
-
 def design_has_slot2_target(design: adsk.fusion.Design) -> bool:
     """True if the document has at least one appearance matching slot-2 names."""
     apps = design.appearances
     for i in range(apps.count):
         if appearance_name_slot(apps.item(i).name) == 2:
-            return True
-    return False
-
-
-def design_has_named_appearance_slot(design: adsk.fusion.Design) -> bool:
-    """True if the document has any slot-1 or slot-2 named appearance.
-
-    When this is True for an appearance-mode model, the controller uses the
-    clean per-name appearance swap (slot1 image on slot-1 appearance, slot2 on
-    slot-2) instead of blanketing every body with the slot-1 image via force
-    decals / carrier — which would hide the slot-2 surface.
-    """
-    apps = design.appearances
-    for i in range(apps.count):
-        if appearance_name_slot(apps.item(i).name) is not None:
             return True
     return False
 
