@@ -105,10 +105,57 @@ SLOT2_DECAL_NAMES: FrozenSet[str] = frozenset(
     }
 )
 
+_SLOT1_DECAL_NAMES_NORM: FrozenSet[str] = frozenset(
+    _normalize_appearance_slot_name(n) for n in SLOT1_DECAL_NAMES
+)
+_SLOT2_DECAL_NAMES_NORM: FrozenSet[str] = frozenset(
+    _normalize_appearance_slot_name(n) for n in SLOT2_DECAL_NAMES
+)
+_DECAL_TRAILING_SLOT_RE = re.compile(r"([12])\s*$")
+
+
+def decal_name_slot(name: str) -> Optional[int]:
+    """Return 1 or 2 for a decal name, else None — tolerant of naming.
+
+    Matches the documented ``SLOT*_DECAL_NAMES`` (normalized: case/space/sep
+    insensitive), then falls back to the trailing digit, so ANY decal whose name
+    ends in 1 or 2 resolves — ``Decal-1``, ``Slot_2``, ``Pattern1``, ``grid 2``,
+    ``Custom_A-1`` all work regardless of exact wording. Names with no trailing
+    1/2 (e.g. ``Logo``) return None.
+    """
+    n = (name or "").strip()
+    if not n:
+        return None
+    norm = _normalize_appearance_slot_name(n)
+    if norm in _SLOT1_DECAL_NAMES_NORM:
+        return 1
+    if norm in _SLOT2_DECAL_NAMES_NORM:
+        return 2
+    m = _DECAL_TRAILING_SLOT_RE.search(n)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 # When the named matches above produce zero updates, fall back to positional
 # matching (first decal -> slot 1, second decal -> slot 2). Disable to force
 # strict naming.
 DECAL_POSITIONAL_FALLBACK: bool = True
+
+# When True (decal mode), instead of only swapping imageFilename on each authored
+# decal — which lets Fusion shrink the image to its own aspect and keeps the
+# designer's honeycomb orientation — the decal is RECREATED in place: same face,
+# same origin, same footprint size (from its own transform), but with the grain
+# rotated so the image's long axis runs along the tread length (SOW 1.1.2
+# "wrap the image in the correct direction and adjust the size to cover the
+# entire decal"). Preserving each decal's own footprint keeps two-tone regions
+# from overlapping. If any step is unsupported on this Fusion build, it falls
+# back to the plain imageFilename swap so nothing crashes.
+# DISABLED: this build does not expose ``decal.faces`` (recreate always fell
+# back). Decal-mode coverage/orientation is handled by the batch projection path
+# instead (FORCE_BODY_COVERAGE, mode-gated in the controller). Kept for a future
+# build that exposes decal faces.
+DECAL_AUTHORED_RECREATE_TO_COVER: bool = False
 
 # Strict per-name control: only SLOT1/SLOT2 appearance names are updated.
 # Do not push slot 1 into every textured appearance (foam, Pine, steel, etc.).
@@ -120,6 +167,18 @@ APPEARANCE_BROADCAST: bool = False
 # read-only / refuse changeTextureImage. The original body->appearance
 # mapping is restored at the end of the batch. Set to False if you want
 # the original mixed materials preserved (some bodies will not change).
+#
+# NOTE: these two flags are now applied MODE-AWARE in the controller — they are
+# honored ONLY for decal-mode models (mode == "decal"), and ignored for
+# appearance-mode models. Rationale (2026-07-02):
+#   * Appearance mode (e.g. Bullnose): the .f3d already has Vinyl Skin-1/-2
+#     appearances on the right faces. Code must NOT project decals or reassign
+#     appearances — projected decals bleed onto the cut edge and override the
+#     real edge material. So appearance mode uses ONLY the per-name image swap.
+#   * Decal mode (e.g. Square Nose): the authored decals can't be recreated
+#     (this Fusion build doesn't expose decal.faces), so the proven batch
+#     projection path (auto-size + grain-align to length) is what gives correct
+#     coverage and direction — exactly how it worked before the appearance fix.
 FORCE_BODY_COVERAGE: bool = True
 
 # When True, batch decals (chain faces + Scale Plane XY) texture visible tread
@@ -531,6 +590,15 @@ _DECAL_PLACEMENT_CACHE: dict = {}
 # Default when a decal id is absent: slot 1.
 _DECAL_SLOT: Dict[int, int] = {}
 
+# Authored-decal slot memory for decal-mode models, keyed by the decal's
+# entityToken (STABLE across Fusion's rename-on-imageFilename-change). The
+# first color set matches decals by name (Honeycomb-1 -> slot 1, etc.) and
+# records the mapping here; every later color set reuses it so a decal keeps its
+# slot even though its name became "Color Set 0X-1" after the first swap. Without
+# this, later color sets fall back to positional order and can swap _1/_2 onto
+# the wrong physical decal. Cleared per batch in clear_decal_shift_temp_files.
+_AUTHORED_DECAL_SLOT: Dict[str, int] = {}
+
 
 class TemplateDecalHint:
     """Settings read from a user-authored decal before batch replacement."""
@@ -625,6 +693,7 @@ def clear_decal_shift_temp_files() -> None:
         _unlink_silent(p)
     _decal_shift_temp_paths.clear()
     _decal_shift_pil_warning_emitted = False
+    _AUTHORED_DECAL_SLOT.clear()
 
 
 def _roll_image_horizontal_to_temp_png(src: Path, dx_px: int) -> Optional[str]:
@@ -887,6 +956,22 @@ def _apply_image_to_appearance_textures_detailed(
                     continue
             except Exception:
                 pass
+            # Image attached as a connected texture on a Color/other property
+            # (ColorProperty.connectedTexture). This is how the client's
+            # Vinyl Skin-1/-2 appearances hold their photo — there is NO
+            # standalone AppearanceTexture node, so the casts above miss it.
+            try:
+                if getattr(p, "hasConnectedTexture", False):
+                    ct = p.connectedTexture
+                    if ct is not None:
+                        if _try_change_on(ct):
+                            _record(child_parents)
+                        ct_props = getattr(ct, "properties", None)
+                        if ct_props is not None:
+                            walk(ct_props, child_parents, depth + 1)
+                        continue
+            except Exception:
+                pass
             if _try_change_on(p):
                 _record(child_parents)
                 continue
@@ -1016,6 +1101,115 @@ def _apply_texture_uv_offsets_to_appearance(
     return n_ok, lines
 
 
+# When True, and an appearance image swap changes 0 textures, dump that
+# appearance's full property tree to the summary so we can see exactly where the
+# image node lives on this Fusion build (property name/type + whether it exposes
+# changeTextureImage / a connected texture). Behavior-safe: logging only.
+DIAG_DUMP_APPEARANCE_TREE: bool = True
+
+
+def dump_appearance_property_tree(
+    appearance: adsk.fusion.Appearance, max_depth: int = 12
+) -> List[str]:
+    """Return human-readable lines describing every property under an appearance.
+
+    Flags each node with what the image-swap walk cares about:
+      * ``changeTextureImage``          — node itself exposes the method
+      * ``AppearanceTexture``           — castable to a texture object
+      * ``AppearanceTextureProperty``   — a property whose ``.value`` is a texture
+      * ``value=<Type>``                — the texture-property's current value type
+    Used only for diagnostics when a swap reports 0 texture updates.
+    """
+    lines: List[str] = []
+    seen: Set[int] = set()
+
+    def _describe(p: Any) -> str:
+        try:
+            name = p.name or "?"
+        except Exception:
+            name = "?"
+        try:
+            otype = p.objectType or type(p).__name__
+        except Exception:
+            otype = type(p).__name__
+        flags: List[str] = []
+        if callable(getattr(p, "changeTextureImage", None)):
+            flags.append("changeTextureImage")
+        try:
+            tex = adsk.core.AppearanceTexture.cast(p)
+        except Exception:
+            tex = None
+        if tex is not None:
+            flags.append("AppearanceTexture")
+            if callable(getattr(tex, "changeTextureImage", None)):
+                flags.append("tex.changeTextureImage")
+        try:
+            tprop = adsk.core.AppearanceTextureProperty.cast(p)
+        except Exception:
+            tprop = None
+        if tprop is not None:
+            flags.append("AppearanceTextureProperty")
+            try:
+                val = tprop.value
+                flags.append("value={}".format(type(val).__name__ if val is not None else "None"))
+                if val is not None and callable(getattr(val, "changeTextureImage", None)):
+                    flags.append("value.changeTextureImage")
+            except Exception as ex:
+                flags.append("value_err={}".format(ex))
+        try:
+            if getattr(p, "hasConnectedTexture", False):
+                flags.append("hasConnectedTexture")
+                ct = p.connectedTexture
+                if ct is not None:
+                    flags.append("connectedTexture={}".format(type(ct).__name__))
+                    try:
+                        ct_otype = ct.objectType
+                        if ct_otype:
+                            flags.append("ct.objectType={}".format(ct_otype))
+                    except Exception:
+                        pass
+                    if callable(getattr(ct, "changeTextureImage", None)):
+                        flags.append("ct.changeTextureImage")
+        except Exception as ex:
+            flags.append("ct_err={}".format(ex))
+        return "{} : {} [{}]".format(name, otype, ", ".join(flags) if flags else "-")
+
+    def walk(coll: Any, depth: int, prefix: str) -> None:
+        if coll is None or depth > max_depth:
+            return
+        try:
+            n = coll.count
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                p = coll.item(i)
+            except Exception:
+                continue
+            try:
+                k = id(p)
+                if k in seen:
+                    continue
+                seen.add(k)
+            except Exception:
+                pass
+            lines.append("{}{}".format(prefix, _describe(p)))
+            for sub in _appearance_texture_child_property_lists(p):
+                walk(sub, depth + 1, prefix + "  ")
+            try:
+                child = getattr(p, "properties", None)
+                if child is not None and child is not coll:
+                    walk(child, depth + 1, prefix + "  ")
+            except Exception:
+                pass
+
+    try:
+        walk(appearance.appearanceProperties, 0, "")
+    except Exception as ex:
+        lines.append("(property-tree dump failed: {})".format(ex))
+    return lines or ["(no properties enumerated)"]
+
+
 def apply_appearance_color_set(
     design: adsk.fusion.Design,
     slot1: Optional[Path],
@@ -1029,19 +1223,54 @@ def apply_appearance_color_set(
     lines: List[str] = []
     total = 0
     apps = design.appearances
+
+    # Snapshot the matching appearances BEFORE editing any of them.
+    # ``changeTextureImage`` can localize a library-linked appearance, which
+    # inserts a copy into ``design.appearances`` and shifts the live indices
+    # mid-loop — that caused Skin-1 to be visited twice and Skin-2 to be skipped
+    # on later color sets. Collecting targets first (this loop never modifies),
+    # then editing the fixed ``targets`` list, avoids that. Every matching
+    # appearance is updated (incl. duplicate-named ones) so whichever instance a
+    # body references receives the image; duplicate log lines are cosmetic.
+    #
+    # NOTE: do NOT dedupe by ``id(ap)`` — the unmatched appearances are released
+    # each iteration and CPython reuses their addresses, so ``id`` collides
+    # across different appearances and wrongly skips the Vinyl slots.
+    targets: List[Tuple[Any, int, str]] = []
     for i in range(apps.count):
-        ap = apps.item(i)
-        target_path: Optional[str] = None
-        slot = appearance_name_slot(ap.name)
+        try:
+            ap = apps.item(i)
+        except Exception:
+            continue
+        try:
+            ap_name = ap.name or ""
+        except Exception:
+            ap_name = ""
+        slot = appearance_name_slot(ap_name)
         if slot == 1 and slot1:
             target_path = _win_path(slot1)
         elif slot == 2 and slot2:
             target_path = _win_path(slot2)
-        if not target_path:
+        else:
             continue
+        targets.append((ap, slot, target_path))
+
+    for ap, slot, target_path in targets:
+        try:
+            ap_name = ap.name
+        except Exception:
+            ap_name = "?"
         n = _apply_image_to_appearance_textures(ap, target_path)
         total += n
-        lines.append('Appearance "{}": {} texture(s) updated'.format(ap.name, n))
+        lines.append('Appearance "{}": {} texture(s) updated'.format(ap_name, n))
+        if n == 0 and DIAG_DUMP_APPEARANCE_TREE:
+            lines.append(
+                '  DIAG property tree for "{}" (slot {}) — why changeTextureImage found 0:'.format(
+                    ap_name, slot
+                )
+            )
+            for tree_line in dump_appearance_property_tree(ap):
+                lines.append("    " + tree_line)
     return total, lines
 
 
@@ -3468,6 +3697,53 @@ def _create_decal_on_face(
     return None, last_err, last_diag
 
 
+def _authored_decal_slot_by_component(design: adsk.fusion.Design) -> Dict[str, int]:
+    """Map component id -> slot from authored decals named per SLOT*_DECAL_NAMES.
+
+    Lets a batch-projected decal inherit the two-tone slot from the authored
+    ``Honeycomb-1``/``Honeycomb-2`` decal on the SAME component, for decal models
+    that carry no Vinyl appearance (so body/face appearance can't supply a slot).
+    """
+    out: Dict[str, int] = {}
+
+    def _scan(comp: adsk.fusion.Component) -> None:
+        try:
+            coll = comp.decals
+            n = coll.count
+            cid = comp.id
+        except Exception:
+            return
+        for j in range(n):
+            try:
+                nm = coll.item(j).name or ""
+            except Exception:
+                continue
+            dslot = decal_name_slot(nm)
+            if dslot == 1:
+                out.setdefault(cid, 1)
+            elif dslot == 2:
+                out.setdefault(cid, 2)
+
+    try:
+        _scan(design.rootComponent)
+        occs = design.rootComponent.allOccurrences
+        for i in range(occs.count):
+            try:
+                _scan(occs.item(i).component)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _body_component_id(body: Any) -> str:
+    try:
+        return body.parentComponent.id or ""
+    except Exception:
+        return ""
+
+
 def create_batch_decals_for_all_bodies(
     design: adsk.fusion.Design,
     image_path: Path,
@@ -3483,6 +3759,9 @@ def create_batch_decals_for_all_bodies(
     lines: List[str] = []
     created: List[adsk.fusion.Decal] = []
     _DECAL_SLOT.clear()
+    # Capture the authored-decal slot map NOW, before batch placement removes the
+    # authored Honeycomb-1/-2 decals — otherwise the two-tone fallback sees none.
+    comp_slot = _authored_decal_slot_by_component(design)
     if not image_path or not image_path.is_file():
         lines.append("Decal projection skipped: image not found ({})".format(image_path))
         return created, lines
@@ -4238,6 +4517,9 @@ def create_batch_decals_for_all_bodies(
             fname = ""
         return appearance_name_slot(fname), fname
 
+    # Fallback slot source for decal models with NO Vinyl appearance: inherit
+    # the slot from the authored Honeycomb-1/-2 decal on the same component
+    # (``comp_slot`` was captured at function start, before removal).
     n_slot2 = 0
     for d in created:
         rec = _DECAL_PLACEMENT_CACHE.get(id(d))
@@ -4249,6 +4531,11 @@ def create_batch_decals_for_all_bodies(
             fslot, fname = _face_appearance_slot(rec.face)
             if fslot is not None:
                 slot, ap_name, src = fslot, fname, "face"
+        if slot is None and body is not None and comp_slot:
+            cslot = comp_slot.get(_body_component_id(body))
+            if cslot is not None:
+                slot, src = cslot, "authored-decal-on-component"
+                ap_name = ap_name or "(authored Honeycomb slot)"
         if slot not in (1, 2):
             slot = 1
         _DECAL_SLOT[id(d)] = slot
@@ -4607,6 +4894,145 @@ def cleanup_batch_decals(decals: List[adsk.fusion.Decal]) -> int:
     return n
 
 
+def _decal_entity_token(d: Any) -> str:
+    """Stable identity for a decal — unchanged by imageFilename/name edits."""
+    try:
+        t = d.entityToken
+        return str(t) if t else ""
+    except Exception:
+        return ""
+
+
+def _collect_all_decals_with_owner(
+    design: adsk.fusion.Design,
+) -> List[Tuple[adsk.fusion.Decal, Any]]:
+    """Every decal paired with the ``decals`` collection that owns it.
+
+    Recreating a decal needs the collection it lives on (root or a
+    sub-component such as ``Plank:1``), so we can't reuse ``_collect_all_decals``.
+    Order matches ``_collect_all_decals`` so slot indices line up.
+    """
+    out: List[Tuple[adsk.fusion.Decal, Any]] = []
+    seen: set = set()
+
+    def _drain(comp: adsk.fusion.Component) -> None:
+        try:
+            key = comp.id
+        except Exception:
+            key = id(comp)
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            coll = comp.decals
+            n = coll.count
+        except Exception:
+            return
+        for j in range(n):
+            try:
+                out.append((coll.item(j), coll))
+            except Exception:
+                continue
+
+    try:
+        _drain(design.rootComponent)
+    except Exception:
+        return out
+    try:
+        occs = design.rootComponent.allOccurrences
+    except Exception:
+        return out
+    for i in range(occs.count):
+        try:
+            comp = occs.item(i).component
+        except Exception:
+            continue
+        _drain(comp)
+    return out
+
+
+def _recreate_authored_decal_oriented(
+    decals_collection: Any,
+    decal: adsk.fusion.Decal,
+    slot_image_path: Path,
+    name: str,
+) -> Tuple[Optional[adsk.fusion.Decal], str]:
+    """Recreate ``decal`` in place with the slot image, grain aligned to the
+    body length, preserving its face / origin / footprint size.
+
+    Returns ``(new_decal, "")`` on success or ``(None, reason)`` so the caller
+    can fall back to a plain imageFilename swap.
+    """
+    # Faces the decal is projected onto (need at least one to re-project).
+    faces: List[adsk.fusion.BRepFace] = []
+    try:
+        fcoll = decal.faces
+        for k in range(fcoll.count):
+            faces.append(fcoll.item(k))
+    except Exception:
+        faces = []
+    if not faces:
+        return None, "decal exposes no faces on this build"
+    primary = faces[0]
+    try:
+        body = primary.body
+    except Exception:
+        body = None
+
+    # Captured transform = origin (position) + axis magnitudes (footprint size)
+    # + current orientation. Read-only on this build, but readable.
+    try:
+        captured = decal.transform
+        origin, _xa, _ya, _za = captured.getAsCoordinateSystem()
+        trf = captured.copy()
+    except Exception as ex:
+        return None, "transform read failed ({})".format(ex)
+
+    # Rotate in the face plane so the image's long axis runs along tread length,
+    # keeping the same footprint magnitudes and origin.
+    if BATCH_DECAL_ALIGN_GRAIN_TO_LENGTH and body is not None:
+        try:
+            trf = _apply_align_grain_to_body_length(
+                trf,
+                primary,
+                origin,
+                body,
+                align_y_axis=bool(BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS),
+            )
+        except Exception as ex:
+            return None, "grain align failed ({})".format(ex)
+
+    image_win = _win_path_for_decal_image(slot_image_path)
+    if not image_win:
+        return None, "image path unavailable"
+
+    try:
+        di = decals_collection.createInput(image_win, faces, origin)
+    except Exception as ex:
+        return None, "createInput failed ({})".format(ex)
+    if di is None:
+        return None, "createInput returned None"
+    _set_decal_input_chain_faces(di, False)
+    _apply_entity_transform(di, trf)
+    try:
+        new_decal = decals_collection.add(di)
+    except Exception as ex:
+        return None, "decals.add failed ({})".format(ex)
+    if new_decal is None:
+        return None, "decals.add returned None"
+    # Some builds only honor the transform after add.
+    _apply_entity_transform(new_decal, trf)
+    try:
+        decal.deleteMe()
+    except Exception:
+        pass
+    try:
+        new_decal.name = name
+    except Exception:
+        pass
+    return new_decal, ""
+
+
 def apply_decal_color_set(
     design: adsk.fusion.Design,
     slot1: Optional[Path],
@@ -4636,96 +5062,120 @@ def apply_decal_color_set(
             )
     total = 0
 
-    decal_list = _collect_all_decals(design)
-    slot1_assigned = False
-    slot2_assigned = False
+    decal_pairs = _collect_all_decals_with_owner(design)
+    decal_list = [d for d, _coll in decal_pairs]
 
-    for d in decal_list:
-        target: Optional[str] = None
-        which: Optional[str] = None
-        if d.name in SLOT1_DECAL_NAMES and slot1:
-            target = _win_path_for_decal_image(slot1)
-            which = "slot 1"
-        elif d.name in SLOT2_DECAL_NAMES and slot2:
-            target = _win_path_for_decal_image(slot2)
-            which = "slot 2"
-        if not target:
-            continue
-        ok, err = _set_decal_image(d, target)
-        if ok:
-            total += 1
-            lines.append('Decal "{}" ({}): image -> {}'.format(d.name, which, target))
-            if which == "slot 1":
-                slot1_assigned = True
-            elif which == "slot 2":
-                slot2_assigned = True
-            nudge_err = _nudge_decal_texture_origin(d)
-            if nudge_err:
-                lines.append('Decal "{}" ({}): transform nudge — {}'.format(d.name, which, nudge_err))
-        else:
-            lines.append('Decal "{}" ({}): failed ({})'.format(d.name, which, err))
+    # Resolve each decal's slot with a STABLE priority so a decal keeps its slot
+    # across every color set:
+    #   1) cached slot by entityToken (from an earlier color set) — survives the
+    #      rename/recreate cycle;
+    #   2) name match (Honeycomb-1 -> slot 1, etc.);
+    #   3) positional fallback (first unassigned -> slot 1, next -> slot 2).
+    slot_by_idx: Dict[int, int] = {}
+    src_by_idx: Dict[int, str] = {}
+    for idx, d in enumerate(decal_list):
+        tok = _decal_entity_token(d)
+        try:
+            dn = d.name or ""
+        except Exception:
+            dn = ""
+        dslot = decal_name_slot(dn)
+        if tok and tok in _AUTHORED_DECAL_SLOT:
+            slot_by_idx[idx] = _AUTHORED_DECAL_SLOT[tok]
+            src_by_idx[idx] = "slot"
+        elif dslot == 1:
+            slot_by_idx[idx] = 1
+            src_by_idx[idx] = "slot"
+        elif dslot == 2:
+            slot_by_idx[idx] = 2
+            src_by_idx[idx] = "slot"
 
     if DECAL_POSITIONAL_FALLBACK and decal_list:
-        if slot1 and not slot1_assigned:
-            d = decal_list[0]
-            p1 = _win_path_for_decal_image(slot1)
-            if not p1:
-                pass
+        assigned = set(slot_by_idx.values())
+        if slot1 and 1 not in assigned:
+            for idx in range(len(decal_list)):
+                if idx not in slot_by_idx:
+                    slot_by_idx[idx] = 1
+                    src_by_idx[idx] = "positional slot"
+                    assigned.add(1)
+                    break
+        if slot2 and 2 not in assigned:
+            if len(decal_list) >= 2:
+                for idx in range(len(decal_list)):
+                    if idx not in slot_by_idx:
+                        slot_by_idx[idx] = 2
+                        src_by_idx[idx] = "positional slot"
+                        assigned.add(2)
+                        break
+            elif len(decal_list) == 1 and 1 not in assigned:
+                slot_by_idx[0] = 2
+                src_by_idx[0] = "positional slot, sole decal"
+                assigned.add(2)
+
+    for idx, (d, coll) in enumerate(decal_pairs):
+        slot = slot_by_idx.get(idx)
+        if slot == 1 and slot1:
+            slot_path: Optional[Path] = slot1
+        elif slot == 2 and slot2:
+            slot_path = slot2
+        else:
+            continue
+        which = "{} {}".format(src_by_idx.get(idx, "slot"), slot)
+
+        # Original name — preserved on recreate so name-matching stays stable
+        # across color sets (no drift to "Color Set 0X-1").
+        try:
+            orig_name = d.name or "decal"
+        except Exception:
+            orig_name = "decal"
+
+        recreated = False
+        if DECAL_AUTHORED_RECREATE_TO_COVER:
+            new_decal, rerr = _recreate_authored_decal_oriented(
+                coll, d, slot_path, orig_name
+            )
+            if new_decal is not None:
+                total += 1
+                recreated = True
+                tok = _decal_entity_token(new_decal)
+                if tok:
+                    _AUTHORED_DECAL_SLOT[tok] = slot
+                try:
+                    nn = new_decal.name
+                except Exception:
+                    nn = orig_name
+                lines.append(
+                    'Decal "{}" ({}): recreated grain-aligned to length -> {}'.format(
+                        nn, which, _win_path_for_decal_image(slot_path)
+                    )
+                )
             else:
-                ok, err = _set_decal_image(d, p1)
-                if ok:
-                    total += 1
-                    slot1_assigned = True
-                    lines.append(
-                        'Decal "{}" (positional slot 1): image -> {}'.format(d.name, p1)
+                lines.append(
+                    'Decal "{}" ({}): recreate unavailable ({}) — image-swap fallback'.format(
+                        orig_name, which, rerr
                     )
-                    nudge_err = _nudge_decal_texture_origin(d)
-                    if nudge_err:
-                        lines.append(
-                            'Decal "{}" (positional slot 1): transform nudge — {}'.format(d.name, nudge_err)
-                        )
-                else:
-                    lines.append('Decal "{}" (positional slot 1): failed ({})'.format(d.name, err))
-        if slot2 and not slot2_assigned and len(decal_list) >= 2:
-            d = decal_list[1]
-            p2 = _win_path_for_decal_image(slot2)
-            if p2:
-                ok, err = _set_decal_image(d, p2)
-                if ok:
-                    total += 1
-                    slot2_assigned = True
-                    lines.append(
-                        'Decal "{}" (positional slot 2): image -> {}'.format(d.name, p2)
-                    )
-                    nudge_err = _nudge_decal_texture_origin(d)
-                    if nudge_err:
-                        lines.append(
-                            'Decal "{}" (positional slot 2): transform nudge — {}'.format(d.name, nudge_err)
-                        )
-                else:
-                    lines.append('Decal "{}" (positional slot 2): failed ({})'.format(d.name, err))
-        elif slot2 and not slot2_assigned and len(decal_list) == 1 and not slot1_assigned:
-            d = decal_list[0]
-            p2 = _win_path_for_decal_image(slot2)
-            if p2:
-                ok, err = _set_decal_image(d, p2)
-                if ok:
-                    total += 1
-                    slot2_assigned = True
-                    lines.append(
-                        'Decal "{}" (positional slot 2, sole decal): image -> {}'.format(d.name, p2)
-                    )
-                    nudge_err = _nudge_decal_texture_origin(d)
-                    if nudge_err:
-                        lines.append(
-                            'Decal "{}" (positional slot 2, sole decal): transform nudge — {}'.format(
-                                d.name, nudge_err
-                            )
-                        )
-                else:
-                    lines.append(
-                        'Decal "{}" (positional slot 2, sole decal): failed ({})'.format(d.name, err)
-                    )
+                )
+
+        if not recreated:
+            target = _win_path_for_decal_image(slot_path)
+            if not target:
+                continue
+            ok, err = _set_decal_image(d, target)
+            if ok:
+                total += 1
+                tok = _decal_entity_token(d)
+                if tok:
+                    _AUTHORED_DECAL_SLOT[tok] = slot
+                try:
+                    dn2 = d.name
+                except Exception:
+                    dn2 = "?"
+                lines.append('Decal "{}" ({}): image -> {}'.format(dn2, which, target))
+                nudge_err = _nudge_decal_texture_origin(d)
+                if nudge_err:
+                    lines.append('Decal "{}" ({}): transform nudge — {}'.format(dn2, which, nudge_err))
+            else:
+                lines.append('Decal ({}): failed ({})'.format(which, err))
 
     return total, lines
 
@@ -5806,7 +6256,7 @@ def design_has_named_appearance_slot(design: adsk.fusion.Design) -> bool:
 def root_has_slot2_decal_target(design: adsk.fusion.Design) -> bool:
     decals = _collect_all_decals(design)
     for d in decals:
-        if d.name in SLOT2_DECAL_NAMES:
+        if decal_name_slot(d.name) == 2:
             return True
     if DECAL_POSITIONAL_FALLBACK and len(decals) >= 2:
         return True

@@ -362,14 +362,16 @@ def _execute_batch_inner(
         carrier: Optional[adsk.fusion.Appearance] = None
         body_appearance_snap: list = []
         batch_decals: List[Any] = []
-        # Force decal/carrier coverage is REQUIRED on the client's Fusion build:
-        # changeTextureImage finds no editable slot on the Vinyl Skin-1/-2
-        # appearances (they keep their baked look), so the color-set image only
-        # shows when projected as a decal. The slot-1 vs slot-2 split is handled
-        # *inside* the decal path (decals inherit their body's appearance slot),
-        # not by swapping document appearances.
+        # Force decal/carrier coverage is MODE-GATED:
+        #  * appearance mode → OFF: the .f3d already has Vinyl Skin-1/-2 on the
+        #    right faces; we only swap the appearance image. Projecting decals
+        #    here would bleed onto the cut edge (client rejected that).
+        #  * decal mode → ON: the authored decals can't be recreated on this
+        #    Fusion build (no decal.faces), so the proven batch projection path
+        #    (auto-size + grain-align) is what gives correct coverage/direction.
         use_decal_coverage = (
-            texture_pipeline.FORCE_BODY_COVERAGE
+            mode == "decal"
+            and texture_pipeline.FORCE_BODY_COVERAGE
             and texture_pipeline.BODY_COVERAGE_VIA_DECALS
         )
 
@@ -399,7 +401,7 @@ def _execute_batch_inner(
                 )
                 for line in decal_lines:
                     summary_lines.append("  " + line)
-        elif texture_pipeline.FORCE_BODY_COVERAGE:
+        elif mode == "decal" and texture_pipeline.FORCE_BODY_COVERAGE:
             summary_lines.append("  Pre-batch appearance audit:")
             for line in texture_pipeline.audit_design_appearances(design):
                 summary_lines.append("    " + line)
@@ -518,9 +520,11 @@ def _execute_batch_inner(
                 )
             if n_tex == 0:
                 zero_texture_color_sets.append(cs.folder.name)
-            else:
-                for line in tex_lines:
-                    summary_lines.append("  {} | {}".format(cs.folder.name, line))
+            # Emit the texture log lines even when 0 updates — they carry the
+            # appearance property-tree diagnostic (DIAG_DUMP_APPEARANCE_TREE)
+            # that tells us why changeTextureImage found no image node.
+            for line in tex_lines:
+                summary_lines.append("  {} | {}".format(cs.folder.name, line))
 
             viewport_render.pump_ui()
             try:
