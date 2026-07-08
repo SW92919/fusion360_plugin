@@ -59,6 +59,7 @@ def _save_local_image(
     render_width: int,
     render_height: int,
     render_backend: str,
+    camera=None,
 ) -> Tuple[bool, str]:
     """Returns ``(ok, local_capture)`` where ``local_capture`` is ``fusion`` or ``viewport``.
 
@@ -78,7 +79,9 @@ def _save_local_image(
         (render_backend or "").strip() == uip.RENDER_BACKEND_LOCAL_VIEWPORT
     )
     if not viewport_only:
-        if viewport_render.save_fusion_local_render(design, app, path, render_width, render_height):
+        if viewport_render.save_fusion_local_render(
+            design, app, path, render_width, render_height, camera=camera
+        ):
             return True, "fusion"
         if viewport_render.save_viewport_image(app, path, render_width, render_height):
             return True, "viewport"
@@ -589,6 +592,16 @@ def _execute_batch_inner(
                 )
                 out_path = support_paths.versioned_path(cs.folder / (base + output_ext))
 
+                # The viewport camera won't stick on this build, so hand the
+                # named view's OWN camera straight to the local renderer.
+                render_cam = None
+                if nv is not None:
+                    try:
+                        render_cam = nv.camera
+                        render_cam.isSmoothTransition = False
+                    except Exception:
+                        render_cam = None
+
                 used_aps = False
                 used_fallback = False
                 ok = False
@@ -645,6 +658,7 @@ def _execute_batch_inner(
                             render_width,
                             render_height,
                             uip.RENDER_BACKEND_LOCAL_FUSION,
+                            camera=render_cam,
                         )
                         used_fallback = True
                         aps_fallback_count += 1
@@ -670,6 +684,7 @@ def _execute_batch_inner(
                         render_width,
                         render_height,
                         render_backend,
+                        camera=render_cam,
                     )
 
                 ts = _log_timestamp()

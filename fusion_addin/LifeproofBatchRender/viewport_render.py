@@ -822,8 +822,31 @@ def prepare_clean_render_view(app: adsk.core.Application) -> None:
 def activate_named_view(app: adsk.core.Application, named_view: adsk.fusion.NamedView) -> bool:
     try:
         vp = app.activeViewport
-        cam = named_view.camera
-        if cam:
+        src = named_view.camera
+        if src:
+            # Assigning the NamedView's camera object wholesale does NOT stick on
+            # this Fusion build (the viewport kept its default view for every
+            # named view). Copy the eye/target/up onto the viewport's OWN camera
+            # object and reassign — that applies reliably. isSmoothTransition off
+            # so it snaps instantly (no mid-animation capture).
+            cam = vp.camera
+            try:
+                cam.isSmoothTransition = False
+            except Exception:
+                pass
+            for attr in ("eye", "target", "upVector"):
+                try:
+                    setattr(cam, attr, getattr(src, attr))
+                except Exception:
+                    pass
+            try:
+                cam.cameraType = src.cameraType
+            except Exception:
+                pass
+            try:
+                cam.viewExtents = src.viewExtents
+            except Exception:
+                pass
             vp.camera = cam
         vp.refresh()
         pump_ui()
@@ -860,6 +883,7 @@ def save_fusion_local_render(
     render_quality: int = 90,
     timeout_sec: float = 1800.0,
     poll_sec: float = 0.25,
+    camera=None,
 ) -> bool:
     """Ray-traced local export via ``Rendering.startLocalRender`` (Render workspace API).
 
@@ -887,11 +911,21 @@ def save_fusion_local_render(
     except Exception:
         return False
 
-    cam = None
-    try:
-        cam = app.activeViewport.camera
-    except Exception:
-        cam = None
+    # Prefer an explicit camera (e.g. the named view's own camera) — on this
+    # build assigning ``viewport.camera`` doesn't stick, so the viewport stays on
+    # the default view for every named view. Passing the intended camera straight
+    # to ``startLocalRender`` renders the correct view regardless of the viewport.
+    cam = camera
+    if cam is None:
+        try:
+            cam = app.activeViewport.camera
+        except Exception:
+            cam = None
+    else:
+        try:
+            cam.isSmoothTransition = False
+        except Exception:
+            pass
 
     try:
         ar = adsk.fusion.RenderAspectRatios
