@@ -272,6 +272,17 @@ def _execute_batch_inner(
 
         viewport_render.prepare_clean_render_view(app)
 
+        # Let Fusion finish computing / refining the display mesh before the first
+        # render. importToNewDocument returns as soon as the doc exists, so
+        # rendering immediately can ray-trace a still-coarse tessellation —
+        # smooth arcs then come out as flat facets ("hexagonal").
+        _settled = viewport_render.settle_geometry(
+            app, viewport_render.GEOMETRY_SETTLE_AFTER_OPEN_SEC, design=design
+        )
+        summary_lines.append(
+            "  Geometry settle after open: {:.1f}s (avoids faceted curves)".format(_settled)
+        )
+
         root = design.rootComponent
         summary_lines.append(
             "  Named-view visibility rules: {}".format(
@@ -591,6 +602,12 @@ def _execute_batch_inner(
                     view_name,
                 )
                 out_path = support_paths.versioned_path(cs.folder / (base + output_ext))
+
+                # Top-up settle so the tessellation is fully refined for THIS
+                # capture (cheap next to a ray-trace).
+                viewport_render.settle_geometry(
+                    app, viewport_render.GEOMETRY_SETTLE_BEFORE_CAPTURE_SEC
+                )
 
                 # The viewport camera won't stick on this build, so hand the
                 # named view's OWN camera straight to the local renderer.

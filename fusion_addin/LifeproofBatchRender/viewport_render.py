@@ -29,6 +29,54 @@ def pump_ui() -> None:
         pass
 
 
+# Seconds to let Fusion finish computing/tessellating a freshly opened model
+# BEFORE the first render. ``importToNewDocument`` returns as soon as the
+# document exists, but Fusion keeps refining the display mesh in the background.
+# Ray-tracing against a still-coarse mesh bakes flat facets into the image —
+# smooth arcs come out as a few straight segments ("hexagonal"), which is exactly
+# the intermittent faceting the client reported. A short settle removes it.
+GEOMETRY_SETTLE_AFTER_OPEN_SEC: float = 4
+
+# Cheap top-up settle right before each capture (negligible next to a ray-trace).
+GEOMETRY_SETTLE_BEFORE_CAPTURE_SEC: float = 0.5
+
+
+def settle_geometry(
+    app: adsk.core.Application,
+    seconds: float,
+    design: adsk.fusion.Design = None,
+) -> float:
+    """Let Fusion finish computing geometry / refining tessellation.
+
+    Pumps the event loop and refreshes the viewport for up to ``seconds`` so the
+    adaptive display mesh converges before we capture. When ``design`` is given,
+    ``computeAll()`` is called first to force any pending geometry compute.
+    Returns the seconds actually spent (0.0 if disabled).
+    """
+    budget = max(0.0, float(seconds))
+    if budget <= 0.0:
+        return 0.0
+
+    if design is not None:
+        compute_all = getattr(design, "computeAll", None)
+        if callable(compute_all):
+            try:
+                compute_all()
+            except Exception:
+                pass
+
+    start = time.monotonic()
+    deadline = start + budget
+    while time.monotonic() < deadline:
+        try:
+            app.activeViewport.refresh()
+        except Exception:
+            pass
+        pump_ui()
+        time.sleep(0.05)
+    return time.monotonic() - start
+
+
 def list_named_views(design: adsk.fusion.Design) -> List[adsk.fusion.NamedView]:
     out: List[adsk.fusion.NamedView] = []
     try:
