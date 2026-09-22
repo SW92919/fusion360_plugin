@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "Lifeproof Batch Render",
+    "description": {
+        "": "APS cloud-render spike: tests whether Rendering.startLocalRender('') offloads to the cloud and where the output lands. Run with a Fusion Team (cloud-saved) design open."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
