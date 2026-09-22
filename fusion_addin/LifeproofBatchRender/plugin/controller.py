@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import adsk.core
 import adsk.fusion
@@ -17,8 +17,6 @@ import viewport_render
 from plugin import image_mapper
 from plugin import logger as logutil
 from plugin import model_handler
-from plugin import renderer_aps
-from plugin import task_manager
 from plugin import ui as uip
 
 
@@ -35,60 +33,19 @@ def _append_log(log_path: Path, row: List[str]) -> None:
         w.writerow(row)
 
 
-def _backend_label(
-    render_backend: str,
-    used_aps: bool,
-    used_fallback: bool,
-    *,
-    local_capture: str = "viewport",
-) -> str:
-    """local_capture: which local exporter wrote pixels — ``fusion`` or ``viewport``."""
-    if "APS" in (render_backend or "").upper():
-        if used_aps:
-            return "aps"
-        if used_fallback:
-            return "aps->local_fusion" if local_capture == "fusion" else "aps->local_viewport"
-        return "aps_failed"
-    return "local_fusion" if local_capture == "fusion" else "local_viewport"
-
-
 def _save_local_image(
     design: adsk.fusion.Design,
     app: adsk.core.Application,
     out_path: Path,
     render_width: int,
     render_height: int,
-    render_backend: str,
     camera=None,
-) -> Tuple[bool, str]:
-    """Returns ``(ok, local_capture)`` where ``local_capture`` is ``fusion`` or ``viewport``.
-
-    Fusion ``Rendering.startLocalRender`` is the default local path; viewport capture is only
-    used when that backend is explicitly selected, or as fallback after Fusion fails.
-
-    ``FORCE_VIEWPORT_CAPTURE`` (viewport_render) hard-overrides this: when True
-    we ALWAYS use the near-instant viewport screenshot and never trigger a
-    ray-traced local render, regardless of the dialog's backend selection.
-    This is what keeps Fusion from freezing on 9-image batches.
-    """
+) -> bool:
+    """Ray-traced local export via ``Rendering.startLocalRender``."""
     path = str(out_path.resolve())
-    force_viewport = bool(
-        getattr(viewport_render, "FORCE_VIEWPORT_CAPTURE", False)
+    return viewport_render.save_fusion_local_render(
+        design, app, path, render_width, render_height, camera=camera
     )
-    viewport_only = force_viewport or (
-        (render_backend or "").strip() == uip.RENDER_BACKEND_LOCAL_VIEWPORT
-    )
-    if not viewport_only:
-        if viewport_render.save_fusion_local_render(
-            design, app, path, render_width, render_height, camera=camera
-        ):
-            return True, "fusion"
-        if viewport_render.save_viewport_image(app, path, render_width, render_height):
-            return True, "viewport"
-        return False, "viewport"
-    if viewport_render.save_viewport_image(app, path, render_width, render_height):
-        return True, "viewport"
-    return False, "viewport"
 
 
 def execute_batch(
@@ -100,15 +57,11 @@ def execute_batch(
     render_height: int,
     output_ext: str,
     pipeline_selection: str,
-    render_backend: str,
-    concurrency: int,
-    aps_fallback: bool,
     max_named_views: int,
     decal_scale_plane_xy: float,
-    addin_dir: Path,
 ) -> None:
     log_path = logutil.default_log_path(texture_root)
-    logutil.append_log(log_path, "execute_batch start backend={}".format(render_backend))
+    logutil.append_log(log_path, "execute_batch start")
 
     texture_pipeline.set_runtime_decal_scale_plane_xy(decal_scale_plane_xy)
     try:
@@ -121,12 +74,8 @@ def execute_batch(
             render_height,
             output_ext,
             pipeline_selection,
-            render_backend,
-            concurrency,
-            aps_fallback,
             max_named_views,
             decal_scale_plane_xy,
-            addin_dir,
             log_path,
         )
     finally:
@@ -142,12 +91,8 @@ def _execute_batch_inner(
     render_height: int,
     output_ext: str,
     pipeline_selection: str,
-    render_backend: str,
-    concurrency: int,
-    aps_fallback: bool,
     max_named_views: int,
     decal_scale_plane_xy: float,
-    addin_dir: Path,
     log_path: Path,
 ) -> None:
 
@@ -166,39 +111,6 @@ def _execute_batch_inner(
 
     texture_pipeline.clear_decal_shift_temp_files()
 
-    aps_cfg = renderer_aps.load_aps_config(addin_dir)
-    token = ""
-    aps_executor: Optional[task_manager.BoundedExecutor] = None
-    aps_bucket_key = ""
-    if "APS" in (render_backend or "").upper():
-        tr = renderer_aps.fetch_two_legged_token(aps_cfg)
-        if not tr.ok:
-            msg = "APS authentication failed:\n{}\n\n".format(tr.error)
-            if aps_fallback:
-                fui.messageBox(msg + "Falling back to local rendering.")
-                render_backend = uip.RENDER_BACKEND_LOCAL_FUSION
-            else:
-                fui.messageBox(msg + "Enable fallback or fix aps_config.json.")
-                return
-        else:
-            token = tr.access_token
-            logutil.append_log(log_path, "APS token acquired (expires_in={})".format(tr.expires_in))
-            ready, ready_msg = renderer_aps.verify_aps_setup(aps_cfg, token)
-            logutil.append_log(log_path, ready_msg)
-            aps_bucket_key = renderer_aps.resolve_bucket_key(aps_cfg)
-            if not ready:
-                if aps_fallback:
-                    fui.messageBox(
-                        "APS setup failed:\n{}\n\nFalling back to local rendering.".format(ready_msg)
-                    )
-                    render_backend = uip.RENDER_BACKEND_LOCAL_FUSION
-                    token = ""
-                else:
-                    fui.messageBox("APS setup failed:\n{}\nEnable fallback or fix aps_config.json.".format(ready_msg))
-                    return
-            else:
-                aps_executor = task_manager.BoundedExecutor(concurrency)
-
     app = adsk.core.Application.get()
     csv_log = texture_root / "_LifeproofBatchRender_log.csv"
     summary_lines: List[str] = [
@@ -207,15 +119,6 @@ def _execute_batch_inner(
         "Models: {}".format(len(models)),
         "Output: {} × {} {}".format(render_width, render_height, output_ext.upper()),
         "Pipeline mode: {}".format(pipeline_selection),
-        "Render backend: {}".format(render_backend),
-        *(
-            [
-                "APS bucket: {}".format(aps_bucket_key or "(none)"),
-                "APS render_mode: {}".format(aps_cfg.render_mode),
-            ]
-            if token
-            else []
-        ),
         (
             "Max named views per color set: 0 (all views in each design)"
             if max_named_views <= 0
@@ -236,8 +139,6 @@ def _execute_batch_inner(
 
     renders_ok = 0
     renders_fail = 0
-    aps_render_ok = 0
-    aps_fallback_count = 0
 
     total_steps: Optional[int] = None
     done_steps = 0
@@ -619,102 +520,20 @@ def _execute_batch_inner(
                     except Exception:
                         render_cam = None
 
-                used_aps = False
-                used_fallback = False
-                ok = False
-                local_capture = "viewport"
-
-                if "APS" in (render_backend or "").upper() and token:
-                    outcome = renderer_aps.submit_render_job(
-                        aps_cfg,
-                        token,
-                        design=design,
-                        app=app,
-                        model_path=mp,
-                        color_folder=cs.folder,
-                        color_name=cs.folder.name,
-                        view_name=view_name,
-                        width=render_width,
-                        height=render_height,
-                        model_stem=model_stem,
-                        slot_paths=[s1 or cs.slot1, s2],
-                    )
-                    if outcome.ok and outcome.output_bytes:
-                        try:
-                            out_path.write_bytes(outcome.output_bytes)
-                            ok = True
-                            used_aps = True
-                            aps_render_ok += 1
-                            if outcome.job_prefix:
-                                summary_lines.append(
-                                    "  APS job: oss://{}/{}".format(
-                                        outcome.bucket_key or aps_bucket_key,
-                                        outcome.job_prefix,
-                                    )
-                                )
-                        except Exception as ex:
-                            ok = False
-                            summary_lines.append("APS write failed: {}".format(ex))
-                    elif aps_fallback:
-                        aps_fail_msg = (outcome.message or "APS render failed (no message).").strip()
-                        summary_lines.append(
-                            "  APS fallback ({} | {}): {}".format(
-                                cs.folder.name, view_name, aps_fail_msg
-                            )
-                        )
-                        logutil.append_log(
-                            log_path,
-                            "APS fallback model={} color={} view={} reason={}".format(
-                                model_stem, cs.folder.name, view_name, aps_fail_msg
-                            ),
-                        )
-                        ok, local_capture = _save_local_image(
-                            design,
-                            app,
-                            out_path,
-                            render_width,
-                            render_height,
-                            uip.RENDER_BACKEND_LOCAL_FUSION,
-                            camera=render_cam,
-                        )
-                        used_fallback = True
-                        aps_fallback_count += 1
-                    else:
-                        ok = False
-                        aps_fail_msg = (outcome.message or "APS render failed.").strip()
-                        summary_lines.append(
-                            "  APS failed ({} | {}): {}".format(
-                                cs.folder.name, view_name, aps_fail_msg
-                            )
-                        )
-                        logutil.append_log(
-                            log_path,
-                            "APS failed model={} color={} view={} reason={}".format(
-                                model_stem, cs.folder.name, view_name, aps_fail_msg
-                            ),
-                        )
-                else:
-                    ok, local_capture = _save_local_image(
-                        design,
-                        app,
-                        out_path,
-                        render_width,
-                        render_height,
-                        render_backend,
-                        camera=render_cam,
-                    )
+                ok = _save_local_image(
+                    design,
+                    app,
+                    out_path,
+                    render_width,
+                    render_height,
+                    camera=render_cam,
+                )
 
                 ts = _log_timestamp()
-                backend = _backend_label(
-                    render_backend,
-                    used_aps,
-                    used_fallback,
-                    local_capture=local_capture,
-                )
                 try:
                     _append_log(
                         csv_log,
-                        [ts, model_stem, cs.folder.name, view_name, str(out_path), "1" if ok else "0", backend],
+                        [ts, model_stem, cs.folder.name, view_name, str(out_path), "1" if ok else "0", "local_fusion"],
                     )
                 except Exception:
                     pass
@@ -724,7 +543,7 @@ def _execute_batch_inner(
                     renders_fail += 1
 
                 done_steps += 1
-                bump_progress("Saved: {} ({})".format(out_path.name, backend))
+                bump_progress("Saved: {}".format(out_path.name))
 
                 visibility_apply.restore_visibility(
                     occ_snap, body_snap, mesh_snap, decal_snap
@@ -778,18 +597,6 @@ def _execute_batch_inner(
         summary_lines.append("Removed *flipped* / mirror sidecar rasters after batch:")
         summary_lines.extend(["  {}".format(x) for x in _post_purge])
 
-    if "APS" in (render_backend or "").upper() or aps_render_ok or aps_fallback_count:
-        summary_lines.append("")
-        summary_lines.append(
-            "APS renders OK: {}  APS fallbacks: {}".format(
-                aps_render_ok, aps_fallback_count
-            )
-        )
-        if aps_fallback_count and not aps_render_ok:
-            summary_lines.append(
-                "  Hint: check APS fallback lines above for OSS/upload/render errors."
-            )
-
     summary_lines.append("")
     summary_lines.append("Renders OK: {}  Failed: {}".format(renders_ok, renders_fail))
     summary_lines.append("CSV log: {}".format(csv_log))
@@ -806,7 +613,7 @@ def _execute_batch_inner(
         "Texture root: {}".format(texture_root),
         "Color sets: {} | Models: {}".format(len(color_sets), len(models)),
         "Output: {} x {} {}".format(render_width, render_height, output_ext.upper()),
-        "Pipeline: {} | Backend: {}".format(pipeline_selection, render_backend),
+        "Pipeline: {}".format(pipeline_selection),
         "",
         "Renders OK: {}  Failed: {}".format(renders_ok, renders_fail),
         "",
@@ -815,9 +622,6 @@ def _execute_batch_inner(
         "Plugin log:   {}".format(log_path),
     ]
     short_text = "\n".join(short_lines)
-
-    if aps_executor is not None:
-        aps_executor.shutdown(wait=True)
 
     try:
         uip.set_progress(ins, 100, 100)

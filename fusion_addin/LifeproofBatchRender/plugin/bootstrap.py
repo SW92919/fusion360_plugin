@@ -211,9 +211,6 @@ def run(context):
                     render_h = batch_config.parse_positive_int(h_in.value, 1080, 64, 8192)
                     ext = ".png" if (fmt_sel or "").upper().startswith("P") else ".jpg"
 
-                    render_backend = uip.read_render_backend(ins)
-                    conc = uip.read_concurrency(ins, 3)
-                    aps_fb = uip.read_aps_fallback(ins)
                     max_named_views = uip.read_max_named_views(ins, 0)
                     decal_scale_xy = uip.read_decal_scale_plane_xy(ins, 2.5)
 
@@ -226,12 +223,8 @@ def run(context):
                         render_h,
                         ext,
                         pipeline_sel,
-                        render_backend,
-                        conc,
-                        aps_fb,
                         max_named_views,
                         decal_scale_xy,
-                        _ADDIN_DIR,
                     )
                 except Exception:
                     try:
@@ -265,7 +258,7 @@ def run(context):
             cmd_defs,
             uip.COMMAND_ID,
             "Lifeproof Batch Render",
-            "Batch textures, named views, visibility, APS/local export.",
+            "Batch textures, named views, visibility, local render export.",
         )
         if cmd_def is None:
             raise RuntimeError(

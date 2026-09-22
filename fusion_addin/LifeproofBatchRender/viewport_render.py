@@ -242,15 +242,6 @@ FORCE_ISOMETRIC_VIEW: bool = True
 # Cap count via the dialog's "Max named views" or by reordering views in Fusion.
 EXCLUDE_VIEW_NAME_TOKENS = ("macro", "iso", "top", "bottom")
 
-# When True, every image is a near-instant VIEWPORT screenshot — the
-# ray-traced ``Rendering.startLocalRender`` path is never used, regardless
-# of the dialog's render-backend selection. This is the anti-freeze switch:
-# ray tracing 9 images is what locked Fusion up. The viewport already shows
-# the applied decal texture, so captures are clean product stills with only
-# slightly flatter lighting (no ray-traced GI / soft shadows). Set False to
-# allow the dialog-selected ray-traced backend again.
-FORCE_VIEWPORT_CAPTURE: bool = False
-
 # Distinct product-hero angles rendered per color set when
 # FORCE_ISOMETRIC_VIEW is on. Each entry is
 # ``(label, azimuth_degrees, elevation_degrees)`` for set_product_hero_camera:
@@ -903,20 +894,6 @@ def activate_named_view(app: adsk.core.Application, named_view: adsk.fusion.Name
         return False
 
 
-def save_viewport_image(app: adsk.core.Application, filepath: str, width: int, height: int) -> bool:
-    """Save active viewport; extension chooses format (.png / .jpg)."""
-    vp = app.activeViewport
-    path = filepath
-    try:
-        if hasattr(vp, "saveAsImageFile"):
-            return bool(vp.saveAsImageFile(path, int(width), int(height)))
-        if hasattr(vp, "saveAsImage"):
-            return bool(vp.saveAsImage(path, int(width), int(height)))
-    except Exception:
-        return False
-    return False
-
-
 def _clamp_local_render_extent(value: int) -> int:
     return max(_LOCAL_RENDER_MIN_PX, min(_LOCAL_RENDER_MAX_PX, int(value)))
 
@@ -936,7 +913,7 @@ def save_fusion_local_render(
     """Ray-traced local export via ``Rendering.startLocalRender`` (Render workspace API).
 
     Uses the active viewport camera. Requires ``design.renderManager``; returns False if the
-    API is unavailable or the render fails/timeouts (caller may fall back to ``save_viewport_image``).
+    API is unavailable or the render fails/timeouts.
 
     ``render_quality`` is the Fusion Render-quality slider (25 draft … 100
     final). Ray-trace time scales steeply with it; 60 is the speed/quality

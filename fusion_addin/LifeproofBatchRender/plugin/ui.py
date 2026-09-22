@@ -4,10 +4,6 @@ import adsk.core
 
 COMMAND_ID = "LifeproofBatchRenderCmd"
 
-# Dropdown labels — keep in sync with ``controller._save_local_image`` routing.
-RENDER_BACKEND_LOCAL_FUSION = "Local (Fusion render)"
-RENDER_BACKEND_LOCAL_VIEWPORT = "Local (viewport)"
-
 INPUT_USE_BROWSE = "lbr_useBrowse"
 INPUT_TEXTURE_ROOT = "lbr_textureRoot"
 INPUT_MODEL_PATHS = "lbr_modelPaths"
@@ -15,9 +11,6 @@ INPUT_IMG_W = "lbr_imgW"
 INPUT_IMG_H = "lbr_imgH"
 INPUT_FORMAT = "lbr_format"
 INPUT_PIPELINE = "lbr_pipeline"
-INPUT_RENDER_BACKEND = "lbr_renderBackend"
-INPUT_CONCURRENCY = "lbr_concurrency"
-INPUT_APS_FALLBACK = "lbr_apsFallbackLocal"
 INPUT_MAX_NAMED_VIEWS = "lbr_maxNamedViews"
 INPUT_DECAL_SCALE_XY = "lbr_decalScaleXY"
 INPUT_PROGRESS = "lbr_progress"
@@ -50,44 +43,12 @@ def _dropdown_selected_name(ins: adsk.core.CommandInputs, iid: str, default: str
         return default
 
 
-def read_render_backend(ins: adsk.core.CommandInputs) -> str:
-    return _dropdown_selected_name(ins, INPUT_RENDER_BACKEND, RENDER_BACKEND_LOCAL_FUSION)
-
-
 def read_format(ins: adsk.core.CommandInputs) -> str:
     return _dropdown_selected_name(ins, INPUT_FORMAT, "PNG")
 
 
 def read_pipeline(ins: adsk.core.CommandInputs) -> str:
     return _dropdown_selected_name(ins, INPUT_PIPELINE, "Auto (from .f3d filename)")
-
-
-def read_concurrency(ins: adsk.core.CommandInputs, default: int = 3) -> int:
-    inp = ins.itemById(INPUT_CONCURRENCY)
-    if inp is None:
-        return default
-    try:
-        from batch_config import parse_bounded_int
-
-        return parse_bounded_int(inp.value, default, 1, 16)
-    except Exception:
-        try:
-            return max(1, min(16, int(str(inp.value).strip())))
-        except Exception:
-            return default
-
-
-def read_aps_fallback(ins: adsk.core.CommandInputs) -> bool:
-    inp = ins.itemById(INPUT_APS_FALLBACK)
-    if inp is None:
-        return True
-    try:
-        return bool(inp.value)
-    except Exception:
-        try:
-            return bool(inp.boolValue)
-        except Exception:
-            return True
 
 
 def read_max_named_views(ins: adsk.core.CommandInputs, default: int = 0) -> int:
@@ -187,25 +148,6 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
     pipe.listItems.add("Auto (from .f3d filename)", True)
     pipe.listItems.add("Force Appearance", False)
     pipe.listItems.add("Force Decal", False)
-
-    rb = inputs.addDropDownCommandInput(
-        INPUT_RENDER_BACKEND,
-        "Render backend",
-        adsk.core.DropDownStyles.TextListDropDownStyle,
-    )
-    rb.listItems.add(RENDER_BACKEND_LOCAL_FUSION, True)
-    rb.listItems.add(RENDER_BACKEND_LOCAL_VIEWPORT, False)
-    rb.listItems.add("APS (requires aps_config.json + workflow)", False)
-
-    inputs.addStringValueInput(INPUT_CONCURRENCY, "APS network concurrency (threads)", "3")
-
-    inputs.addBoolValueInput(
-        INPUT_APS_FALLBACK,
-        "If APS fails, fall back to local Fusion render (then viewport if needed)",
-        True,
-        "",
-        True,
-    )
 
     # ProgressBarCommandInput signature is (id, name, formatString) on most builds —
     # it does not accept min/max args. Use a try/except so older/newer builds both work.

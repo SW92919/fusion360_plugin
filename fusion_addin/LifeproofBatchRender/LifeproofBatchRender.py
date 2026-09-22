@@ -1,5 +1,5 @@
 # LifeproofBatchRender — Fusion 360 Python add-in entry point.
-# Implementation lives in ./plugin (modular UI, controller, APS client skeleton).
+# Implementation lives in ./plugin (modular UI, controller, local render export).
 
 from __future__ import annotations
 
