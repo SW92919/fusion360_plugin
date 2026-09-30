@@ -548,6 +548,19 @@ BATCH_DECAL_BODY_PREFER_KEYWORDS: Tuple[str, ...] = (
     "striped",
 )
 
+# Body-NAME fragments marking the visible show surface. The client's models name
+# it "<Part> Skin" — ``Nose Skin``, ``Plank Skin`` — and that is the body the
+# texture has to land on.
+#
+# Ranked ABOVE BATCH_DECAL_BODY_PREFER_KEYWORDS because those are matched against
+# a haystack that includes the body's APPEARANCE name, and an internal body can
+# carry a "Steel - Satin" appearance too. That is exactly what went wrong on
+# Bullnose: Supplemental Plank's internal ``Body2`` (appearance "Steel - Satin2")
+# scored 4x and took the decal, leaving ``Plank Skin`` bare and the steel body
+# showing through the render.
+BATCH_DECAL_BODY_PREFER_NAME_KEYWORDS: Tuple[str, ...] = ("skin",)
+BATCH_DECAL_BODY_PREFER_NAME_KEYWORD_RANK: float = 50.0
+
 # When True, the plugin also rewrites ``imageFilename`` on every user-
 # authored decal in the .f3d (anything not named ``LifeproofBatchDecal_*``).
 # Disable when you have many user-authored decals (e.g. 15+ on a single
@@ -2185,6 +2198,13 @@ def _body_decal_rank_multiplier(
     for prefer in BATCH_DECAL_BODY_PREFER_NAMES:
         if _body_name_matches_map_anchor(body_name, prefer):
             return float(BATCH_DECAL_BODY_PREFER_NAME_RANK)
+    # Body NAME only — deliberately not the appearance haystack below, so a
+    # "<Part> Skin" show body always beats an internal body that merely happens
+    # to carry a Steel/Satin appearance.
+    name_only = _normalize_fusion_body_name(body_name).lower()
+    for kw in BATCH_DECAL_BODY_PREFER_NAME_KEYWORDS:
+        if kw and kw.lower() in name_only:
+            return float(BATCH_DECAL_BODY_PREFER_NAME_KEYWORD_RANK)
     haystack = _body_filter_haystack(body, label, original_appearance_names)
     for kw in BATCH_DECAL_BODY_PREFER_KEYWORDS:
         if kw.lower() in haystack:
@@ -4133,9 +4153,22 @@ def create_batch_decals_for_all_bodies(
             body_candidates.append(best)
             skipped = len(local_picks) - 1
             if skipped > 0:
+                # Name the winner AND the runners-up with their scores. Picking the
+                # wrong body here is invisible in the render except as an untextured
+                # part, so the decision has to be readable in the log.
+                def _pick_label(p):
+                    try:
+                        return "{}={:.0f}".format(p[3], p[0])
+                    except Exception:
+                        return "?"
+
+                others = [p for p in local_picks if p is not best]
                 lines.append(
-                    "  {}: one decal on largest show body (skipped {} sub-bodies)".format(
-                        label, skipped
+                    "  {}: one decal on best show body -> {} (skipped {}: {})".format(
+                        label,
+                        _pick_label(best),
+                        skipped,
+                        ", ".join(_pick_label(p) for p in others[:6]) or "-",
                     )
                 )
         elif (
