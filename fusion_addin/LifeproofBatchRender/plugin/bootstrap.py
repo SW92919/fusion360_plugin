@@ -9,6 +9,7 @@ import adsk.core
 import adsk.fusion
 
 import batch_config
+import render_instructions
 
 from plugin import controller
 from plugin import ui as uip
@@ -214,8 +215,20 @@ def run(context):
                     blob = batch_config.read_textbox_or_string(mp_inp)
                     models = batch_config.parse_model_paths_blob(blob)
                     if not models:
-                        fui.messageBox("Enter at least one .f3d path (one per line or | separated).")
-                        return
+                        # Left blank = render every model the instructions list, taken
+                        # from the folder the instructions file itself came from. The
+                        # JSON names the models but carries no paths, so this is
+                        # derivable; fill the field in to render a subset instead.
+                        loaded = render_instructions.load_instructions(instructions_path)
+                        models, find_lines = render_instructions.discover_model_files(loaded)
+                        if not models:
+                            fui.messageBox(
+                                "No model files given, and none could be found "
+                                "automatically.\n\n{}\n\nUse the browse button to pick "
+                                "the .f3d files, or put them next to the instructions "
+                                "file.".format("\n".join(find_lines))
+                            )
+                            return
                     for p in models:
                         if not p.exists():
                             fui.messageBox("Model file not found:\n{}".format(p))

@@ -119,7 +119,8 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
     try:
         inputs.addTextBoxCommandInput(
             INPUT_MODEL_PATHS,
-            "Model files (.f3d) — one path per line, or separate with |",
+            "Model files (.f3d) — leave EMPTY to render every model in the "
+            "instructions file; or one path per line to render a subset",
             "",
             5,
             False,
@@ -127,7 +128,7 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
     except Exception:
         inputs.addStringValueInput(
             INPUT_MODEL_PATHS,
-            "Model paths (.f3d), | separated",
+            "Model paths (.f3d), | separated (empty = all from instructions)",
             "",
         )
     _add_browse_button(

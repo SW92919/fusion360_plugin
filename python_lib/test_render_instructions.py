@@ -453,6 +453,41 @@ class DecalTargetingIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(nose.length_cm, 127.0, places=2)
 
 
+class ModelDiscoveryTests(unittest.TestCase):
+    """Model files are derivable: the JSON names them and they ship beside it."""
+
+    def setUp(self):
+        self.path = (Path(__file__).resolve().parent.parent
+                     / "Resources" / "Models" / "Rendering Instructions.json")
+        if not self.path.is_file():
+            self.skipTest("client instructions file not present")
+        self.ins = ri.load_instructions(self.path)
+
+    def test_finds_every_model_next_to_the_instructions(self):
+        found, lines = ri.discover_model_files(self.ins)
+        self.assertEqual(len(found), len(self.ins.models), "\n".join(lines))
+        self.assertTrue(all(p.suffix.lower() == ".f3d" for p in found))
+        self.assertNotIn("NOT FOUND", "\n".join(lines))
+
+    def test_order_follows_the_json(self):
+        found, _ = ri.discover_model_files(self.ins)
+        keys = [ri.model_match_key(p) for p in found]
+        self.assertEqual(keys, [m.match_key for m in self.ins.models])
+
+    def test_missing_file_is_reported_not_guessed(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            found, lines = ri.discover_model_files(self.ins, search_dir=Path(tmp))
+            self.assertEqual(found, [])
+            self.assertIn("NOT FOUND", "\n".join(lines))
+
+    def test_unknown_folder_degrades_gracefully(self):
+        found, lines = ri.discover_model_files(self.ins, search_dir=Path("/no/such/dir"))
+        self.assertEqual(found, [])
+        self.assertTrue(lines)
+
+
 class OutputNameIntegrationTests(unittest.TestCase):
     """The JSON label must survive into a distinct, filesystem-safe filename.
 

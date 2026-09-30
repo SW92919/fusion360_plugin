@@ -545,6 +545,55 @@ def find_for_model(instructions: RenderInstructions, model_path: Path) -> Option
     return None
 
 
+def discover_model_files(
+    instructions: RenderInstructions, search_dir: Optional[Path] = None
+) -> Tuple[List[Path], List[str]]:
+    """Find one .f3d per entry, in the folder the instructions file came from.
+
+    The JSON names models (``"Bullnose"``) but carries no paths, and the client
+    ships the .f3d files beside it — so the selection is derivable and does not
+    need to be made by hand. Entries whose file is missing are reported, not
+    guessed at.
+
+    Returns ``(paths_in_JSON_order, log_lines)``.
+    """
+    if instructions is None or not instructions.models:
+        return [], ["No render-instruction entries to find models for."]
+    base = search_dir
+    if base is None:
+        base = instructions.source.parent if instructions.source else None
+    if base is None or not Path(base).is_dir():
+        return [], ["Cannot auto-find models: the instructions folder is unknown."]
+    base = Path(base)
+
+    by_key: Dict[str, Path] = {}
+    for candidate in sorted(base.glob("*.f3d")):
+        by_key.setdefault(model_match_key(candidate), candidate)
+        legacy = normalize_name_key(strip_legacy_mode_suffix(candidate.stem))
+        if legacy:
+            by_key.setdefault(legacy, candidate)
+
+    found: List[Path] = []
+    missing: List[str] = []
+    for entry in instructions.models:
+        hit = by_key.get(entry.match_key)
+        if hit is None:
+            missing.append(entry.file_name)
+            continue
+        if hit not in found:
+            found.append(hit)
+
+    lines = [
+        "Auto-selected {} model file(s) from {}".format(len(found), base),
+    ]
+    lines.extend("  {}".format(p.name) for p in found)
+    if missing:
+        lines.append(
+            "  NOT FOUND next to the instructions file: {}".format(", ".join(missing))
+        )
+    return found, lines
+
+
 def decal_size_for_part(entry: ModelInstructions, part_name: str) -> Optional[DecalSizeSpec]:
     """Size authored for this component, matched case/spacing-insensitively."""
     if entry is None or not entry.decals:
