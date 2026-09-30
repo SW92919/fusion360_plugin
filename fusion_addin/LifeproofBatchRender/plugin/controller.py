@@ -25,6 +25,32 @@ def _log_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _code_build_stamp() -> str:
+    """Newest source timestamp across the add-in — identifies the running build.
+
+    Fusion caches modules for the life of the session, so an edited file and a
+    stale in-memory copy are otherwise indistinguishable from the log.
+    """
+    try:
+        addin_dir = Path(texture_pipeline.__file__).resolve().parent
+        newest = 0.0
+        newest_name = "?"
+        for py in addin_dir.rglob("*.py"):
+            try:
+                mtime = py.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest:
+                newest, newest_name = mtime, py.name
+        if not newest:
+            return "(unknown)"
+        return "{} (newest source: {})".format(
+            datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M:%S"), newest_name
+        )
+    except Exception as ex:
+        return "(unavailable: {})".format(ex)
+
+
 def _append_log(log_path: Path, row: List[str]) -> None:
     new_file = not log_path.exists()
     with open(log_path, "a", newline="", encoding="utf-8") as f:
@@ -189,6 +215,9 @@ def _execute_batch_inner(
         "Models: {}".format(len(models)),
         "Output: {} × {} {}".format(render_width, render_height, output_ext.upper()),
         "Pipeline mode: {}".format(pipeline_selection),
+        # Which build actually ran. Fusion caches modules for the whole session,
+        # so without this a stale build and a fresh log look identical.
+        "Code loaded: {}".format(_code_build_stamp()),
         "Render instructions: {} ({} model entries)".format(
             instructions.source, len(instructions.models)
         ),
