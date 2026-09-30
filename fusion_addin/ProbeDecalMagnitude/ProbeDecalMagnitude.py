@@ -37,43 +37,123 @@ import adsk.fusion
 FUSION_DEFAULT_PATCH_CM = 5.0
 
 
-def _largest_planar_face(root):
-    """Biggest flat face in the design — the cleanest possible measurement surface."""
-    best = None
-    best_area = 0.0
+def _collect_bodies(root, notes):
+    """Every solid body, as OCCURRENCE PROXIES where possible.
+
+    ``occurrence.bRepBodies`` yields proxies that carry their placement in the
+    assembly; ``occurrence.component.bRepBodies`` yields definition bodies with no
+    occurrence context, and some properties (``isVisible`` among them) can raise on
+    those. Proxies first, definitions only as a fallback.
+
+    Every failure is appended to ``notes`` — swallowing them is what made the first
+    two runs of this probe report "nothing found" with no way to tell why.
+    """
     bodies = []
     try:
-        for i in range(root.bRepBodies.count):
+        n_root = root.bRepBodies.count
+        notes.append("root.bRepBodies.count = {}".format(n_root))
+        for i in range(n_root):
             bodies.append(root.bRepBodies.item(i))
-    except Exception:
-        pass
+    except Exception as ex:
+        notes.append("root.bRepBodies FAILED: {}".format(ex))
+
+    try:
+        n_direct = root.occurrences.count
+        notes.append("root.occurrences.count = {}".format(n_direct))
+    except Exception as ex:
+        notes.append("root.occurrences FAILED: {}".format(ex))
+
     try:
         occs = root.allOccurrences
-        for i in range(occs.count):
-            comp = occs.item(i).component
-            for j in range(comp.bRepBodies.count):
-                bodies.append(comp.bRepBodies.item(j))
-    except Exception:
-        pass
-
-    for body in bodies:
-        try:
-            if not body.isVisible:
+        n_occ = occs.count
+        notes.append("root.allOccurrences.count = {}".format(n_occ))
+        n_proxy = 0
+        n_defn = 0
+        for i in range(n_occ):
+            try:
+                occ = occs.item(i)
+            except Exception as ex:
+                notes.append("allOccurrences.item({}) FAILED: {}".format(i, ex))
                 continue
+            added = False
+            try:
+                for j in range(occ.bRepBodies.count):
+                    bodies.append(occ.bRepBodies.item(j))
+                    added = True
+                    n_proxy += 1
+            except Exception as ex:
+                if i == 0:
+                    notes.append("occ.bRepBodies FAILED: {}".format(ex))
+                added = False
+            if not added:
+                try:
+                    comp = occ.component
+                    for j in range(comp.bRepBodies.count):
+                        bodies.append(comp.bRepBodies.item(j))
+                        n_defn += 1
+                except Exception as ex:
+                    if i == 0:
+                        notes.append("occ.component.bRepBodies FAILED: {}".format(ex))
+                    continue
+        notes.append("bodies via proxy = {}, via definition = {}".format(n_proxy, n_defn))
+    except Exception as ex:
+        notes.append("root.allOccurrences FAILED: {}".format(ex))
+
+    return bodies
+
+
+def _largest_planar_face(root, notes):
+    """Biggest flat face in the design — the cleanest measurement surface.
+
+    Returns ``(face, area, report)``. Visibility is preferred but NOT required: a
+    hidden body's geometry measures the same, and demanding visibility used to make
+    this silently find nothing. ``report`` says what was actually examined so a
+    failure is diagnosable instead of a dead end.
+    """
+    best = None
+    best_area = 0.0
+    n_bodies = 0
+    n_faces = 0
+    n_planar = 0
+    kinds = {}
+
+    try:
+        plane_type = adsk.core.SurfaceTypes.PlaneSurfaceType
+    except Exception:
+        plane_type = 0
+
+    for body in _collect_bodies(root, notes):
+        n_bodies += 1
+        try:
             faces = body.faces
+            count = faces.count
         except Exception:
             continue
-        for k in range(faces.count):
+        for k in range(count):
             try:
                 face = faces.item(k)
-                if face.geometry.surfaceType != adsk.core.SurfaceTypes.PlaneSurfaceType:
-                    continue
-                area = face.area
-                if area > best_area:
-                    best_area, best = area, face
             except Exception:
                 continue
-    return best, best_area
+            n_faces += 1
+            try:
+                stype = face.geometry.surfaceType
+            except Exception:
+                continue
+            kinds[stype] = kinds.get(stype, 0) + 1
+            if stype != plane_type:
+                continue
+            n_planar += 1
+            try:
+                area = face.area
+            except Exception:
+                continue
+            if area > best_area:
+                best_area, best = area, face
+
+    report = "examined {} body/bodies, {} face(s), {} planar; surfaceType counts: {}".format(
+        n_bodies, n_faces, n_planar, kinds or "(none)"
+    )
+    return best, best_area, report
 
 
 def _any_image(root_dir):
@@ -92,17 +172,63 @@ def run(context):
     app = adsk.core.Application.get()
     ui = app.userInterface
     try:
-        design = adsk.fusion.Design.cast(app.activeProduct)
-        if not design:
-            ui.messageBox("Open a Fusion design first.")
-            return
-        root = design.rootComponent
+        notes = []
+        doc = None
+        try:
+            doc = app.activeDocument
+            notes.append("activeDocument = {!r}".format(doc.name))
+        except Exception as ex:
+            notes.append("activeDocument FAILED: {}".format(ex))
 
-        face, area = _largest_planar_face(root)
+        # activeProduct follows the active WORKSPACE, so in Render/CAM it need not be
+        # the Design. Ask the document for its Design product as well, and use
+        # whichever actually yields a root component.
+        design = None
+        try:
+            design = adsk.fusion.Design.cast(app.activeProduct)
+            notes.append(
+                "activeProduct = {} -> Design.cast {}".format(
+                    type(app.activeProduct).__name__, "OK" if design else "None"
+                )
+            )
+        except Exception as ex:
+            notes.append("activeProduct FAILED: {}".format(ex))
+        if design is None and doc is not None:
+            try:
+                prods = doc.products
+                names = []
+                for i in range(prods.count):
+                    names.append(prods.item(i).productType)
+                notes.append("document products = {}".format(names))
+                design = adsk.fusion.Design.cast(
+                    prods.itemByProductType("DesignProductType")
+                )
+                notes.append("itemByProductType -> {}".format("OK" if design else "None"))
+            except Exception as ex:
+                notes.append("document.products FAILED: {}".format(ex))
+
+        if design is None:
+            ui.messageBox(
+                "Could not get a Design from this document.\n\n{}\n\n"
+                "Open one of the product models (Bullnose.f3d etc.) and re-run.".format(
+                    "\n".join(notes)
+                )
+            )
+            return
+
+        root = design.rootComponent
+        try:
+            notes.append("rootComponent = {!r}".format(root.name))
+        except Exception as ex:
+            notes.append("rootComponent.name FAILED: {}".format(ex))
+
+        face, area, report = _largest_planar_face(root, notes)
         if face is None:
             ui.messageBox(
-                "No planar face found. Open a model with at least one flat face "
-                "(any of the trim products will do)."
+                "No planar face found.\n\n{}\n\nDIAGNOSTICS\n{}\n\n"
+                "Send this text back — it says exactly where the scan stopped.".format(
+                    report, "\n".join(notes)
+                )
             )
             return
 
@@ -115,11 +241,39 @@ def run(context):
                 return
             image = Path(dlg.filename)
 
-        comp = face.body.parentComponent
         point = face.pointOnFace
-        decal_input = comp.decals.createInput(str(image), [face], point)
+        decal_input = None
+        create_errs = []
+        # A proxy face's parentComponent is the DEFINITION, which is not always the
+        # right context for createInput — try it, then the owning occurrence's
+        # component, then root.
+        candidates = []
+        try:
+            candidates.append(face.body.parentComponent)
+        except Exception as ex:
+            create_errs.append("face.body.parentComponent: {}".format(ex))
+        try:
+            ctx = face.assemblyContext
+            if ctx is not None:
+                candidates.append(ctx.component)
+        except Exception:
+            pass
+        candidates.append(root)
+
+        for comp in candidates:
+            if comp is None:
+                continue
+            try:
+                decal_input = comp.decals.createInput(str(image), [face], point)
+                if decal_input is not None:
+                    break
+            except Exception as ex:
+                create_errs.append("{}: {}".format(getattr(comp, "name", "?"), ex))
         if decal_input is None:
-            ui.messageBox("decals.createInput returned None — cannot probe.")
+            ui.messageBox(
+                "decals.createInput returned None on every candidate component.\n\n"
+                "{}\n\nImage used: {}".format("\n".join(create_errs) or "(no errors)", image)
+            )
             return
 
         # Chain faces OFF: a wrapped decal's developed size differs from its
@@ -148,6 +302,7 @@ def run(context):
             "DECAL MAGNITUDE PROBE",
             "",
             "Face area           : {:.2f} cm^2".format(area),
+            "Geometry scanned    : {}".format(report),
             "Chain faces         : OFF (no wrap confound)",
             "",
             "Default magnitudes  : |X| = {:.4f}   |Y| = {:.4f}".format(mx, my),

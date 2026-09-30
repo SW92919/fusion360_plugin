@@ -107,6 +107,43 @@ def _detach_from_ribbon(fui: adsk.core.UserInterface) -> None:
             pass
 
 
+def _dialog_instructions_file(fui: adsk.core.UserInterface) -> Optional[Path]:
+    dlg = fui.createFileDialog()
+    dlg.title = "Select the Render Instructions file"
+    dlg.filter = "Render instructions (*.json;*.txt)|*.json;*.txt|All files (*.*)|*.*"
+    dlg.filterIndex = 0
+    if dlg.showOpen() != adsk.core.DialogResults.DialogOK:
+        return None
+    return Path(dlg.filename) if dlg.filename else None
+
+
+def _dialog_texture_root(fui: adsk.core.UserInterface) -> Optional[Path]:
+    fd = fui.createFolderDialog()
+    fd.title = "Select texture root (subfolders = color sets)"
+    if fd.showDialog() != adsk.core.DialogResults.DialogOK:
+        return None
+    return Path(fd.folder) if fd.folder else None
+
+
+def _dialog_model_paths(fui: adsk.core.UserInterface) -> List[Path]:
+    dlg = fui.createFileDialog()
+    dlg.isMultiSelectEnabled = True
+    dlg.title = "Select one or more Fusion designs (.f3d)"
+    dlg.filter = "Fusion designs (*.f3d)|*.f3d|All files (*.*)|*.*"
+    dlg.filterIndex = 0
+    if dlg.showOpen() != adsk.core.DialogResults.DialogOK:
+        return []
+    paths: List[Path] = []
+    try:
+        names = dlg.filenames
+        for i in range(names.count):
+            paths.append(Path(names.item(i)))
+    except Exception:
+        if dlg.filename:
+            paths.append(Path(dlg.filename))
+    return paths
+
+
 def run(context):
     _ = context
     fui: Optional[adsk.core.UserInterface] = None
@@ -137,8 +174,24 @@ def run(context):
                         return
                     instructions_path = Path(instructions_raw)
                     if not instructions_path.is_file():
+                        # A relative path resolves against Fusion's working directory,
+                        # not the repo, so show where it actually looked.
+                        try:
+                            resolved = instructions_path.resolve()
+                        except Exception:
+                            resolved = instructions_path
+                        hint = ""
+                        if not instructions_path.is_absolute():
+                            hint = (
+                                "\n\nThat is a RELATIVE path. Fusion resolves it against its "
+                                "own working folder, not your project. Use the browse button, "
+                                "or paste the full path starting with a drive letter."
+                            )
                         fui.messageBox(
-                            "Render Instructions file not found:\n{}".format(instructions_path)
+                            "Render Instructions file not found.\n\n"
+                            "Entered : {}\nLooked in: {}{}".format(
+                                instructions_raw, resolved, hint
+                            )
                         )
                         return
 
@@ -202,6 +255,41 @@ def run(context):
                     except Exception:
                         pass
 
+        class OnInputChanged(adsk.core.InputChangedEventHandler):
+            """Fills a path field from a file/folder dialog when its button is clicked."""
+
+            def __init__(self):
+                super().__init__()
+
+            def notify(self, args):
+                try:
+                    changed = args.input
+                    ins = args.inputs
+                    iid = changed.id
+                    if iid not in uip.BROWSE_INPUT_IDS:
+                        return
+                    # A button input latches on; clear it so it can be used again.
+                    uip.reset_browse_button(ins, iid)
+
+                    if iid == uip.INPUT_BROWSE_INSTRUCTIONS:
+                        picked = _dialog_instructions_file(fui)
+                        if picked:
+                            uip.set_text_input(ins, uip.INPUT_INSTRUCTIONS, str(picked))
+                    elif iid == uip.INPUT_BROWSE_TEXTURE_ROOT:
+                        picked = _dialog_texture_root(fui)
+                        if picked:
+                            uip.set_text_input(ins, uip.INPUT_TEXTURE_ROOT, str(picked))
+                    elif iid == uip.INPUT_BROWSE_MODEL_PATHS:
+                        picked = _dialog_model_paths(fui)
+                        if picked:
+                            uip.set_text_input(
+                                ins,
+                                uip.INPUT_MODEL_PATHS,
+                                "\n".join(str(p) for p in picked),
+                            )
+                except Exception:
+                    _log("OnInputChanged failed:\n" + traceback.format_exc())
+
         class OnCreated(adsk.core.CommandCreatedEventHandler):
             def __init__(self):
                 super().__init__()
@@ -213,6 +301,9 @@ def run(context):
                     on_ex = OnExecute()
                     cmd.execute.add(on_ex)
                     _handlers.append(on_ex)
+                    on_changed = OnInputChanged()
+                    cmd.inputChanged.add(on_changed)
+                    _handlers.append(on_changed)
                 except Exception:
                     _log("OnCreated failed:\n" + traceback.format_exc())
 

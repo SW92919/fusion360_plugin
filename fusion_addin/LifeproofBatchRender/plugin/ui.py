@@ -7,6 +7,18 @@ COMMAND_ID = "LifeproofBatchRenderCmd"
 INPUT_INSTRUCTIONS = "lbr_renderInstructions"
 INPUT_TEXTURE_ROOT = "lbr_textureRoot"
 INPUT_MODEL_PATHS = "lbr_modelPaths"
+
+# "Browse..." buttons, each directly under the field it fills. Fusion cannot put a
+# button inside a text input, so they sit on their own row.
+INPUT_BROWSE_INSTRUCTIONS = "lbr_browseInstructions"
+INPUT_BROWSE_TEXTURE_ROOT = "lbr_browseTextureRoot"
+INPUT_BROWSE_MODEL_PATHS = "lbr_browseModelPaths"
+
+BROWSE_INPUT_IDS = (
+    INPUT_BROWSE_INSTRUCTIONS,
+    INPUT_BROWSE_TEXTURE_ROOT,
+    INPUT_BROWSE_MODEL_PATHS,
+)
 INPUT_IMG_W = "lbr_imgW"
 INPUT_IMG_H = "lbr_imgH"
 INPUT_QUALITY = "lbr_renderQuality"
@@ -77,11 +89,22 @@ def read_instructions_path(ins: adsk.core.CommandInputs) -> str:
         return ""
 
 
+def _add_browse_button(inputs: adsk.core.CommandInputs, iid: str, label: str) -> None:
+    """Clickable button row. A BoolValueInput with isCheckBox=False renders as one."""
+    try:
+        inputs.addBoolValueInput(iid, label, False, "", False)
+    except Exception:
+        pass
+
+
 def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
     inputs.addStringValueInput(
         INPUT_INSTRUCTIONS,
         "Render Instructions Location",
         "",
+    )
+    _add_browse_button(
+        inputs, INPUT_BROWSE_INSTRUCTIONS, "   ... browse for instructions file"
     )
 
     inputs.addStringValueInput(
@@ -89,6 +112,10 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
         "Texture root folder",
         "",
     )
+    _add_browse_button(
+        inputs, INPUT_BROWSE_TEXTURE_ROOT, "   ... browse for texture folder"
+    )
+
     try:
         inputs.addTextBoxCommandInput(
             INPUT_MODEL_PATHS,
@@ -103,6 +130,9 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
             "Model paths (.f3d), | separated",
             "",
         )
+    _add_browse_button(
+        inputs, INPUT_BROWSE_MODEL_PATHS, "   ... browse for model files (.f3d)"
+    )
 
     inputs.addStringValueInput(INPUT_IMG_W, "Image width (px)", DEFAULT_IMG_W)
     inputs.addStringValueInput(INPUT_IMG_H, "Image height (px)", DEFAULT_IMG_H)
@@ -149,6 +179,32 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
             inputs.addStringValueInput(INPUT_STATUS, "Status", "")
         except Exception:
             pass
+
+
+def set_text_input(ins: adsk.core.CommandInputs, iid: str, text: str) -> bool:
+    """Write into a string or textbox input, whichever this build created."""
+    inp = ins.itemById(iid)
+    if inp is None:
+        return False
+    for attr in ("text", "formattedText", "value"):
+        if hasattr(inp, attr):
+            try:
+                setattr(inp, attr, text)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def reset_browse_button(ins: adsk.core.CommandInputs, iid: str) -> None:
+    """Clear a button's pressed state so it can be clicked again."""
+    inp = ins.itemById(iid)
+    if inp is None:
+        return
+    try:
+        inp.value = False
+    except Exception:
+        pass
 
 
 def set_status(ins: adsk.core.CommandInputs, text: str) -> None:
