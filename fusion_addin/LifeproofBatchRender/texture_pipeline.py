@@ -310,6 +310,37 @@ BATCH_DECAL_FIT_DEFAULT_AXIS_MULTIPLIER: float = 1.0
 # effect as the Fusion gizmo / Keep Aspect Ratio — NOT separate width/height).
 BATCH_DECAL_USE_SCALE_PLANE_XY: bool = True
 
+# --- Absolute decal sizing (client's Render Instructions) -------------------
+# Size each decal to an exact physical size from the JSON instead of auto-fitting
+# to the body. Independent X/Y magnitudes on DecalInput.transform — the Fusion API
+# supports non-uniform axis magnitudes; horizontalScale/verticalScale do not exist.
+BATCH_DECAL_ABSOLUTE_SIZE: bool = True
+
+# When True a sizing failure aborts the decal (body renders bare = obvious) rather
+# than silently falling back to cover-fit (renders plausible but wrong size).
+BATCH_DECAL_ABSOLUTE_SIZE_STRICT: bool = True
+
+# Centimetres of rendered extent per 1.0 of transform-axis magnitude.
+#
+# 1.0 → magnitude IS the full extent (9 in → |Y| = 22.86)
+# 2.0 → magnitude is the HALF extent  (9 in → |Y| = 11.43)
+#
+# NOT PROVEN from the code, so it is a constant rather than an assumption baked
+# into the arithmetic. The only measurement in this repo is the comment above
+# BATCH_DECAL_FIT_DEFAULT_AXIS_MULTIPLIER ("legacy 2.0 * axis_len undershot render
+# ~2x"), and that is one equation in two unknowns: shortfall = 2 * W / k, where W is
+# (extent actually needed to cover) / (projected bbox span). Chain faces are ON, so a
+# decal wraps and W > 1 on curved parts — a quarter-round of radius r has projected
+# width r but developed width ~1.57r. Both {k=1, W=1} and {k=2, W~1.8} reproduce every
+# number recorded in this file, and Fusion's own stub uses magnitude-as-radius for
+# ellipse axes while calling the decal transform origin the decal's CENTRE.
+#
+# TO SETTLE IT (~1 minute): run tools/probe_decal_magnitude.py in Fusion. It creates a
+# DecalInput on a flat face with chain-faces off, prints the default magnitudes, and
+# compares them against Fusion's documented ~5 cm default patch (referenced in five
+# places in this file). If it reports k=2.0, change this constant — nothing else.
+BATCH_DECAL_MAGNITUDE_CM_PER_UNIT: float = 1.0
+
 # Fusion DECAL dialog **Scale Plane XY** slider — uniform multiplier applied
 # after auto-fit to the body bbox in decal-local axes (manual bullnose ~1.8).
 # Overridden per batch from the plugin UI when set.
@@ -317,6 +348,75 @@ BATCH_DECAL_SCALE_PLANE_XY: float = 1
 
 # Set by controller from UI; None = use ``BATCH_DECAL_SCALE_PLANE_XY`` above.
 _RUNTIME_DECAL_SCALE_PLANE_XY: Optional[float] = None
+
+# Per-model decal targets from the Render Instructions JSON, keyed by
+# ``render_instructions.normalize_part_key(componentPartNumber)``. Each value is a
+# ``DecalSizeSpec`` (width_cm / length_cm / slot / part_number). Set once per model
+# by the controller; empty means "no JSON targets" and the legacy filename-derived
+# targeting applies.
+_DECAL_TARGETS_BY_PART: Dict[str, Any] = {}
+
+
+def set_decal_targets(targets: Optional[Dict[str, Any]]) -> None:
+    """Install this model's JSON decal targets (part_key -> DecalSizeSpec)."""
+    global _DECAL_TARGETS_BY_PART
+    _DECAL_TARGETS_BY_PART = dict(targets or {})
+
+
+def get_decal_targets() -> Dict[str, Any]:
+    return _DECAL_TARGETS_BY_PART
+
+
+def _part_key(name: str) -> str:
+    """Normalize a Fusion browser name for comparison with a JSON part number."""
+    try:
+        from render_instructions import normalize_part_key
+
+        return normalize_part_key(name or "")
+    except Exception:
+        return re.sub(r"[\s\-_]+", "-", (name or "").strip().lower()).strip("-")
+
+
+def decal_target_for_names(*names: str) -> Optional[Any]:
+    """First JSON decal target matching any of these occurrence/component/body names."""
+    if not _DECAL_TARGETS_BY_PART:
+        return None
+    for name in names:
+        if not name:
+            continue
+        spec = _DECAL_TARGETS_BY_PART.get(_part_key(name))
+        if spec is not None:
+            return spec
+    return None
+
+
+def _size_spec_for_body(
+    body: Optional[Any], occurrence_label: str = ""
+) -> Optional[Any]:
+    """JSON decal size for the part this body belongs to, or None.
+
+    The JSON names COMPONENTS ("Stair Nose"), so the occurrence and component names
+    are tried before the body's own name — a body is typically called something like
+    ``Nose Skin (7)`` and would not match.
+    """
+    if not _DECAL_TARGETS_BY_PART:
+        return None
+    names: List[str] = []
+    if occurrence_label and occurrence_label != "(root)":
+        names.append(occurrence_label)
+    if body is not None:
+        for getter in (
+            lambda: body.parentComponent.name,
+            lambda: body.parentComponent.partNumber,
+            lambda: body.name,
+        ):
+            try:
+                value = getter()
+            except Exception:
+                continue
+            if value:
+                names.append(value)
+    return decal_target_for_names(*names)
 
 
 def get_decal_scale_plane_xy() -> float:
@@ -612,6 +712,7 @@ class DecalPlacementRecord:
         "chain_faces",
         "template_hint",
         "center_override",
+        "size_spec",
     )
 
     def __init__(
@@ -623,7 +724,11 @@ class DecalPlacementRecord:
         chain_faces: Optional[bool],
         template_hint: Optional[TemplateDecalHint],
         center_override: Optional[adsk.core.Point3D] = None,
+        size_spec: Optional[Any] = None,
     ) -> None:
+        # Absolute size must survive the delete/recreate that every colour set
+        # triggers, or only the first colour set would be correctly sized.
+        self.size_spec = size_spec
         self.decals_collection = decals_collection
         self.face = face
         self.body = body
@@ -1792,6 +1897,28 @@ def _occurrence_is_batch_target(
     label = (occurrence_label or "").strip()
     if not label:
         return False
+    # The Render Instructions name the target components explicitly, so when they
+    # are present they are the authority. The legacy path below derives the target
+    # from the .f3d FILENAME, which stopped matching when the client renamed the
+    # models (Bullnose.f3d no longer contains "Treads Plus", and the components are
+    # "Stair Nose" / "Supplemental Plank") — that would decal nothing at all.
+    if _DECAL_TARGETS_BY_PART:
+        # Every JSON target is a real occurrence in these models (Stair Nose:1,
+        # L-Cap (1):1, 3-In-1:1 ...). Root is skipped so a design whose root
+        # component shares the product's name cannot be decaled a second time
+        # on top of the occurrence that already matched.
+        if label == "(root)":
+            return False
+        names = [label]
+        if comp is not None:
+            for attr in ("name", "partNumber"):
+                try:
+                    value = getattr(comp, attr, None)
+                except Exception:
+                    continue
+                if value:
+                    names.append(value)
+        return decal_target_for_names(*names) is not None
     if label == "(root)":
         if not BATCH_DECAL_MAIN_BODY_FROM_FILENAME or not main_token or comp is None:
             return False
@@ -2527,7 +2654,13 @@ def _matrix_from_axes(
     y_axis: adsk.core.Vector3D,
     z_axis: adsk.core.Vector3D,
 ) -> Tuple[Optional[adsk.core.Matrix3D], Optional[str]]:
-    """Build a Matrix3D from a decal coordinate system (multi-method fallback)."""
+    """Build a Matrix3D from a decal coordinate system (multi-method fallback).
+
+    ``setWithCoordinateSystem`` returns a bool — Fusion rejects a coordinate system
+    whose axes are degenerate or not usable. That result used to be discarded, so a
+    rejected system returned an untouched identity matrix that then read as success
+    and silently placed the decal at Fusion's default size and orientation.
+    """
     m = adsk.core.Matrix3D.create()
     for method_name in (
         "setWithCoordinateSystem",
@@ -2536,7 +2669,9 @@ def _matrix_from_axes(
     ):
         try:
             method = getattr(m, method_name)
-            method(origin, x_axis, y_axis, z_axis)
+            result = method(origin, x_axis, y_axis, z_axis)
+            if result is False:
+                return None, "{} rejected the coordinate system".format(method_name)
             return m, None
         except TypeError:
             continue
@@ -2589,6 +2724,123 @@ def _apply_xy_scale_to_transform(
     except Exception as ex:
         last_err = str(ex)
     return None, last_err
+
+
+def _resolve_size_axis_targets(
+    trf: adsk.core.Matrix3D,
+    body: Optional[adsk.fusion.BRepBody],
+    width_cm: float,
+    length_cm: float,
+) -> Tuple[float, float, str]:
+    """Decide which decal-local axis carries ``length_cm`` vs ``width_cm``.
+
+    ``length`` is the part's LONG direction (the client's 50 in) and ``width`` runs
+    across it. Grain alignment normally rotates decal-local X onto the body length
+    (``BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS`` is False), but that rotation can be
+    skipped — curved faces, a template hint, or a body whose long axis can't be
+    determined — so the assignment is resolved from the ACTUAL axes rather than
+    assumed. Same dot-product test ``_apply_bbox_floor_to_decal_needs`` uses.
+
+    Returns ``(target_x_cm, target_y_cm, note)``.
+    """
+    default = (length_cm, width_cm, "x=length (grain default)")
+    if body is None:
+        return default
+    try:
+        _origin, x_axis, y_axis, _z_axis = trf.getAsCoordinateSystem()
+    except Exception:
+        return default
+    x_u = _vec3_normalize(_vec3_from_vector3d(x_axis))
+    y_u = _vec3_normalize(_vec3_from_vector3d(y_axis))
+    if x_u is None or y_u is None:
+        return default
+    try:
+        long_axis = _body_unit_length_axis(body)
+    except Exception:
+        return default
+    if long_axis is None:
+        return default
+    dot_x = abs(_vec3_dot(x_u, long_axis))
+    dot_y = abs(_vec3_dot(y_u, long_axis))
+    if dot_y > dot_x:
+        return (
+            width_cm,
+            length_cm,
+            "y=length (|dot| y={:.2f} > x={:.2f})".format(dot_y, dot_x),
+        )
+    return (
+        length_cm,
+        width_cm,
+        "x=length (|dot| x={:.2f} >= y={:.2f})".format(dot_x, dot_y),
+    )
+
+
+def _apply_absolute_size_to_matrix(
+    trf: adsk.core.Matrix3D,
+    body: Optional[adsk.fusion.BRepBody],
+    width_cm: float,
+    length_cm: float,
+) -> Tuple[Optional[str], Optional[adsk.core.Matrix3D], List[str]]:
+    """Set INDEPENDENT X/Y axis magnitudes so the decal lands at an exact size.
+
+    Unlike ``_apply_scale_plane_xy_to_matrix`` (one uniform factor chosen to COVER
+    the body) this ignores the body's extent entirely: the decal becomes exactly
+    ``width_cm`` x ``length_cm``, which is what the client's JSON specifies.
+
+    Origin, Z axis and in-plane rotation are preserved — only the X/Y magnitudes
+    change. Returns ``(error, matrix, diagnostic_lines)``.
+    """
+    diag: List[str] = []
+    if width_cm <= 0.0 or length_cm <= 0.0:
+        return "non-positive target size", None, diag
+    try:
+        origin, x_axis, y_axis, z_axis = trf.getAsCoordinateSystem()
+    except Exception as ex:
+        return "getAsCoordinateSystem: {}".format(ex), None, diag
+
+    x_len = _vector_length(x_axis)
+    y_len = _vector_length(y_axis)
+    if x_len < 1e-9 or y_len < 1e-9:
+        return "degenerate decal axes", None, diag
+
+    target_x_cm, target_y_cm, axis_note = _resolve_size_axis_targets(
+        trf, body, width_cm, length_cm
+    )
+
+    k = max(float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT), 1e-9)
+    mag_x = target_x_cm / k
+    mag_y = target_y_cm / k
+
+    try:
+        new_x = adsk.core.Vector3D.create(
+            x_axis.x / x_len * mag_x, x_axis.y / x_len * mag_x, x_axis.z / x_len * mag_x
+        )
+        new_y = adsk.core.Vector3D.create(
+            y_axis.x / y_len * mag_y, y_axis.y / y_len * mag_y, y_axis.z / y_len * mag_y
+        )
+    except Exception as ex:
+        return "axis rebuild: {}".format(ex), None, diag
+
+    rebuilt, err = _matrix_from_axes(origin, new_x, new_y, z_axis)
+    if rebuilt is None:
+        return err or "matrix rebuild failed", None, diag
+
+    diag.append(
+        "absolute size: target {:.2f}x{:.2f} cm ({:.2f}x{:.2f} in) | {} | "
+        "magnitudes {:.3f}x{:.3f} (k={:.2f} cm/unit) | was {:.3f}x{:.3f}".format(
+            target_x_cm,
+            target_y_cm,
+            target_x_cm / 2.54,
+            target_y_cm / 2.54,
+            axis_note,
+            mag_x,
+            mag_y,
+            k,
+            x_len,
+            y_len,
+        )
+    )
+    return None, rebuilt, diag
 
 
 def _slice_image_for_tile(
@@ -3179,10 +3431,17 @@ def _decal_readback_log_line(decal: adsk.fusion.Decal) -> str:
         m = decal.transform
         if m is not None:
             _o, x_axis, y_axis, _z = m.getAsCoordinateSystem()
+            # Report the RAW magnitudes plus the size they imply under the current
+            # BATCH_DECAL_MAGNITUDE_CM_PER_UNIT. This line used to hard-code a x2
+            # (half-extent) reading while the sizing arithmetic assumed x1 — the two
+            # disagreed, so the instrument could not be used to check the geometry.
+            mx = _vector_length(x_axis)
+            my = _vector_length(y_axis)
+            k = max(float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT), 1e-9)
             parts.append(
-                "decalSizeXY=({:.2f}x{:.2f} cm)".format(
-                    _vector_length(x_axis) * 2.0,
-                    _vector_length(y_axis) * 2.0,
+                "decalMagXY=({:.3f}x{:.3f}) => {:.2f}x{:.2f} cm @k={:.1f} "
+                "({:.2f}x{:.2f} in)".format(
+                    mx, my, mx * k, my * k, k, mx * k / 2.54, my * k / 2.54
                 )
             )
             uv_deg = _decal_x_axis_angle_in_face_plane_deg(m)
@@ -3262,8 +3521,12 @@ def _configure_decal_create_input(
     *,
     chain_faces: Optional[bool] = None,
     template_hint: Optional[TemplateDecalHint] = None,
+    size_spec: Optional[Any] = None,
 ) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[adsk.core.Matrix3D], List[str], Optional[bool]]:
-    """Apply chain faces, grain align, Z angle, and Scale Plane XY on ``DecalInput``.
+    """Apply chain faces, grain align, Z angle, and sizing on ``DecalInput``.
+
+    ``size_spec`` (a ``render_instructions.DecalSizeSpec``) switches sizing from
+    auto cover-fit to the exact physical size the client's JSON asks for.
 
     Returns ``(error, scale_xy_factor, scale_warning, final_transform, scale_diag, use_chain)``.
     """
@@ -3329,7 +3592,42 @@ def _configure_decal_create_input(
     scale_diag: List[str] = []
     need_x = 0.0
     need_y = 0.0
-    if BATCH_DECAL_USE_SCALE_PLANE_XY:
+
+    # Absolute sizing from the Render Instructions wins over cover-fit: the client
+    # specifies an exact physical size per component, so the body's extent is
+    # irrelevant. Cover-fit still runs for decals with no JSON target (tiles,
+    # secondary parts) and when absolute sizing is switched off.
+    if size_spec is not None and BATCH_DECAL_ABSOLUTE_SIZE:
+        abs_err, abs_trf, scale_diag = _apply_absolute_size_to_matrix(
+            trf,
+            body,
+            float(getattr(size_spec, "width_cm", 0.0)),
+            float(getattr(size_spec, "length_cm", 0.0)),
+        )
+        if abs_trf is not None:
+            trf = abs_trf
+            scale_warn = "absolute {:.1f}x{:.1f} in".format(
+                float(getattr(size_spec, "width_in", 0.0)),
+                float(getattr(size_spec, "length_in", 0.0)),
+            )
+        elif BATCH_DECAL_ABSOLUTE_SIZE_STRICT:
+            # Hard-fail rather than fall back to cover-fit: a wrong-sized decal
+            # renders plausibly and ships silently, a missing one is obvious.
+            return (
+                "absolute decal size failed for '{}': {}".format(
+                    getattr(size_spec, "part_number", "?"), abs_err or "unknown"
+                ),
+                None,
+                None,
+                None,
+                scale_diag,
+                use_chain,
+            )
+        else:
+            scale_warn = "ABSOLUTE SIZE FAILED ({}) — cover fit used".format(abs_err)
+            size_spec = None  # fall through to cover-fit below
+
+    if size_spec is None and BATCH_DECAL_USE_SCALE_PLANE_XY:
         scale_err, scale_xy, scaled_trf, need_x, need_y, scale_diag = (
             _apply_scale_plane_xy_to_matrix(
                 trf, face, body, image_path, chain_faces=use_chain
@@ -3339,10 +3637,10 @@ def _configure_decal_create_input(
             trf = scaled_trf
         elif scale_err:
             scale_warn = scale_err
-    if scale_xy is not None and scale_warn is None:
-        scale_warn = "scale_xy={:.2f} need={:.0f}x{:.0f}cm".format(
-            scale_xy, need_x, need_y
-        )
+        if scale_xy is not None and scale_warn is None:
+            scale_warn = "scale_xy={:.2f} need={:.0f}x{:.0f}cm".format(
+                scale_xy, need_x, need_y
+            )
 
     assign_err = _apply_entity_transform(decal_input, trf)
     if assign_err:
@@ -3363,6 +3661,7 @@ def _create_decal_on_face(
     chain_faces: Optional[bool] = None,
     template_hint: Optional[TemplateDecalHint] = None,
     record_placement: bool = True,
+    size_spec: Optional[Any] = None,
 ) -> Tuple[Optional[adsk.fusion.Decal], str, List[str]]:
     """Create one decal on ``face`` (or ``faces``) using ``createInput``.
 
@@ -3403,6 +3702,7 @@ def _create_decal_on_face(
             image_path,
             chain_faces=chain_faces,
             template_hint=template_hint,
+            size_spec=size_spec,
         )
         if orient_err:
             last_err = orient_err
@@ -3439,6 +3739,7 @@ def _create_decal_on_face(
                     chain_faces=use_chain,
                     template_hint=template_hint,
                     center_override=center_override if center_override is not None else center,
+                    size_spec=size_spec,
                 ),
             )
         if scale_warn:
@@ -3665,6 +3966,7 @@ def create_batch_decals_for_all_bodies(
                     body=body,
                     image_path=image_path,
                     template_hint=template_hint,
+                    size_spec=_size_spec_for_body(body, label),
                 )
                 if decal is None:
                     lines.append(
@@ -3972,6 +4274,7 @@ def create_batch_decals_for_all_bodies(
                 body=body,
                 image_path=image_path,
                 template_hint=template_hint,
+                size_spec=_size_spec_for_body(body, body_label),
             )
             if decal is None:
                 lines.append(
@@ -4286,6 +4589,20 @@ def create_batch_decals_for_all_bodies(
             if cslot is not None:
                 slot, src = cslot, "authored-decal-on-component"
                 ap_name = ap_name or "(authored Honeycomb slot)"
+        if slot is None:
+            # Render Instructions order decides the two-tone split: decals[0] takes
+            # the _1 raster, decals[1] the _2. Confirmed against Bullnose.f3d, whose
+            # authored decals are "dusk-cherry - 1" on Stair Nose and "dusk-cherry-2"
+            # on Supplemental Plank — the same order as the JSON.
+            spec = getattr(rec, "size_spec", None) if rec is not None else None
+            if spec is None:
+                spec = _size_spec_for_body(body)
+            jslot = getattr(spec, "slot", None) if spec is not None else None
+            if jslot in (1, 2):
+                slot, src = jslot, "render-instructions"
+                ap_name = ap_name or "({})".format(
+                    getattr(spec, "part_number", "json part")
+                )
         if slot not in (1, 2):
             slot = 1
         _DECAL_SLOT[id(d)] = slot
@@ -4385,6 +4702,9 @@ def _update_batch_decals_via_recreate(
         return 0, lines, decals
     out: List[adsk.fusion.Decal] = []
     n_slot2 = 0
+    n_ok = 0
+    n_failed = 0
+    n_size_lost = 0
     pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
     for idx, d in enumerate(decals):
         old_id = id(d)
@@ -4406,6 +4726,7 @@ def _update_batch_decals_via_recreate(
             out.append(d)
             continue
         face = _resolve_recreate_face(record)
+        size_spec = getattr(record, "size_spec", None)
         new_decal, err, _scale_diag = _create_decal_on_face(
             record.decals_collection,
             image_win,
@@ -4416,8 +4737,30 @@ def _update_batch_decals_via_recreate(
             image_path=image_path,
             chain_faces=record.chain_faces,
             template_hint=record.template_hint,
+            size_spec=size_spec,
         )
         if new_decal is None:
+            n_failed += 1
+            if size_spec is not None:
+                # Do NOT re-image the old decal: it was sized for this part, but a
+                # failed recreate means we cannot prove the new one would be. An
+                # imageFilename swap here yields a plausible render at a possibly
+                # wrong size — the exact failure this guards against. Leaving the
+                # previous colour in place makes the problem visible instead.
+                n_size_lost += 1
+                lines.append(
+                    "  Decal '{}': recreate FAILED ({}) — ABSOLUTE SIZE LOST for part "
+                    "'{}'; left unchanged rather than re-imaged at an unverified size".format(
+                        dn, err, getattr(size_spec, "part_number", "?")
+                    )
+                )
+                out.append(d)
+                if (idx + 1) % pump_every == 0:
+                    try:
+                        adsk.doEvents()
+                    except Exception:
+                        pass
+                continue
             ok, swap_err = _set_decal_image(d, image_win)
             if ok:
                 lines.append(
@@ -4439,6 +4782,7 @@ def _update_batch_decals_via_recreate(
                 except Exception:
                     pass
             continue
+        n_ok += 1
         try:
             d.deleteMe()
         except Exception as ex:
@@ -4470,13 +4814,21 @@ def _update_batch_decals_via_recreate(
             except Exception:
                 pass
     slot2_note = " ({} on _2 image)".format(n_slot2) if n_slot2 else ""
+    fail_note = ""
+    if n_failed:
+        fail_note = ", {} FAILED".format(n_failed)
+        if n_size_lost:
+            fail_note += " ({} absolute-sized)".format(n_size_lost)
     lines.insert(
         0,
-        "Batch decal update: {} / {} recreate(s){}".format(
-            len(out), len(decals), slot2_note
+        "Batch decal update: {} / {} recreated OK{}{}".format(
+            n_ok, len(decals), fail_note, slot2_note
         ),
     )
-    return len(out), lines, out
+    # Report ACTUAL successes, not len(out) — every branch appends to ``out``, so
+    # its length always equalled the input and could never signal a failure. The
+    # controller reads this to decide whether a colour set textured at all.
+    return n_ok, lines, out
 
 
 def _update_batch_decals_via_image_swap(

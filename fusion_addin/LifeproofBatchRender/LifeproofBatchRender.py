@@ -43,7 +43,7 @@ def run(context):
             app = adsk.core.Application.get()
             if app and app.userInterface:
                 app.userInterface.messageBox(
-                    "Lifeproof Batch Render failed to start.\n\n"
+                    "Batch Render failed to start.\n\n"
                     "See:\n{}\n\n{}".format(_STARTUP_LOG, tb)
                 )
         except Exception:
