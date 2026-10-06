@@ -414,6 +414,21 @@ def _execute_batch_inner(
                 )
                 for line in decal_lines:
                     summary_lines.append("  " + line)
+                if not batch_decals and entry.decals:
+                    # The JSON asked for decals and none were placed, so every render
+                    # of this model will come out untextured. That is otherwise only
+                    # visible by looking at the images.
+                    summary_lines.append(
+                        "  *** NO DECALS PLACED on {} — the render instructions ask for "
+                        "{}, but no show body qualified. Every image for this model will "
+                        "be untextured. See the per-occurrence lines above. ***".format(
+                            mp.name,
+                            ", ".join(d.part_number for d in entry.decals),
+                        )
+                    )
+                    logutil.append_log(
+                        log_path, "NO DECALS PLACED on {}".format(mp.name)
+                    )
         elif mode == "decal" and texture_pipeline.FORCE_BODY_COVERAGE:
             summary_lines.append("  Pre-batch appearance audit:")
             for line in texture_pipeline.audit_design_appearances(design):

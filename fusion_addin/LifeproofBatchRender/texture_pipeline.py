@@ -558,7 +558,14 @@ BATCH_DECAL_BODY_PREFER_KEYWORDS: Tuple[str, ...] = (
 # Bullnose: Supplemental Plank's internal ``Body2`` (appearance "Steel - Satin2")
 # scored 4x and took the decal, leaving ``Plank Skin`` bare and the steel body
 # showing through the render.
-BATCH_DECAL_BODY_PREFER_NAME_KEYWORDS: Tuple[str, ...] = ("skin",)
+#
+# "wear layer" is the same idea under the older naming: in Square Nose the Stair
+# Nose holds both ``Nose`` and ``Nose Wear Layer``, whose scores came out 141723 vs
+# 141722 — a one-unit margin, i.e. a coin flip between the substrate and the visible
+# surface. BATCH_DECAL_ROOT_ANCHOR_BODIES already lists "Nose Wear Layer" ahead of
+# "Nose" for exactly this reason; this makes that preference apply to body scoring
+# too instead of only to the root-anchor path.
+BATCH_DECAL_BODY_PREFER_NAME_KEYWORDS: Tuple[str, ...] = ("skin", "wear layer", "wearlayer")
 BATCH_DECAL_BODY_PREFER_NAME_KEYWORD_RANK: float = 50.0
 
 # When True, the plugin also rewrites ``imageFilename`` on every user-
@@ -1959,6 +1966,13 @@ def _resolve_forced_body_name(
     mapped = _occurrence_forced_body_name_from_map(occurrence_label)
     if mapped:
         return mapped
+    # With Render Instructions targets, do NOT guess a body name from the .f3d
+    # filename. That path derives the body from the OCCURRENCE name, which is the
+    # component ("End Cap (1)") while the body inside is "End Cap" — so it pinned a
+    # body that does not exist and every one of those models produced 0 decals.
+    # Returning None lets the show-body scoring choose, which is what already works.
+    if _DECAL_TARGETS_BY_PART:
+        return None
     label = (occurrence_label or "").strip()
     if label == "(root)" and BATCH_DECAL_MAIN_BODY_FROM_FILENAME and main_token:
         return _resolve_root_batch_anchor_body(comp, main_token)
