@@ -4624,9 +4624,28 @@ def create_batch_decals_for_all_bodies(
     for d in created:
         rec = _DECAL_PLACEMENT_CACHE.get(id(d))
         body = rec.body if rec is not None else None
-        ap_name = _orig_appearance_name_for_body(body)
-        slot = appearance_name_slot(ap_name)
-        src = "body"
+        ap_name = ""
+        slot = None
+        src = ""
+
+        # The Render Instructions are the client's authority, so decals[] order wins
+        # over anything left in the .f3d. It used to be consulted LAST, which made
+        # Bullnose and Square Nose disagree: Bullnose took the JSON order (nose -> _1)
+        # while Square Nose still had authored decals that inherited the opposite
+        # (nose -> _2), so the same product family rendered with the two colours
+        # swapped. decals[0] takes the _1 raster, decals[1] the _2.
+        spec = getattr(rec, "size_spec", None) if rec is not None else None
+        if spec is None:
+            spec = _size_spec_for_body(body)
+        jslot = getattr(spec, "slot", None) if spec is not None else None
+        if jslot in (1, 2):
+            slot, src = jslot, "render-instructions"
+            ap_name = "({})".format(getattr(spec, "part_number", "json part"))
+
+        if slot is None:
+            ap_name = _orig_appearance_name_for_body(body)
+            slot = appearance_name_slot(ap_name)
+            src = "body"
         if slot is None and rec is not None:
             fslot, fname = _face_appearance_slot(rec.face)
             if fslot is not None:
@@ -4636,22 +4655,9 @@ def create_batch_decals_for_all_bodies(
             if cslot is not None:
                 slot, src = cslot, "authored-decal-on-component"
                 ap_name = ap_name or "(authored Honeycomb slot)"
-        if slot is None:
-            # Render Instructions order decides the two-tone split: decals[0] takes
-            # the _1 raster, decals[1] the _2. Confirmed against Bullnose.f3d, whose
-            # authored decals are "dusk-cherry - 1" on Stair Nose and "dusk-cherry-2"
-            # on Supplemental Plank — the same order as the JSON.
-            spec = getattr(rec, "size_spec", None) if rec is not None else None
-            if spec is None:
-                spec = _size_spec_for_body(body)
-            jslot = getattr(spec, "slot", None) if spec is not None else None
-            if jslot in (1, 2):
-                slot, src = jslot, "render-instructions"
-                ap_name = ap_name or "({})".format(
-                    getattr(spec, "part_number", "json part")
-                )
         if slot not in (1, 2):
             slot = 1
+            src = src or "default"
         _DECAL_SLOT[id(d)] = slot
         if slot == 2:
             n_slot2 += 1
