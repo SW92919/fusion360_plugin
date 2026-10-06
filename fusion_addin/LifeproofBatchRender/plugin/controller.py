@@ -414,6 +414,24 @@ def _execute_batch_inner(
                 )
                 for line in decal_lines:
                     summary_lines.append("  " + line)
+                # Roll the per-body skin audit up to model level. isChainFaces paints
+                # the WHOLE body, so a non-skin body means the texture reaches the cut
+                # ends no matter what this code does — that is a model fix, not a code
+                # fix, and this is how we tell whether it has been done.
+                _not_skin = [
+                    ln for ln in decal_lines if "NOT A SKIN BODY" in ln
+                ]
+                if _not_skin:
+                    summary_lines.append(
+                        "  *** {} body/bodies on {} are FULL SOLIDS, not show-only skins. "
+                        "Texture will appear on the cut ends and may not cover the whole "
+                        "outer face. Fix is in the model: add a show-only skin body like "
+                        "Bullnose's 'Nose Skin'. ***".format(len(_not_skin), mp.name)
+                    )
+                    logutil.append_log(
+                        log_path,
+                        "{}: {} non-skin decal body/bodies".format(mp.name, len(_not_skin)),
+                    )
                 if not batch_decals and entry.decals:
                     # The JSON asked for decals and none were placed, so every render
                     # of this model will come out untextured. That is otherwise only

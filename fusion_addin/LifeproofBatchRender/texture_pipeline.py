@@ -2393,6 +2393,63 @@ def _is_end_cap_face(
     return dot >= float(BATCH_DECAL_END_CAP_NORMAL_DOT)
 
 
+def audit_decal_body_is_show_only(
+    body: adsk.fusion.BRepBody,
+) -> Tuple[bool, str]:
+    """Is this body a show-only 'Skin', or a full solid that includes cut ends?
+
+    ``isChainFaces=True`` makes Fusion wrap the decal onto EVERY face of the body
+    (Autodesk's own wording in Decal.redefine), so the add-in cannot stop the
+    texture reaching the cut ends — the BODY decides the painted set.
+
+    Bullnose renders correctly because its ``Nose Skin`` holds only the visible
+    outer surface. A body that still contains end-cap faces will show texture on
+    the cut ends no matter what this code does, so the model has to be fixed, not
+    the pipeline. That makes this audit the fastest way to tell whether a given
+    .f3d is ready.
+
+    Returns ``(is_show_only, human_readable_summary)``.
+    """
+    try:
+        faces = body.faces
+        n = faces.count
+    except Exception as ex:
+        return False, "faces unreadable ({})".format(ex)
+    if not n:
+        return False, "no faces"
+
+    n_end_cap = 0
+    end_cap_area = 0.0
+    total_area = 0.0
+    for i in range(n):
+        try:
+            f = faces.item(i)
+        except Exception:
+            continue
+        try:
+            area = _face_area(f)
+        except Exception:
+            area = 0.0
+        total_area += area
+        try:
+            if _is_end_cap_face(f, body):
+                n_end_cap += 1
+                end_cap_area += area
+        except Exception:
+            continue
+
+    show_only = n_end_cap == 0
+    verdict = "SHOW-ONLY (safe to chain-wrap)" if show_only else (
+        "FULL SOLID — {} cut-end face(s), {:.0f} cm²: the texture WILL reach the "
+        "cut ends. Needs a show-only skin body like Bullnose's 'Nose Skin'.".format(
+            n_end_cap, end_cap_area
+        )
+    )
+    return show_only, "{} face(s), {:.0f} cm² total, {} end-cap → {}".format(
+        n, total_area, n_end_cap, verdict
+    )
+
+
 def _face_qualifies_for_decal(
     face: adsk.fusion.BRepFace,
     body: Optional[adsk.fusion.BRepBody] = None,
@@ -4015,6 +4072,14 @@ def create_batch_decals_for_all_bodies(
                 rb = _decal_readback_log_line(decal)
                 extra = " ({})".format(err) if err else ""
                 face_diag = _face_show_diagnostic_line(primary, body)
+                _ok_skin, _skin_note = audit_decal_body_is_show_only(body)
+                lines.append(
+                    "  {}: {} {}".format(
+                        body_label,
+                        "SKIN OK —" if _ok_skin else "*** NOT A SKIN BODY ***",
+                        _skin_note,
+                    )
+                )
                 lines.append(
                     "  {}: 1 chain decal on primary face ({:.0f} cm², {}){}{}{}".format(
                         body_label,
@@ -4337,6 +4402,14 @@ def create_batch_decals_for_all_bodies(
             if err:
                 extra = " ({})".format(err)
             face_diag = _face_show_diagnostic_line(face, body)
+            _ok_skin, _skin_note = audit_decal_body_is_show_only(body)
+            lines.append(
+                "  {}: {} {}".format(
+                    body_label,
+                    "SKIN OK —" if _ok_skin else "*** NOT A SKIN BODY ***",
+                    _skin_note,
+                )
+            )
             lines.append(
                 "  {}: 1 chain decal on primary face ({:.0f} cm², {}){}{}{}".format(
                     body_label,
