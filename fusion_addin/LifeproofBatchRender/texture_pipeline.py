@@ -164,7 +164,19 @@ APPEARANCE_BROADCAST: bool = False
 #     (this Fusion build doesn't expose decal.faces), so the proven batch
 #     projection path (auto-size + grain-align to length) is what gives correct
 #     coverage and direction — exactly how it worked before the appearance fix.
-FORCE_BODY_COVERAGE: bool = True
+# OFF since 2026-10-14: the client re-authored every model with a decal that is
+# already placed exactly where the texture belongs — covering the visible profile
+# and stopping cleanly at the cut ends. Batch projection existed to work around
+# the OLD models, whose authored decals did not cover properly, and it cannot
+# reproduce that placement: a projected decal is applied to a BODY and Fusion
+# wraps it onto every face of that body (Decal.redefine), so it always reaches
+# the cut ends. Worse, it DELETED the good authored decals first.
+#
+# With this off, decal mode simply swaps imageFilename on the authored decals and
+# inherits the designer's placement, size and orientation.
+#
+# Turn back ON only for a model with NO usable authored decal.
+FORCE_BODY_COVERAGE: bool = False
 
 # When True, batch decals (chain faces + Scale Plane XY) texture visible tread
 # bodies even when a library carrier is available. Keeps manual-decal-like
@@ -388,6 +400,31 @@ def decal_target_for_names(*names: str) -> Optional[Any]:
         if spec is not None:
             return spec
     return None
+
+
+def _json_slot_for_decal(decal: Any) -> Optional[int]:
+    """Slot for an AUTHORED decal, from the component it lives on.
+
+    The Render Instructions name components, not decals, so an authored decal
+    inherits the slot of whichever ``componentPartNumber`` owns it. This is the
+    only source that works for a decal whose own name has no trailing 1/2.
+    """
+    if not _DECAL_TARGETS_BY_PART:
+        return None
+    names: List[str] = []
+    for getter in (
+        lambda: decal.parentComponent.name,
+        lambda: decal.parentComponent.partNumber,
+    ):
+        try:
+            value = getter()
+        except Exception:
+            continue
+        if value:
+            names.append(value)
+    spec = decal_target_for_names(*names)
+    slot = getattr(spec, "slot", None) if spec is not None else None
+    return slot if slot in (1, 2) else None
 
 
 def _size_spec_for_body(
@@ -5177,9 +5214,18 @@ def apply_decal_color_set(
         except Exception:
             dn = ""
         dslot = decal_name_slot(dn)
+        # The Render Instructions map COMPONENT -> slot, which covers authored
+        # decals whose own name carries no trailing 1/2 — Bullnose's
+        # "dusk-cherry - 1 - Horizontal" is on Stair Nose (decals[0] -> _1) but
+        # ends in "Horizontal", so a name-only rule would fall through to the
+        # positional guess and could swap the two tones.
+        jslot = _json_slot_for_decal(d)
         if tok and tok in _AUTHORED_DECAL_SLOT:
             slot_by_idx[idx] = _AUTHORED_DECAL_SLOT[tok]
             src_by_idx[idx] = "slot"
+        elif jslot in (1, 2):
+            slot_by_idx[idx] = jslot
+            src_by_idx[idx] = "render-instructions slot"
         elif dslot == 1:
             slot_by_idx[idx] = 1
             src_by_idx[idx] = "slot"
