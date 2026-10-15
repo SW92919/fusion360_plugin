@@ -157,7 +157,7 @@
   "use strict";
   // Page <-> add-in messages (see plugin/panel.py):
   //   to Python:   ready, browse, render, start_now   (adsk.fusionSendData)
-  //   from Python: started, status, progress, finished, idle   (fusionJavaScriptHandler)
+  //   from Python: started, status, progress, finished, idle, clear_paths   (fusionJavaScriptHandler)
   // The Render button follows the batch's own messages ("started" ... "idle"),
   // not request replies: a reply can come back late or not at all.
   var FIELDS = ["instructions", "textureRoot", "models", "width", "height", "quality", "format"];
@@ -240,6 +240,8 @@
         batchStarted = false;
         clearTimeout(startTimer);
         setRunning(false);
+      } else if (action === "clear_paths") {
+        (d.fields || []).forEach(function (f) { if ($(f)) { $(f).value = ""; } });
       }
       return JSON.stringify({ ok: true });
     }

@@ -129,7 +129,7 @@ Click **Render**. The add-in first checks the paths; a problem is shown in red u
 - Do **not** keep the CSV log open in Excel during a batch. Rows that cannot be written are lost without a warning.
 - Render time depends on the computer, the image size and the quality. On our test computer, one image at 2000 × 1130 and **Final (75)** took about 1 to 1.5 minutes.
 
-The panel remembers the settings of your last **Render** click until Fusion is closed or the add-in is stopped.
+When you close the panel and open it again, the three path fields start empty. Image size, quality and format keep the values of your last **Render** click until Fusion is closed or the add-in is stopped.
 
 ### When it finishes
 

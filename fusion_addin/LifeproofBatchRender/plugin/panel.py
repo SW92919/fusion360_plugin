@@ -34,6 +34,9 @@ PANEL_WIDTH = 640
 PANEL_HEIGHT = 560
 PANEL_MIN_WIDTH = 480
 PANEL_MIN_HEIGHT = 440
+# Emptied when the panel is reopened after Close; size, quality and format keep
+# their last values.
+PATH_FIELDS = ("instructions", "textureRoot", "models")
 
 _handlers: List[Any] = []
 # The registered CustomEvent itself must stay referenced (Autodesk's sample keeps
@@ -88,6 +91,9 @@ class PanelReporter:
 
     def idle(self) -> None:
         self._send("idle", {})
+
+    def clear_paths(self) -> None:
+        self._send("clear_paths", {"fields": list(PATH_FIELDS)})
 
 
 def html_url() -> str:
@@ -351,13 +357,23 @@ def show(app: adsk.core.Application, fui: adsk.core.UserInterface) -> None:
             palette.htmlFileURL = html_url()  # a panel left from an older build
     except Exception:
         pass
+    try:
+        was_visible = bool(palette.isVisible)
+    except Exception:
+        was_visible = True
     palette.isVisible = True
     # Reopened: make sure the Render button matches whether a batch is running.
     reporter = PanelReporter(palette)
     if _state["running"]:
         reporter.started()
-    else:
-        reporter.idle()
+        return
+    if not was_visible:
+        # Reopened after Close: start from empty paths, and forget them so a
+        # reloaded page does not bring them back either.
+        for field in PATH_FIELDS:
+            _state["values"].pop(field, None)
+        reporter.clear_paths()
+    reporter.idle()
 
 
 def stop(app: adsk.core.Application, fui: adsk.core.UserInterface) -> None:

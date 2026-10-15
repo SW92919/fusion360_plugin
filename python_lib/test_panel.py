@@ -344,6 +344,55 @@ class RunTests(_TempFiles):
         self.assertEqual(palette.sent, [])
 
 
+class ReopenTests(unittest.TestCase):
+    """Opening the panel again with the Batch Render command (panel.show)."""
+
+    def setUp(self):
+        panel._state.update(pending=None, running=False, active=False, values={
+            "instructions": r"C:\R.json", "textureRoot": r"C:\T", "models": r"C:\M.f3d",
+            "width": "1000", "height": "500", "quality": "Draft (25)", "format": "JPG",
+        })
+
+    def tearDown(self):
+        panel._state.update(pending=None, running=False, active=False, values={})
+
+    def _show(self, visible):
+        palette = FakePalette()
+        palette.isVisible = visible
+        panel.show(FakeApp(), FakeUI(palette))
+        self.assertTrue(palette.isVisible)
+        return palette.sent
+
+    def test_reopened_after_close_starts_with_empty_paths(self):
+        sent = self._show(visible=False)
+        self.assertIn(("clear_paths", {"fields": ["instructions", "textureRoot", "models"]}), sent)
+        self.assertEqual(sent[-1][0], "idle")
+        # Forgotten too, so a reloaded page does not bring them back.
+        reply = panel.handle_action(FakeApp(), FakeUI(), "ready", {})
+        for field in ("instructions", "textureRoot", "models"):
+            self.assertEqual(reply["values"][field], "", field)
+        self.assertEqual(reply["values"]["width"], "1000")
+        self.assertEqual(reply["values"]["format"], "JPG")
+
+    def test_command_on_an_open_panel_keeps_what_is_typed(self):
+        sent = self._show(visible=True)
+        self.assertNotIn("clear_paths", [a for a, _ in sent])
+        self.assertEqual(panel._state["values"]["textureRoot"], r"C:\T")
+
+    def test_reopened_during_a_batch_keeps_the_batch_paths(self):
+        panel._state["running"] = True
+        sent = self._show(visible=False)
+        self.assertEqual([a for a, _ in sent], ["started"])
+        self.assertEqual(panel._state["values"]["instructions"], r"C:\R.json")
+
+    def test_panel_brought_back_by_the_batch_result_keeps_its_paths(self):
+        palette = FakePalette()
+        palette.isVisible = False
+        panel.PanelReporter(palette).finish("Renders OK: 6")
+        self.assertNotIn("clear_paths", [a for a, _ in palette.sent])
+        self.assertEqual(panel._state["values"]["models"], r"C:\M.f3d")
+
+
 class PageContractTests(unittest.TestCase):
     """The page and the add-in must agree on ids and message names."""
 
@@ -367,7 +416,7 @@ class PageContractTests(unittest.TestCase):
 
     def test_messages_to_the_page_are_handled(self):
         sent = set(re.findall(r'self\._send\("(\w+)"', self.py))
-        self.assertEqual(sent, {"status", "progress", "started", "finished", "idle"})
+        self.assertEqual(sent, {"status", "progress", "started", "finished", "idle", "clear_paths"})
         for action in sent:
             self.assertIn('action === "{}"'.format(action), self.html)
 
