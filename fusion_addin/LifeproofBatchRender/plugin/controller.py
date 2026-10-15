@@ -9,6 +9,7 @@ import adsk.core
 import adsk.fusion
 
 import batch_config
+import image_orient
 import render_instructions
 import support_paths
 import texture_pipeline
@@ -26,26 +27,45 @@ def _log_timestamp() -> str:
 
 
 def _code_build_stamp() -> str:
-    """Newest source timestamp across the add-in — identifies the running build.
+    """Report the RUNNING build, and shout if it is older than the files on disk.
 
-    Fusion caches modules for the life of the session, so an edited file and a
-    stale in-memory copy are otherwise indistinguishable from the log.
+    Fusion keeps one interpreter per session, so editing a .py does nothing until
+    the add-in is stopped and started again — re-running the command re-executes
+    STALE code. A stamp built only from file mtimes says "fresh" while old code
+    runs, which has already cost two debugging rounds. Comparing the mtime
+    captured when texture_pipeline was imported against its mtime now is what
+    actually detects that.
     """
     try:
-        addin_dir = Path(texture_pipeline.__file__).resolve().parent
+        tp_file = Path(texture_pipeline.__file__).resolve()
+        loaded = float(getattr(texture_pipeline, "MODULE_IMPORTED_MTIME", 0.0) or 0.0)
+        on_disk = tp_file.stat().st_mtime
+
         newest = 0.0
         newest_name = "?"
-        for py in addin_dir.rglob("*.py"):
+        for py in tp_file.parent.rglob("*.py"):
             try:
                 mtime = py.stat().st_mtime
             except OSError:
                 continue
             if mtime > newest:
                 newest, newest_name = mtime, py.name
-        if not newest:
-            return "(unknown)"
-        return "{} (newest source: {})".format(
-            datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M:%S"), newest_name
+
+        def _fmt(ts: float) -> str:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
+
+        # One second of slack for filesystem timestamp granularity.
+        stale = loaded and (on_disk - loaded) > 1.0
+        note = ""
+        if stale:
+            note = (
+                "  *** STALE: running code imported from a {} build, but "
+                "texture_pipeline.py on disk is {}. Fusion will not reload an edited "
+                "file until the add-in is STOPPED and STARTED again (re-running the "
+                "command is not enough). Any fix made since then is NOT active. ***"
+            ).format(_fmt(loaded), _fmt(on_disk))
+        return "running build {} | newest source on disk {} ({}){}".format(
+            _fmt(loaded), _fmt(newest), newest_name, note
         )
     except Exception as ex:
         return "(unavailable: {})".format(ex)
@@ -206,6 +226,9 @@ def _execute_batch_inner(
         return
 
     texture_pipeline.clear_decal_shift_temp_files()
+    # Prepared (rotated / fitted) copies of the colour-set rasters live in a temp
+    # cache; start clean so a raster edited since the last run is re-prepared.
+    image_orient.clear_cache()
 
     app = adsk.core.Application.get()
     csv_log = texture_root / "_LifeproofBatchRender_log.csv"
@@ -239,6 +262,9 @@ def _execute_batch_inner(
     renders_ok = 0
     renders_fail = 0
     models_skipped = 0
+    # Decals that kept the model's original texture. Renders still succeed in
+    # that case, so without this the totals read 'Failed: 0' over a wrong image.
+    decal_failures: List[str] = []
 
     # Estimate from the JSON rather than the first model — configuration counts
     # differ per model now, so the old "first model × everything" guess would skew
@@ -290,7 +316,9 @@ def _execute_batch_inner(
         # Install this model's decal targets. These drive BOTH which components get
         # a decal (replacing the filename-derived guess, which the model rename
         # broke) and the exact physical size each one is given.
-        texture_pipeline.set_decal_targets(render_instructions.decal_size_map(entry))
+        texture_pipeline.set_decal_targets(
+            render_instructions.decal_size_map(entry), model_path=mp
+        )
         if entry.decals:
             summary_lines.append(
                 "  Decal targets from instructions: {}".format(
@@ -577,6 +605,10 @@ def _execute_batch_inner(
                 n_tex, tex_lines = texture_pipeline.apply_color_set_for_open_design(
                     mode, s1, s2, carrier=carrier
                 )
+            for failed_decal in texture_pipeline.pop_decal_swap_failures():
+                decal_failures.append(
+                    "{} | {} | {}".format(mp.name, cs.folder.name, failed_decal)
+                )
             if n_tex == 0:
                 zero_texture_color_sets.append(cs.folder.name)
             # Emit the texture log lines even when 0 updates — they carry the
@@ -751,9 +783,16 @@ def _execute_batch_inner(
         summary_lines.extend(["  {}".format(x) for x in _post_purge])
 
     summary_lines.append("")
+    if decal_failures:
+        summary_lines.append(
+            "*** {} decal problem(s) - these parts do not show the colour set "
+            "correctly (see each line): ***".format(len(decal_failures))
+        )
+        summary_lines.extend("  {}".format(x) for x in decal_failures)
+        summary_lines.append("")
     summary_lines.append(
-        "Renders OK: {}  Failed: {}  Models skipped: {}".format(
-            renders_ok, renders_fail, models_skipped
+        "Renders OK: {}  Failed: {}  Models skipped: {}  Decal updates failed: {}".format(
+            renders_ok, renders_fail, models_skipped, len(decal_failures)
         )
     )
     summary_lines.append("CSV log: {}".format(csv_log))
@@ -778,6 +817,15 @@ def _execute_batch_inner(
             if models_skipped
             else []
         ),
+        *(
+            [
+                "",
+                "WARNING: {} decal problem(s) - those parts do not show the colour "
+                "set correctly. See the summary.".format(len(decal_failures)),
+            ]
+            if decal_failures
+            else []
+        ),
         "",
         "Full summary: {}".format(summary_path),
         "CSV log:      {}".format(csv_log),
@@ -790,5 +838,12 @@ def _execute_batch_inner(
     except Exception:
         pass
     fui.messageBox(short_text, "Batch Render")
-    logutil.append_log(log_path, "execute_batch done ok={} fail={}".format(renders_ok, renders_fail))
+    logutil.append_log(
+        log_path,
+        "execute_batch done ok={} fail={} decal_failures={}".format(
+            renders_ok, renders_fail, len(decal_failures)
+        ),
+    )
     texture_pipeline.clear_decal_shift_temp_files()
+    # Only now: Fusion may still read a prepared image until the last render.
+    image_orient.clear_cache()
