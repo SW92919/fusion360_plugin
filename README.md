@@ -1,83 +1,57 @@
-# Lifeproof / Fusion 360 batch render pipeline
+# Lifeproof Batch Render (Fusion 360 add-in)
 
-This repository is a **project scaffold** for a Fusion 360 add-in that batch-renders stair tread/nose models across **color folders** (texture pairs), **named views**, and optional **per-view visibility** rules.
+A Fusion 360 Python add-in that batch-renders flooring-trim models for every color set in a texture folder. A **Render Instructions** JSON file says which models to render, the size of each part's decal, which named views to use, and which parts to hide in each image. Images are made with Fusion's local renderer.
 
-**Final client documentation** (install, UI, scope, acceptance checklist): [`docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md`](docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md) · **All docs index:** [`docs/README.md`](docs/README.md).
-
-**Add-in not working in Fusion?** See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
-
-It is based on your screenshots and requirements (no `.f3d` or texture binaries are committed here).
-
-## What the screenshots imply
-
-| Item | Meaning |
-|------|--------|
-| Root folder `Lifeproof` | Contains one subfolder per **color set** (e.g. `Antler Trail Oak`). |
-| Files like `antler-trail-oak-1.jpg`, `antler-trail-oak-2.jpg` | Map to **appearance slot 1** and **slot 2** (`_1` / `_2` suffix convention). |
-| Large swatch image | Optional reference; pipeline can ignore or use for QA. |
-| `Treads Plus Bullnose - Appearance.f3d` | Model that expects **appearances** for wood grain. |
-| `Treads Plus Square Nose - Decal.f3d` | Model that expects **decals** for the same look. |
-| Existing PNGs (`Antler Trail Oak - Nose Front`, etc.) | Target **look**: same naming spirit as outputs; your locked rule is below. |
-
-## Output naming (locked)
-
-```text
-{model name} – {image name without extension} – {named view}
-```
-
-Examples (model = Fusion file name without `.f3d`, image = texture stem you map, view = Fusion named view):
-
-```text
-Treads Plus Bullnose - Appearance – antler-trail-oak-1 – Nose Front.png
-```
-
-If you add the earlier **visibility** dimension, extend to:
-
-```text
-{model} – {image} – {view} – {visibility label}
-```
-
-Auto-versioning (`v2`, `v3`) when a file already exists should be applied in the **same folder** as the color set inputs (per your spec).
+**User guide** (install, panel fields, JSON format, outputs, troubleshooting, acceptance checklist): [`docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md`](docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md).
 
 ## Repository layout
 
 | Path | Purpose |
-|------|--------|
-| `docs/README.md` | **Index** of all documentation (client review order + support). |
-| `docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md` | **Client guide:** dialog fields, outputs, folder layout. |
-| `docs/FOLDER_LAYOUT.md` | How to arrange folders and textures. |
-| `fusion_addin/LifeproofBatchRender/` | Fusion Python add-in (install this folder into Fusion **Scripts and Add-Ins**). |
-| `docs/LOCAL_BATCH.md` | Detailed batch behavior (colors × views, logging, limits). |
-| `python_lib/` | Pure Python: scan folders, build filenames, parse visibility tokens (unit-testable without Fusion). |
+|------|---------|
+| `fusion_addin/LifeproofBatchRender/` | The add-in. Install this folder in Fusion. |
+| `Resources/Models/` | The client's 8 models (`.f3d`), `Rendering Instructions.json`, and the change request (`.docx` / `.pdf`). |
+| `Resources/Models_old/` | Earlier versions of the models, from before the 2026-09 rename. |
+| `docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md` | User guide for the client. |
+| `python_lib/` | Unit tests. They run outside Fusion. |
+| `scripts/run_tests.ps1` | Runs the unit tests. |
 
-## Appearance + decal (both)
+## Add-in modules
 
-The add-in includes **`texture_pipeline.py`**: it can drive **document appearances** (texture swap via `AppearanceTexture.changeTextureImage`) or **root decals** (`Decal.imageFilename`), chosen from the model filename (`…Appearance…` vs `…Decal…`). Rename targets in Fusion to match the `SLOT*_…_NAMES` frozensets, or edit those sets — see **`docs/APPEARANCE_AND_DECAL.md`**.
+| File | Role |
+|------|------|
+| `LifeproofBatchRender.py` | Entry point. Reloads the add-in's modules on every **Run**. |
+| `plugin/bootstrap.py` | Registers the **Batch Render** command (SOLID → MODIFY, UTILITIES → ADD-INS). |
+| `plugin/panel.py`, `plugin/html/batch_render.html` | The Batch Render palette: fields, status text, progress bar. |
+| `plugin/ui.py` | Command and palette IDs, and the panel's default values and choices (size, quality, format). |
+| `plugin/panel_settings.py` | Fills the panel with those defaults and checks its settings before a run. |
+| `plugin/controller.py` | The batch: models × color sets × render configurations, CSV log and summary. |
+| `plugin/model_handler.py` | Opens each `.f3d` in a new document. |
+| `plugin/image_mapper.py` | Drops the `_2` image when a model has no second decal. |
+| `plugin/logger.py` | Writes `_LifeproofBatchRender_plugin.log` in the texture root. |
+| `render_instructions.py` | Loads and validates the Render Instructions JSON. No Fusion API, so it is unit-tested. |
+| `texture_pipeline.py` | Swaps the color images onto the designer's decals and sizes them from the JSON. |
+| `image_orient.py` | Rotates and fits color images to each decal (temporary copies). |
+| `visibility_apply.py` | Hides `hideBodies` parts and helper geometry, and restores visibility after each image. |
+| `viewport_render.py` | Fusion local render through the named view's camera. |
+| `support_paths.py` | Color-folder scanning and output file names. |
+| `batch_config.py` | Parses the panel's model-path and number fields. |
 
-## Local batch (all colors × views)
+## Install (developers)
 
-The **Lifeproof Batch Render** command runs a **local viewport batch**: every color subfolder × every **named view** in the `.f3d` (each view is one output file—**not** one file per `_1` / `_2` texture). Use **Max named views per color set** in the dialog to cap how many views export (e.g. `2` when the design defines three bookmarks but you only want the first two). **Visibility** comes from **description** fields; PNG/JPG export, versioning, and **`_LifeproofBatchRender_log.csv`** — see **`docs/LOCAL_BATCH.md`**.
+1. In Fusion: **UTILITIES → ADD-INS → Scripts and Add-Ins** → **+** → select `fusion_addin/LifeproofBatchRender` (the folder with the `.py` files and the `.manifest`).
+2. Select **LifeproofBatchRender** and click **Run**, then open **SOLID → MODIFY → Batch Render**.
+3. After editing code: **Stop**, then **Run** again. The `Code loaded:` line in `_LifeproofBatchRender_summary.txt` (texture root) shows which build ran. `STALE` there, or a `running build` time older than `newest source on disk`, means the old code is still loaded; the `STALE` check itself only looks at `texture_pipeline.py`.
 
-## Fusion API work (remaining)
+## Running the tests
 
-- **Photoreal** Fusion Render workspace or **APS** cloud rendering instead of viewport capture.
-- Richer **visibility combination** matrix if you need explicit Cartesian product of body states.
+```powershell
+powershell -File scripts/run_tests.ps1
+```
 
-## Quick install (developers)
-
-1. Clone or copy this repo.
-2. In Fusion: **Utilities → ADD-INS → Scripts and Add-Ins** → **green plus** → select `fusion_addin/LifeproofBatchRender` (folder containing `.py` and `.manifest`).
-3. Run the add-in once; use **SOLID → MODIFY → Lifeproof Batch Render**. A **command dialog** opens for paths, resolution, format, pipeline, and more (see **`docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md`**).
-
-**Launch Fusion** on your PC to use the add-in. From this repo you can only run automated checks:
-
-`powershell -File scripts/run_tests.ps1`
-
-## Running unit tests (naming / folders only)
+or, from the repository root:
 
 ```bash
-cd lifeproof-fusion-batch-render
 python -m unittest discover -s python_lib -p "test_*.py"
 ```
 
-Requires Python 3.10+ on your machine for tests; Fusion ships its own embedded Python for the add-in runtime.
+The tests use your own Python 3 installation (Fusion ships its own Python for the add-in). Some of them read the models and JSON in `Resources/Models/`.

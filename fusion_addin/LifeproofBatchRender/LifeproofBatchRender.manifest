@@ -1,10 +1,10 @@
 {
   "autodeskProduct": "Fusion360",
   "type": "addin",
-  "id": "A1B2C3D4-E5F6-4789-A012-3456789ABCDE",
-  "author": "Your Team",
+  "id": "70735F46-A549-4C36-BAF3-31E56C943563",
+  "author": "",
   "description": {
-    "": "Batch render Lifeproof-style models across color folders, named views, and visibility rules."
+    "": "Batch render trim models for every color folder, driven by a Render Instructions JSON file (decal images and sizes, named views, hidden bodies)."
   },
   "version": "0.3.0",
   "runOnStartup": false,

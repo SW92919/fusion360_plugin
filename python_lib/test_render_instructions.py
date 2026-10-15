@@ -6,6 +6,7 @@ Imported from the add-in folder because render_instructions.py is pure stdlib
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -125,18 +126,6 @@ class LabelTests(unittest.TestCase):
         cfgs = got.models[0].render_configurations
         self.assertEqual(len(cfgs), 1)
         self.assertEqual(cfgs[0].index, 1)  # not 0 — the surviving config was 2nd
-
-
-class ModeTests(unittest.TestCase):
-    def test_non_empty_decals_means_decal_mode(self):
-        got = ri.parse_instructions(json.dumps([_entry(decals=[
-            {"componentPartNumber": "Stair Nose",
-             "textureSize": {"width": 9, "length": 50, "unit": "in"}}])]))
-        self.assertEqual(got.models[0].texture_mode, "decal")
-
-    def test_empty_decals_means_appearance_mode(self):
-        got = ri.parse_instructions(json.dumps([_entry(decals=[])]))
-        self.assertEqual(got.models[0].texture_mode, "appearance")
 
 
 class MatchingTests(unittest.TestCase):
@@ -270,6 +259,46 @@ class MalformedInputTests(unittest.TestCase):
         self.assertFalse(ri.load_instructions(Path("")).ok)
 
 
+class TextFileTests(unittest.TestCase):
+    """The client sends the same JSON as a .txt file (Notepad) or as .json."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _load(self, data, file_name="Rendering Instructions.txt"):
+        path = self.dir / file_name
+        path.write_bytes(data)
+        return ri.load_instructions(path)
+
+    def test_txt_and_json_load_the_same(self):
+        data = json.dumps([_entry("Bullnose"), _entry("L-Cap")]).encode("utf-8")
+        for file_name in ("Rendering Instructions.txt", "Rendering Instructions.json"):
+            got = self._load(data, file_name)
+            self.assertTrue(got.ok, [p.message for p in got.problems])
+            self.assertEqual([m.file_name for m in got.models], ["Bullnose", "L-Cap"], file_name)
+
+    def test_notepad_encodings_with_an_accented_letter(self):
+        # ANSI (cp1252) with an even byte count used to be read as UTF-16 junk.
+        name = "Caf" + chr(0xE9) + " Trim"
+        text = json.dumps([_entry(name)], ensure_ascii=False)
+        for pad in ("", " "):
+            for encoding in ("cp1252", "utf-8", "utf-8-sig", "utf-16"):
+                got = self._load((text + pad).encode(encoding))
+                self.assertEqual([m.file_name for m in got.models], [name], (encoding, len(pad)))
+
+    def test_client_file_saved_as_txt_loads_like_the_json(self):
+        real = _ADDIN.parent.parent / "Resources" / "Models" / "Rendering Instructions.json"
+        if not real.is_file():
+            self.skipTest("client instructions file not present")
+        got = self._load(real.read_bytes())
+        self.assertTrue(got.ok, [p.message for p in got.problems])
+        self.assertEqual(got.models, ri.load_instructions(real).models)
+
+
 class RealClientFileTests(unittest.TestCase):
     """The actual file the client shipped, if it is present in the repo."""
 
@@ -287,9 +316,9 @@ class RealClientFileTests(unittest.TestCase):
         self.assertTrue(got.ok, [p.message for p in got.problems])
         self.assertEqual(len(got.models), 8)
 
-    def test_every_model_is_decal_mode(self):
+    def test_every_model_lists_its_decals(self):
         got = ri.load_instructions(self.path)
-        self.assertEqual([m.texture_mode for m in got.models], ["decal"] * 8)
+        self.assertEqual([m.file_name for m in got.models if not m.decals], [])
 
     def test_bullnose_has_four_configs_with_unique_labels(self):
         got = ri.load_instructions(self.path)
@@ -394,9 +423,8 @@ class RealClientFileTests(unittest.TestCase):
 class DecalTargetingIntegrationTests(unittest.TestCase):
     """Fusion browser names must resolve against the JSON's componentPartNumber.
 
-    This is the lookup that replaces the filename-derived decal targeting the
-    model rename broke. The browser decorates names ('L-Cap (1):1') while the
-    client writes the bare part ('L-Cap'), and these must meet in the middle.
+    The browser decorates names ('L-Cap (1):1') while the client writes the bare
+    part ('L-Cap'), and these must meet in the middle.
     """
 
     def setUp(self):
@@ -432,7 +460,7 @@ class DecalTargetingIntegrationTests(unittest.TestCase):
             self.assertEqual(sizes[key].part_number, expected_part, browser_name)
 
     def test_non_target_components_do_not_resolve(self):
-        # Hiding-only and scenery parts must NOT be given a decal.
+        # Hiding-only and scenery parts must NOT resolve; their decals stay as authored.
         _entry, sizes = self._map_for("3-in-1")
         for name in ("Track:1", "Foam Pad:1", "Main Light:1", "Riser 1.5", "Plank:1"):
             self.assertNotIn(ri.normalize_part_key(name), sizes, name)
@@ -497,9 +525,9 @@ class OutputNameIntegrationTests(unittest.TestCase):
     """
 
     def setUp(self):
-        import naming
+        import support_paths
 
-        self.naming = naming
+        self.naming = support_paths
 
     def _names_for(self, configs):
         ins = ri.parse_instructions(json.dumps([_entry(configs=configs)]))

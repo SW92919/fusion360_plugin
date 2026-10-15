@@ -97,11 +97,6 @@ class ModelInstructions:
     decals: Tuple[DecalSizeSpec, ...]
     render_configurations: Tuple[RenderConfiguration, ...]
 
-    @property
-    def texture_mode(self) -> str:
-        """Non-empty decals[] means this model is driven by the decal pipeline."""
-        return "decal" if self.decals else "appearance"
-
 
 @dataclass(frozen=True)
 class RenderInstructions:
@@ -117,9 +112,8 @@ class RenderInstructions:
 def normalize_name_key(name: str) -> str:
     """Canonical compare key: ``Square Nose`` / ``square-nose`` / ``Square_Nose`` → ``square-nose``.
 
-    Keep in sync with texture_pipeline._normalize_product_name_key so keys built
-    here are directly comparable with keys built there. NBSP and Unicode dashes are
-    folded first because these names are copied out of Word/PDF.
+    NBSP and Unicode dashes are folded first because these names are copied out
+    of Word/PDF.
     """
     s = (name or "").strip().replace(" ", " ").lower()
     for ch in _DASH_CHARS:
@@ -159,10 +153,6 @@ def normalize_part_key(name: str) -> str:
 def model_match_key(model_path: Path) -> str:
     """Match key for a selected .f3d — extension dropped, case/spacing-insensitive."""
     return normalize_name_key(model_path.stem)
-
-
-def inches_to_cm(value: float) -> float:
-    return float(value) * INCH_TO_CM
 
 
 def _as_clean_str(value: object) -> str:
@@ -489,7 +479,12 @@ def parse_instructions(text: str, source: Optional[Path] = None) -> RenderInstru
 
 
 def load_instructions(path: Path) -> RenderInstructions:
-    """Read and parse the instructions file. Tolerates a UTF-8 BOM and UTF-16."""
+    """Read and parse the instructions file.
+
+    Any extension: the client sends the same JSON as ``.txt`` or ``.json``. Reads
+    UTF-8 (with or without BOM), UTF-16 with a BOM, and ANSI (cp1252) as Notepad
+    saves them.
+    """
     if not path or not str(path).strip():
         return RenderInstructions(
             source=None,
@@ -512,8 +507,14 @@ def load_instructions(path: Path) -> RenderInstructions:
             problems=(Problem(PROBLEM_ERROR, str(p), "could not read file — {}".format(ex)),),
         )
 
+    # UTF-16 only with its BOM: tried blind, an ANSI file with an accented letter
+    # and an even byte count decoded as UTF-16 junk ("not valid JSON ... line 1").
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        encodings: Tuple[str, ...] = ("utf-16",)
+    else:
+        encodings = ("utf-8-sig", "cp1252")
     text = None
-    for encoding in ("utf-8-sig", "utf-16", "utf-8", "cp1252"):
+    for encoding in encodings:
         try:
             text = raw.decode(encoding)
             break

@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import adsk.core
 import adsk.fusion
 
-import batch_config
 import image_orient
 import render_instructions
 import support_paths
@@ -19,7 +18,6 @@ import viewport_render
 from plugin import image_mapper
 from plugin import logger as logutil
 from plugin import model_handler
-from plugin import ui as uip
 
 
 def _log_timestamp() -> str:
@@ -157,29 +155,31 @@ def _resolve_render_tasks(
 
 
 def execute_batch(
-    fui: adsk.core.UserInterface,
-    ins: adsk.core.CommandInputs,
+    reporter: Any,
     texture_root: Path,
     models: List[Path],
     render_width: int,
     render_height: int,
     output_ext: str,
-    pipeline_selection: str,
     instructions_path: Path,
     render_quality: int,
 ) -> None:
+    """Run one batch. ``reporter`` shows progress on the Batch Render panel.
+
+    It needs ``set_status(text)``, ``set_progress(value, maximum)``,
+    ``finish(summary)`` (every render made) and ``fail(text)`` (could not run, or
+    some renders / decal updates failed).
+    """
     log_path = logutil.default_log_path(texture_root)
     logutil.append_log(log_path, "execute_batch start")
 
     _execute_batch_inner(
-        fui,
-        ins,
+        reporter,
         texture_root,
         models,
         render_width,
         render_height,
         output_ext,
-        pipeline_selection,
         instructions_path,
         render_quality,
         log_path,
@@ -187,14 +187,12 @@ def execute_batch(
 
 
 def _execute_batch_inner(
-    fui: adsk.core.UserInterface,
-    ins: adsk.core.CommandInputs,
+    reporter: Any,
     texture_root: Path,
     models: List[Path],
     render_width: int,
     render_height: int,
     output_ext: str,
-    pipeline_selection: str,
     instructions_path: Path,
     render_quality: int,
     log_path: Path,
@@ -203,14 +201,14 @@ def _execute_batch_inner(
     try:
         color_sets = support_paths.scan_texture_root(texture_root)
     except Exception as ex:
-        fui.messageBox("Invalid texture folder:\n{}".format(ex))
+        reporter.fail("Invalid texture folder:\n{}".format(ex))
         logutil.append_log(log_path, "scan_texture_root failed", ex)
         return
     if not color_sets:
-        fui.messageBox("No color subfolders found under:\n{}".format(texture_root))
+        reporter.fail("No color subfolders found under:\n{}".format(texture_root))
         return
     if not models:
-        fui.messageBox("No model files selected.")
+        reporter.fail("No model files selected.")
         return
 
     # The render instructions now drive views, hides and decal sizes, so a bad file
@@ -218,14 +216,13 @@ def _execute_batch_inner(
     instructions = render_instructions.load_instructions(instructions_path)
     if not instructions.ok:
         detail = "\n".join(render_instructions.describe_problems(instructions, limit=12))
-        fui.messageBox(
+        reporter.fail(
             "Render Instructions could not be used:\n\n{}\n\n"
             "Fix the file and run again.".format(detail)
         )
         logutil.append_log(log_path, "render instructions rejected: {}".format(detail))
         return
 
-    texture_pipeline.clear_decal_shift_temp_files()
     # Prepared (rotated / fitted) copies of the colour-set rasters live in a temp
     # cache; start clean so a raster edited since the last run is re-prepared.
     image_orient.clear_cache()
@@ -237,7 +234,6 @@ def _execute_batch_inner(
         "Color sets: {}".format(len(color_sets)),
         "Models: {} ({})".format(len(models), ", ".join(Path(m).name for m in models)),
         "Output: {} × {} {}".format(render_width, render_height, output_ext.upper()),
-        "Pipeline mode: {}".format(pipeline_selection),
         # Which build actually ran. Fusion caches modules for the whole session,
         # so without this a stale build and a fresh log look identical.
         "Code loaded: {}".format(_code_build_stamp()),
@@ -281,10 +277,9 @@ def _execute_batch_inner(
     done_steps = 0
 
     def bump_progress(msg: str) -> None:
-        uip.set_status(ins, msg)
         try:
-            pct = 0 if not total_steps else int(min(100, (100 * done_steps) // max(1, total_steps)))
-            uip.set_progress(ins, pct, 100)
+            reporter.set_status(msg)
+            reporter.set_progress(min(done_steps, total_steps), total_steps)
         except Exception:
             pass
         viewport_render.pump_ui()
@@ -307,18 +302,10 @@ def _execute_batch_inner(
             models_skipped += 1
             continue
 
-        # The .f3d filenames no longer carry "Decal"/"Appearance", so the old
-        # filename sniff (support_paths.infer_texture_mode) would call every model
-        # "appearance" via its fallback and texture nothing. The JSON is the
-        # authority now: a non-empty decals[] means decal mode.
-        mode = batch_config.resolve_pipeline_mode(
-            pipeline_selection, mp, lambda _p, _entry=entry: _entry.texture_mode
-        )
-        summary_lines.append("=== {} → {} ===".format(mp.name, mode))
+        summary_lines.append("=== {} ===".format(mp.name))
 
-        # Install this model's decal targets. These drive BOTH which components get
-        # a decal (replacing the filename-derived guess, which the model rename
-        # broke) and the exact physical size each one is given.
+        # Install this model's decal targets: which colour image (_1 / _2) each
+        # listed part's decals take, and the size each one is given.
         texture_pipeline.set_decal_targets(
             render_instructions.decal_size_map(entry), model_path=mp
         )
@@ -332,6 +319,11 @@ def _execute_batch_inner(
                         for d in entry.decals
                     )
                 )
+            )
+        else:
+            summary_lines.append(
+                "  No decals listed in the Render Instructions: the model's own "
+                "decals are matched to _1 / _2 by name, else by order"
             )
 
         doc, err = model_handler.open_model(app, mp)
@@ -347,11 +339,10 @@ def _execute_batch_inner(
         # Render Instructions decal sizes (deliverable 2). Resizing a decal rolls the
         # timeline back and recomputes the model, so it is done first: the geometry
         # settle and the visibility snapshot below then see the finished model.
-        if mode == "decal":
-            for size_line in texture_pipeline.apply_json_decal_sizes(design):
-                summary_lines.append("  {}".format(size_line))
-            for size_warning in texture_pipeline.pop_decal_size_warnings():
-                size_warnings.append("{} | {}".format(mp.name, size_warning))
+        for size_line in texture_pipeline.apply_json_decal_sizes(design):
+            summary_lines.append("  {}".format(size_line))
+        for size_warning in texture_pipeline.pop_decal_size_warnings():
+            size_warnings.append("{} | {}".format(mp.name, size_warning))
 
         viewport_render.prepare_clean_render_view(app)
 
@@ -367,11 +358,6 @@ def _execute_batch_inner(
         )
 
         root = design.rootComponent
-        summary_lines.append(
-            "  Named-view visibility rules: {}".format(
-                "ON (hide:/show: in descriptions)" if texture_pipeline.APPLY_NAMED_VIEW_VISIBILITY else "OFF (use file visibility as opened)"
-            )
-        )
         # The JSON's renderConfigurations are now the complete deliverable list:
         # an ordered set of (named view, components to hide) pairs, where the same
         # view may legitimately repeat with a different hide-list.
@@ -399,165 +385,13 @@ def _execute_batch_inner(
             models_skipped += 1
             continue
 
-        an, dn = texture_pipeline.list_appearance_and_decal_names(design)
+        dn = texture_pipeline.list_decal_names(design)
         summary_lines.append(
-            "Template targets - Appearances ({}): {} | Decals ({}): {}".format(
-                len(an),
-                ", ".join(an) if an else "(none)",
-                len(dn),
-                ", ".join(dn) if dn else "(none)",
-            )
+            "Template decals ({}): {}".format(len(dn), ", ".join(dn) if dn else "(none)")
         )
 
         occ_snap, body_snap, mesh_snap, decal_snap = visibility_apply.capture_visibility(root)
         batch_hide_tokens = visibility_apply.collect_batch_hide_persistent_tokens(root)
-
-        carrier: Optional[adsk.fusion.Appearance] = None
-        body_appearance_snap: list = []
-        batch_decals: List[Any] = []
-        # Force decal/carrier coverage is MODE-GATED:
-        #  * appearance mode → OFF: the .f3d already has Vinyl Skin-1/-2 on the
-        #    right faces; we only swap the appearance image. Projecting decals
-        #    here would bleed onto the cut edge (client rejected that).
-        #  * decal mode → ON: the authored decals can't be recreated on this
-        #    Fusion build (no decal.faces), so the proven batch projection path
-        #    (auto-size + grain-align) is what gives correct coverage/direction.
-        use_decal_coverage = (
-            mode == "decal"
-            and texture_pipeline.FORCE_BODY_COVERAGE
-            and texture_pipeline.BODY_COVERAGE_VIA_DECALS
-        )
-
-        if use_decal_coverage:
-            first_image = None
-            for cs in color_sets:
-                if cs.slot1:
-                    first_image = cs.slot1
-                    break
-            if first_image is None:
-                summary_lines.append(
-                    "  Decal projection skipped: no color-set image available"
-                )
-            else:
-                _neutralize = getattr(
-                    texture_pipeline, "neutralize_dark_body_appearances", None
-                )
-                body_appearance_snap = texture_pipeline.capture_body_appearances(
-                    design
-                )
-                if callable(_neutralize):
-                    _, neut_lines = _neutralize(design)
-                    for line in neut_lines:
-                        summary_lines.append("  " + line)
-                batch_decals, decal_lines = texture_pipeline.create_batch_decals_for_all_bodies(
-                    design, first_image, appearance_snap=body_appearance_snap, model_path=mp
-                )
-                for line in decal_lines:
-                    summary_lines.append("  " + line)
-                # Roll the per-body skin audit up to model level. isChainFaces paints
-                # the WHOLE body, so a non-skin body means the texture reaches the cut
-                # ends no matter what this code does — that is a model fix, not a code
-                # fix, and this is how we tell whether it has been done.
-                _not_skin = [
-                    ln for ln in decal_lines if "NOT A SKIN BODY" in ln
-                ]
-                if _not_skin:
-                    summary_lines.append(
-                        "  *** {} body/bodies on {} are FULL SOLIDS, not show-only skins. "
-                        "Texture will appear on the cut ends and may not cover the whole "
-                        "outer face. Fix is in the model: add a show-only skin body like "
-                        "Bullnose's 'Nose Skin'. ***".format(len(_not_skin), mp.name)
-                    )
-                    logutil.append_log(
-                        log_path,
-                        "{}: {} non-skin decal body/bodies".format(mp.name, len(_not_skin)),
-                    )
-                if not batch_decals and entry.decals:
-                    # The JSON asked for decals and none were placed, so every render
-                    # of this model will come out untextured. That is otherwise only
-                    # visible by looking at the images.
-                    summary_lines.append(
-                        "  *** NO DECALS PLACED on {} — the render instructions ask for "
-                        "{}, but no show body qualified. Every image for this model will "
-                        "be untextured. See the per-occurrence lines above. ***".format(
-                            mp.name,
-                            ", ".join(d.part_number for d in entry.decals),
-                        )
-                    )
-                    logutil.append_log(
-                        log_path, "NO DECALS PLACED on {}".format(mp.name)
-                    )
-        elif mode == "decal" and texture_pipeline.FORCE_BODY_COVERAGE:
-            summary_lines.append("  Pre-batch appearance audit:")
-            for line in texture_pipeline.audit_design_appearances(design):
-                summary_lines.append("    " + line)
-
-            test_image = None
-            for cs in color_sets:
-                if cs.slot1:
-                    test_image = cs.slot1
-                    break
-            carrier, carrier_lines = texture_pipeline.get_or_create_carrier(
-                design, test_image=test_image
-            )
-            for line in carrier_lines:
-                summary_lines.append("  Carrier setup: {}".format(line))
-            if carrier is not None:
-                body_appearance_snap = texture_pipeline.capture_body_appearances(design)
-                n_ok, n_fail, body_lines = texture_pipeline.apply_carrier_to_all_bodies(
-                    design, carrier
-                )
-                summary_lines.append(
-                    "  Carrier '{}' force-assigned: bodies {} OK / {} failed".format(
-                        carrier.name, n_ok, n_fail
-                    )
-                )
-                for line in body_lines:
-                    summary_lines.append("    {}".format(line))
-
-                summary_lines.append("  Post-carrier appearance audit:")
-                for line in texture_pipeline.audit_design_appearances(design):
-                    summary_lines.append("    " + line)
-            else:
-                # No carrier means this Fusion build exposes no usable
-                # appearance texture slots (every addByCopy probe failed), so
-                # the per-name appearance match can't texture solid materials
-                # like the end-cap "Paint - Metallic (Black)". Decals are the
-                # only mechanism that works here — auto-fall back to projecting
-                # batch tile decals onto every face so coverage is complete.
-                summary_lines.append(
-                    "  Carrier setup: NONE found - auto-falling back to "
-                    "batch-decal coverage (build has no texture slots)"
-                )
-                fb_image = test_image
-                if fb_image is None:
-                    summary_lines.append(
-                        "  Decal fallback skipped: no color-set image available"
-                    )
-                else:
-                    # Neutralize dark/reflective body appearances BEFORE decals
-                    # project, so any decal gap shows matte grey instead of a
-                    # black-metallic or shiny-steel stripe. Snapshot is
-                    # restored at end-of-batch via body_appearance_snap.
-                    # getattr-guarded so a texture_pipeline version that lacks
-                    # this helper degrades gracefully instead of hard-crashing.
-                    _neutralize = getattr(
-                        texture_pipeline, "neutralize_dark_body_appearances", None
-                    )
-                    body_appearance_snap = texture_pipeline.capture_body_appearances(
-                        design
-                    )
-                    if callable(_neutralize):
-                        _, neut_lines = _neutralize(design)
-                        for line in neut_lines:
-                            summary_lines.append("  " + line)
-                    batch_decals, decal_lines = (
-                        texture_pipeline.create_batch_decals_for_all_bodies(
-                            design, fb_image, appearance_snap=body_appearance_snap, model_path=mp
-                        )
-                    )
-                    for line in decal_lines:
-                        summary_lines.append("  " + line)
 
         zero_texture_color_sets: List[str] = []
         # Hide results are identical for every colour set, so report each
@@ -571,52 +405,8 @@ def _execute_batch_inner(
 
             bump_progress("Textures: {} / {}".format(model_stem, cs.folder.name))
 
-            s1, s2 = image_mapper.effective_texture_slots(design, mode, cs.slot1, cs.slot2)
-            n_tex = 0
-            tex_lines: List[str] = []
-            if batch_decals:
-                decal_image = s1 or cs.slot1
-                n_expected = len(batch_decals)
-                # slot-2 bodies (Vinyl Skin-2) receive the _2 raster; the rest _1.
-                n_tex, dec_lines, batch_decals = texture_pipeline.update_batch_decal_images(
-                    batch_decals, decal_image, s2
-                )
-                tex_lines.extend(dec_lines)
-                # n_tex is now a real success count, so a partial failure is
-                # visible instead of being averaged away by the list length.
-                if n_tex < n_expected:
-                    tex_lines.append(
-                        "DECAL UPDATE FAILURES: {} of {} decal(s) did not recreate — "
-                        "any absolute size may not be applied for this color set".format(
-                            n_expected - n_tex, n_expected
-                        )
-                    )
-                if mode == "appearance":
-                    n_app, app_lines = texture_pipeline.apply_hybrid_appearance_for_batch(
-                        design, s1, s2
-                    )
-                    n_tex += n_app
-                    tex_lines.extend(app_lines)
-                # Optionally also swap imageFilename on user-authored decals
-                # in the .f3d. Disabled by default — every extra decal write
-                # triggers a Fusion re-projection that grows the freeze
-                # window, and with the batch tile coverage we usually don't
-                # need them. Toggle UPDATE_USER_AUTHORED_DECALS in
-                # texture_pipeline.py to re-enable.
-                if texture_pipeline.UPDATE_USER_AUTHORED_DECALS:
-                    try:
-                        batch_ids = set(id(d) for d in batch_decals)
-                    except Exception:
-                        batch_ids = set()
-                    n_user, user_lines = texture_pipeline.update_user_authored_decals(
-                        design, decal_image, batch_ids
-                    )
-                    n_tex += n_user
-                    tex_lines.extend(user_lines)
-            else:
-                n_tex, tex_lines = texture_pipeline.apply_color_set_for_open_design(
-                    mode, s1, s2, carrier=carrier
-                )
+            s1, s2 = image_mapper.effective_texture_slots(design, cs.slot1, cs.slot2)
+            n_tex, tex_lines = texture_pipeline.apply_decal_color_set(design, s1, s2)
             for failed_decal in texture_pipeline.pop_decal_swap_failures():
                 decal_failures.append(
                     "{} | {} | {}".format(mp.name, cs.folder.name, failed_decal)
@@ -625,9 +415,8 @@ def _execute_batch_inner(
                 size_warnings.append("{} | {}".format(mp.name, size_warning))
             if n_tex == 0:
                 zero_texture_color_sets.append(cs.folder.name)
-            # Emit the texture log lines even when 0 updates — they carry the
-            # appearance property-tree diagnostic (DIAG_DUMP_APPEARANCE_TREE)
-            # that tells us why changeTextureImage found no image node.
+            # Emit the texture log lines even when 0 decals were updated — they
+            # say which decal was skipped or refused, and why.
             for line in tex_lines:
                 summary_lines.append("  {} | {}".format(cs.folder.name, line))
 
@@ -654,8 +443,6 @@ def _execute_batch_inner(
                 visibility_apply.restore_visibility(
                     occ_snap, body_snap, mesh_snap, decal_snap
                 )
-                if texture_pipeline.APPLY_NAMED_VIEW_VISIBILITY:
-                    visibility_apply.apply_visibility_for_named_view(root, view_name)
                 hide_lines = _apply_hides()
                 hide_key = (view_name, vis_label)
                 if hide_lines and hide_key not in logged_hides:
@@ -664,21 +451,16 @@ def _execute_batch_inner(
                         summary_lines.append("  {}".format(line))
 
                 viewport_render.activate_named_view(app, nv)
-                viewport_render.apply_named_view_framing(
-                    app, view_name, preserve_orientation=True, design=design
-                )
+                viewport_render.apply_named_view_framing(app)
                 viewport_render.pump_ui()
-                # Reframe once helpers are off — otherwise ViewFit bounds still
-                # include proxy solids hidden after the first fit (wrong crop vs manual hide).
+                # Hide again once the camera is set: camera updates can bring back
+                # hidden Render-proxy meshes.
                 _apply_hides()
                 viewport_render.pump_ui()
-                # Re-apply the designer's exact saved camera right before capture so
-                # the visibility toggling above can't nudge the composition
-                # (PRESERVE_NAMED_VIEW_COMPOSITION trusts it 1:1).
+                # Re-apply the named view to the viewport (best effort only: the
+                # render below is handed the named view's own camera, nv.camera).
                 viewport_render.activate_named_view(app, nv)
-                viewport_render.apply_named_view_framing(
-                    app, view_name, preserve_orientation=True, design=design
-                )
+                viewport_render.apply_named_view_framing(app)
                 viewport_render.pump_ui()
 
                 # Last-chance hide after ``apply_named_view_framing`` (camera updates can
@@ -710,6 +492,9 @@ def _execute_batch_inner(
                     except Exception:
                         render_cam = None
 
+                bump_progress(
+                    "Rendering {} of {}: {}".format(done_steps + 1, total_steps, out_path.name)
+                )
                 ok = _save_local_image(
                     design,
                     app,
@@ -742,7 +527,9 @@ def _execute_batch_inner(
                     renders_fail += 1
 
                 done_steps += 1
-                bump_progress("Saved: {}".format(out_path.name))
+                bump_progress(
+                    "{}: {}".format("Saved" if ok else "Render FAILED", out_path.name)
+                )
 
                 visibility_apply.restore_visibility(
                     occ_snap, body_snap, mesh_snap, decal_snap
@@ -750,29 +537,6 @@ def _execute_batch_inner(
                 viewport_render.pump_ui()
 
         visibility_apply.restore_visibility(occ_snap, body_snap, mesh_snap, decal_snap)
-
-        if batch_decals:
-            if texture_pipeline.SKIP_BATCH_DECAL_CLEANUP:
-                summary_lines.append(
-                    "  Decal teardown: skipped (SKIP_BATCH_DECAL_CLEANUP=True — inspect in Fusion)"
-                )
-            else:
-                n_removed = texture_pipeline.cleanup_batch_decals(batch_decals)
-                summary_lines.append(
-                    "  Decal teardown: {} batch decal(s) removed".format(n_removed)
-                )
-
-        if body_appearance_snap and texture_pipeline.RESTORE_BODY_APPEARANCES_ON_FINISH:
-            n_restored = texture_pipeline.restore_body_appearances(body_appearance_snap)
-            summary_lines.append(
-                "  Carrier teardown: original appearance restored on {} body/bodies".format(
-                    n_restored
-                )
-            )
-        elif body_appearance_snap:
-            summary_lines.append(
-                "  Carrier teardown: skipped (RESTORE_BODY_APPEARANCES_ON_FINISH=False)"
-            )
 
         if zero_texture_color_sets:
             summary_lines.append(
@@ -782,10 +546,8 @@ def _execute_batch_inner(
                 )
             )
             summary_lines.append(
-                "  Hint: rename appearances/decals to match SLOT*_NAMES in texture_pipeline.py,"
-            )
-            summary_lines.append(
-                "  or rely on the positional fallback (decal mode only)."
+                "  Hint: check the Render Instructions part numbers and the model's "
+                "decals (names in SLOT*_DECAL_NAMES in texture_pipeline.py)."
             )
 
     summary_lines.append("")
@@ -827,13 +589,9 @@ def _execute_batch_inner(
     except Exception as ex:
         logutil.append_log(log_path, "summary write failed: {}".format(ex))
 
+    # The result comes first: the panel's Status box shows the top of this text.
     short_lines: List[str] = [
-        "Texture root: {}".format(texture_root),
-        "Color sets: {} | Models: {}".format(len(color_sets), len(models)),
-        "Output: {} x {} {}".format(render_width, render_height, output_ext.upper()),
-        "Pipeline: {}".format(pipeline_selection),
-        "",
-        "Renders OK: {}  Failed: {}".format(renders_ok, renders_fail),
+        "Done. Renders OK: {}  Failed: {}".format(renders_ok, renders_fail),
         *(
             ["Models skipped (no render-instructions entry): {}".format(models_skipped)]
             if models_skipped
@@ -858,6 +616,10 @@ def _execute_batch_inner(
             else []
         ),
         "",
+        "Texture root: {}".format(texture_root),
+        "Color sets: {} | Models: {}".format(len(color_sets), len(models)),
+        "Output: {} x {} {}".format(render_width, render_height, output_ext.upper()),
+        "",
         "Full summary: {}".format(summary_path),
         "CSV log:      {}".format(csv_log),
         "Plugin log:   {}".format(log_path),
@@ -865,16 +627,20 @@ def _execute_batch_inner(
     short_text = "\n".join(short_lines)
 
     try:
-        uip.set_progress(ins, 100, 100)
+        # The images actually made (views missing from a model are planned but
+        # never rendered), and red text when anything failed.
+        reporter.set_progress(done_steps, max(1, done_steps))
+        if renders_fail or decal_failures or not renders_ok:
+            reporter.fail(short_text)
+        else:
+            reporter.finish(short_text)
     except Exception:
         pass
-    fui.messageBox(short_text, "Batch Render")
     logutil.append_log(
         log_path,
         "execute_batch done ok={} fail={} decal_failures={}".format(
             renders_ok, renders_fail, len(decal_failures)
         ),
     )
-    texture_pipeline.clear_decal_shift_temp_files()
     # Only now: Fusion may still read a prepared image until the last render.
     image_orient.clear_cache()

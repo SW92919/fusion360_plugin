@@ -6,8 +6,6 @@ from typing import List, Optional, Tuple
 import adsk.core
 import adsk.fusion
 
-import viewport_render
-
 
 def open_model(app: adsk.core.Application, model_path: Path) -> Tuple[Optional[adsk.core.Document], str]:
     """Open a local ``.f3d`` archive in a new document.
@@ -56,8 +54,3 @@ def active_design(app: adsk.core.Application) -> Optional[adsk.fusion.Design]:
     return adsk.fusion.Design.cast(app.activeProduct)
 
 
-def named_view_tasks(design: adsk.fusion.Design) -> Tuple[List[Tuple[Optional[adsk.fusion.NamedView], str]], str]:
-    named_views = viewport_render.list_named_views(design)
-    if named_views:
-        return [(nv, nv.name) for nv in named_views], ""
-    return [(None, "Viewport")], "No named views — using single 'Viewport' capture per color set."

@@ -1,4 +1,4 @@
-# Apply / restore visibility from Component.description and BRepBody.description (if present).
+# Snapshot / restore visibility; hide helper geometry and the Render Instructions' hideBodies parts.
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 import adsk.fusion
 
 from render_instructions import normalize_part_key
-from visibility_rules import visibility_for_description
 
 # Optional exact Fusion Browser names (normalized lower-case / stripped — use
 # ``my body`` or ``my-body`` as stored after trim+lower). Use when helpers use
@@ -18,11 +17,11 @@ EXACT_BATCH_HIDE_BODY_NAMES: FrozenSet[str] = frozenset()
 EXACT_BATCH_HIDE_OCCURRENCE_NAMES: FrozenSet[str] = frozenset()
 EXACT_BATCH_HIDE_DECAL_NAMES: FrozenSet[str] = frozenset()
 
-# Bodies/occurrences matching these are turned off during each viewport capture
+# Bodies/occurrences matching these are turned off for each render
 # (after baseline restore). Use Fusion descriptions ``hide:batch`` / ``hide:render``
 # on helper surfaces, or name them with one of the substrings below.
 _BATCH_HIDE_DESCRIPTION_MARKERS: Tuple[str, ...] = ("hide:batch", "hide:render")
-# Helper geometry to hide during viewport capture. NOTE: scene lights
+# Helper geometry to hide for each render. NOTE: scene lights
 # (``Main Light``, key/fill/rim, etc.) are intentionally NOT hidden — turning a
 # light's bulb off disables its illumination and makes renders too dark (client
 # feedback). Only UV / reference / explicit batch-hide helpers are listed here.
@@ -319,14 +318,7 @@ def _decal_hide_for_batch(decal: object) -> bool:
 
 
 def collect_batch_hide_persistent_tokens(root: adsk.fusion.Component) -> frozenset[str]:
-    """Entity tokens for helpers matched **before** carrier paint.
-
-    After ``LifeproofBatchCarrier`` replaces UV-ish appearances, substring checks
-    on appearance names stop working — we still hide using these stable tokens.
-
-    Also captures bodies whose **faces** pin UV/checker appearances (common on
-    mapping sheets): carrier wipes those pins, but tokens keep hiding correct.
-    """
+    """Entity tokens of the helpers the batch-hide rules match, taken once per model."""
     tokens: Set[str] = set()
     for occ in _iter_occurrences_union(root):
         if _occurrence_should_hide_batch(occ):
@@ -409,50 +401,6 @@ def restore_visibility(
         try:
             if getattr(snap.decal, "isValid", True):
                 snap.decal.isLightBulbOn = snap.was_on
-        except Exception:
-            pass
-
-
-def apply_visibility_for_named_view(root: adsk.fusion.Component, view_name: str) -> None:
-    """Set isLightBulbOn from description rules for this view name (absolute, not delta)."""
-    for occ in _iter_occurrences_union(root):
-        try:
-            desc = occ.component.description or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            occ.isLightBulbOn = vis
-        except Exception:
-            pass
-    for body in _iter_bodies_recursive(root):
-        try:
-            desc = getattr(body, "description", "") or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            body.isLightBulbOn = vis
-        except Exception:
-            pass
-    for mesh in _iter_mesh_bodies_recursive(root):
-        try:
-            desc = getattr(mesh, "description", "") or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            mesh.isLightBulbOn = vis
-        except Exception:
-            pass
-    for decal in _iter_root_decals(root):
-        try:
-            desc = getattr(decal, "description", "") or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            decal.isLightBulbOn = vis
         except Exception:
             pass
 
@@ -618,14 +566,13 @@ def apply_batch_render_geometry_hides(
     root: adsk.fusion.Component,
     persistent_hide_tokens: Optional[frozenset[str]] = None,
 ) -> int:
-    """Hide UV/reference helper geometry during viewport capture.
+    """Hide UV/reference helper geometry for the next render.
 
-    Call **after** ``restore_visibility`` each frame so helpers stay off even when
-    the baseline snapshot had them visible.
+    Call **after** ``restore_visibility`` before each render so helpers stay off even
+    when the baseline snapshot had them visible.
 
-    ``persistent_hide_tokens`` comes from ``collect_batch_hide_persistent_tokens``
-    taken once before carrier assignment so helpers stay hidden after appearances
-    are rewritten.
+    ``persistent_hide_tokens`` comes from ``collect_batch_hide_persistent_tokens``,
+    taken once per model.
 
     Fusion-side setup (pick one):
     - Put ``hide:batch`` or ``hide:render`` in the component or body **description**, or
