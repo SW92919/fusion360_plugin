@@ -55,7 +55,7 @@ def validate_settings(raw: Dict[str, Any]) -> Tuple[Optional[BatchRequest], str]
     if not instructions_raw:
         return None, (
             "Enter the Render Instructions Location "
-            "(full path to the render instructions JSON file)."
+            "(full path to the render instructions .json or .txt file)."
         )
     instructions_path = Path(instructions_raw)
     if not instructions_path.is_file():

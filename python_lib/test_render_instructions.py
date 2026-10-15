@@ -6,6 +6,7 @@ Imported from the add-in folder because render_instructions.py is pure stdlib
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -256,6 +257,46 @@ class MalformedInputTests(unittest.TestCase):
 
     def test_empty_path_is_reported_not_raised(self):
         self.assertFalse(ri.load_instructions(Path("")).ok)
+
+
+class TextFileTests(unittest.TestCase):
+    """The client sends the same JSON as a .txt file (Notepad) or as .json."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _load(self, data, file_name="Rendering Instructions.txt"):
+        path = self.dir / file_name
+        path.write_bytes(data)
+        return ri.load_instructions(path)
+
+    def test_txt_and_json_load_the_same(self):
+        data = json.dumps([_entry("Bullnose"), _entry("L-Cap")]).encode("utf-8")
+        for file_name in ("Rendering Instructions.txt", "Rendering Instructions.json"):
+            got = self._load(data, file_name)
+            self.assertTrue(got.ok, [p.message for p in got.problems])
+            self.assertEqual([m.file_name for m in got.models], ["Bullnose", "L-Cap"], file_name)
+
+    def test_notepad_encodings_with_an_accented_letter(self):
+        # ANSI (cp1252) with an even byte count used to be read as UTF-16 junk.
+        name = "Caf" + chr(0xE9) + " Trim"
+        text = json.dumps([_entry(name)], ensure_ascii=False)
+        for pad in ("", " "):
+            for encoding in ("cp1252", "utf-8", "utf-8-sig", "utf-16"):
+                got = self._load((text + pad).encode(encoding))
+                self.assertEqual([m.file_name for m in got.models], [name], (encoding, len(pad)))
+
+    def test_client_file_saved_as_txt_loads_like_the_json(self):
+        real = _ADDIN.parent.parent / "Resources" / "Models" / "Rendering Instructions.json"
+        if not real.is_file():
+            self.skipTest("client instructions file not present")
+        got = self._load(real.read_bytes())
+        self.assertTrue(got.ok, [p.message for p in got.problems])
+        self.assertEqual(got.models, ri.load_instructions(real).models)
 
 
 class RealClientFileTests(unittest.TestCase):

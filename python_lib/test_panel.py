@@ -123,6 +123,18 @@ class SettingsTests(_TempFiles):
         self.assertEqual(problem, "")
         self.assertEqual(len(request.models), 8)
 
+    def test_txt_instructions_work_like_json(self):
+        # The client sends the Render Instructions as a .txt file.
+        txt = self.instructions.with_suffix(".txt")
+        txt.write_text(
+            json.dumps([{"fileName": "Bullnose", "renderConfigurations": [{"namedView": "Full Front"}]}]),
+            encoding="utf-8",
+        )
+        request, problem = panel_settings.validate_settings(self.settings(instructions=str(txt), models=""))
+        self.assertEqual(problem, "")
+        self.assertEqual(request.instructions_path, txt)
+        self.assertEqual(request.models, [self.model_a])
+
     def test_defaults_match_the_shared_choices(self):
         d = panel_settings.panel_defaults()
         self.assertEqual(d["values"]["quality"], "Final (75)")
@@ -280,6 +292,39 @@ class RequestTests(_TempFiles):
         finally:
             panel._dialog_texture_root = original
         self.assertFalse(reply["ok"])
+
+    def test_file_dialogs_use_fusions_filter_format(self):
+        # Fusion wants "Name (*.a;*.b);;Other (*.*)"; the Windows "Name|*.a|..."
+        # string it was given listed every file in the folder (2026-10-16).
+        made = []
+
+        class FakeFileDialog:
+            filename, filenames = "", []
+
+            def showOpen(self):
+                return "cancelled"
+
+        class DialogUI:
+            def createFileDialog(self):
+                made.append(FakeFileDialog())
+                return made[-1]
+
+        core = panel.adsk.core
+        original = getattr(core, "DialogResults", None)
+        core.DialogResults = type("DialogResults", (), {"DialogOK": "ok"})
+        try:
+            self.assertIsNone(panel._dialog_instructions_file(DialogUI()))
+            self.assertEqual(panel._dialog_model_paths(DialogUI()), [])
+        finally:
+            if original is None:
+                del core.DialogResults
+            else:
+                core.DialogResults = original
+        self.assertEqual(made[0].filter, "Render instructions (*.json;*.txt)")
+        self.assertEqual(made[1].filter, "Fusion designs (*.f3d);;All files (*.*)")
+        for dlg in made:
+            self.assertNotIn("|", dlg.filter)
+            self.assertEqual(dlg.filterIndex, 0)
 
 
 class RunTests(_TempFiles):

@@ -43,7 +43,7 @@ Clicking **Batch Render** opens the **Batch Render panel**. The panel stays open
 
 ### 2. The Render Instructions file (JSON)
 
-The file is a list with one entry per model. Example (the Bullnose entry, shortened to two render configurations):
+The file can be saved as `.json` or `.txt`, as long as its content is JSON. It is a list with one entry per model. Example (the Bullnose entry, shortened to two render configurations):
 
 ```json
 [

@@ -37,6 +37,10 @@ PANEL_MIN_HEIGHT = 440
 # Emptied when the panel is reopened after Close; size, quality and format keep
 # their last values.
 PATH_FIELDS = ("instructions", "textureRoot", "models")
+# Fusion's FileDialog.filter format: "Name (*.a;*.b);;Other (*.*)". A Windows-style
+# "Name|*.a|..." string is not understood and the dialog listed every file.
+INSTRUCTIONS_FILTER = "Render instructions (*.json;*.txt)"
+MODELS_FILTER = "Fusion designs (*.f3d);;All files (*.*)"
 
 _handlers: List[Any] = []
 # The registered CustomEvent itself must stay referenced (Autodesk's sample keeps
@@ -115,7 +119,7 @@ def _palette(fui: adsk.core.UserInterface) -> Optional[adsk.core.Palette]:
 def _dialog_instructions_file(fui: adsk.core.UserInterface) -> Optional[Path]:
     dlg = fui.createFileDialog()
     dlg.title = "Select the Render Instructions file"
-    dlg.filter = "Render instructions (*.json;*.txt)|*.json;*.txt|All files (*.*)|*.*"
+    dlg.filter = INSTRUCTIONS_FILTER
     dlg.filterIndex = 0
     if dlg.showOpen() != adsk.core.DialogResults.DialogOK:
         return None
@@ -134,7 +138,7 @@ def _dialog_model_paths(fui: adsk.core.UserInterface) -> List[Path]:
     dlg = fui.createFileDialog()
     dlg.isMultiSelectEnabled = True
     dlg.title = "Select one or more Fusion designs (.f3d)"
-    dlg.filter = "Fusion designs (*.f3d)|*.f3d|All files (*.*)|*.*"
+    dlg.filter = MODELS_FILTER
     dlg.filterIndex = 0
     if dlg.showOpen() != adsk.core.DialogResults.DialogOK:
         return []

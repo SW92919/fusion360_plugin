@@ -479,7 +479,12 @@ def parse_instructions(text: str, source: Optional[Path] = None) -> RenderInstru
 
 
 def load_instructions(path: Path) -> RenderInstructions:
-    """Read and parse the instructions file. Tolerates a UTF-8 BOM and UTF-16."""
+    """Read and parse the instructions file.
+
+    Any extension: the client sends the same JSON as ``.txt`` or ``.json``. Reads
+    UTF-8 (with or without BOM), UTF-16 with a BOM, and ANSI (cp1252) as Notepad
+    saves them.
+    """
     if not path or not str(path).strip():
         return RenderInstructions(
             source=None,
@@ -502,8 +507,14 @@ def load_instructions(path: Path) -> RenderInstructions:
             problems=(Problem(PROBLEM_ERROR, str(p), "could not read file — {}".format(ex)),),
         )
 
+    # UTF-16 only with its BOM: tried blind, an ANSI file with an accented letter
+    # and an even byte count decoded as UTF-16 junk ("not valid JSON ... line 1").
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        encodings: Tuple[str, ...] = ("utf-16",)
+    else:
+        encodings = ("utf-8-sig", "cp1252")
     text = None
-    for encoding in ("utf-8-sig", "utf-16", "utf-8", "cp1252"):
+    for encoding in encodings:
         try:
             text = raw.decode(encoding)
             break
