@@ -382,9 +382,8 @@ class RealClientFileTests(unittest.TestCase):
 class DecalTargetingIntegrationTests(unittest.TestCase):
     """Fusion browser names must resolve against the JSON's componentPartNumber.
 
-    This is the lookup that replaces the filename-derived decal targeting the
-    model rename broke. The browser decorates names ('L-Cap (1):1') while the
-    client writes the bare part ('L-Cap'), and these must meet in the middle.
+    The browser decorates names ('L-Cap (1):1') while the client writes the bare
+    part ('L-Cap'), and these must meet in the middle.
     """
 
     def setUp(self):
@@ -420,7 +419,7 @@ class DecalTargetingIntegrationTests(unittest.TestCase):
             self.assertEqual(sizes[key].part_number, expected_part, browser_name)
 
     def test_non_target_components_do_not_resolve(self):
-        # Hiding-only and scenery parts must NOT be given a decal.
+        # Hiding-only and scenery parts must NOT resolve; their decals stay as authored.
         _entry, sizes = self._map_for("3-in-1")
         for name in ("Track:1", "Foam Pad:1", "Main Light:1", "Riser 1.5", "Plank:1"):
             self.assertNotIn(ri.normalize_part_key(name), sizes, name)

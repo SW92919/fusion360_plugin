@@ -1,140 +1,208 @@
 # Lifeproof Batch Render — Client guide
 
-This document describes the **Lifeproof Batch Render** Fusion 360 add-in: what it does, how to use the command dialog, and what to expect in outputs and logs.
+This guide explains how to install the **Batch Render** add-in for Fusion 360, prepare your files, run a batch, and read the results.
 
 ---
 
 ## What the add-in does
 
-For each **Fusion model** (`.f3d`) you select and each **color folder** under your texture root, the add-in:
+You give it three things: a **Render Instructions** file (JSON), your **models** (`.f3d`), and a **texture root folder** with one subfolder per color set. For every model in the Render Instructions, the add-in:
 
-1. Opens the model and applies the color-set images (textures via **appearances** and/or **decals**, depending on the model and settings).
-2. Saves one **rendered image** per **named camera view** defined in that model (unless you limit views — see below).
-3. Writes files into the **same color folder** that supplied the images, and records a **CSV log** under the texture root.
+1. Opens the model once, as a new, unsaved Fusion document. Your `.f3d` file on disk is never changed.
+2. Resizes the designer's decals to the sizes given in the Render Instructions.
 
-Rendering uses the **local Fusion viewport** unless you enable the optional **APS** (cloud) path and have it configured.
+Then, for every color folder:
+
+3. Puts the color set's `-1` and `-2` images on those decals.
+4. For each render configuration in the Render Instructions: hides the parts listed for it, uses the model's saved **named view** as the camera, and renders the image with Fusion's **local renderer** on this computer.
+5. Saves each image into that color folder.
+
+A CSV log and a summary are written into the texture root folder. No cloud rendering is used.
 
 ---
 
 ## Installing the add-in
 
-1. Use the folder **`LifeproofBatchRender`** from this repository (under `fusion_addin/LifeproofBatchRender/`) so it contains the `.py` files and **`LifeproofBatchRender.manifest`**.
-2. In Fusion: **Utilities → ADD-INS → Scripts and Add-Ins** → **+** (Add) → select that folder → enable the add-in.
-3. Open the **SOLID** workspace → **MODIFY** panel → **Lifeproof Batch Render**.
+1. Copy the whole folder **`fusion_addin/LifeproofBatchRender`** from this repository, with all its files: `LifeproofBatchRender.py`, `LifeproofBatchRender.manifest`, the other `.py` files and the `plugin` folder.
+2. In Fusion: **UTILITIES → ADD-INS → Scripts and Add-Ins** → **+** (Add) → select that folder.
+3. Select **LifeproofBatchRender** in the list and click **Run**. Tick **Run on Startup** if you want it loaded every time Fusion starts.
+4. The command is called **Batch Render**. It appears at the bottom of the **SOLID → MODIFY** menu, and also in the **UTILITIES → ADD-INS** menu. It has no icon, only the text entry. If you cannot find it, use Fusion's command search and type `Batch Render`.
 
-The command opens a **palette dialog** on the right (standard Fusion command UI).
-
-**Distribution:** Before wide release, assign a **new unique GUID** to the `id` field in `LifeproofBatchRender.manifest` if this add-in might coexist with others using the same id.
-
----
-
-## Delivered capabilities
-
-| Capability | Included |
-|------------|----------|
-| Select **texture root** (subfolders = color / finish variations) | Yes |
-| Select **one or more** `.f3d` models | Yes |
-| Map **`_1` / `_2`** images to **appearance** or **decal** slots (pipeline from model filename or Force mode) | Yes |
-| Process **all** color subfolders under the root | Yes |
-| **Named views** as cameras for each export (optional cap in the dialog) | Yes |
-| **Visibility** from **description** on components/bodies (`hide:…`, `show:…`, or single view name) | Yes |
-| **Local export** per color folder: `{model} – {image stem} – {view}` + extension | Yes |
-| Auto **versioning** when a file exists (`(v2)`, `(v3)`, …) | Yes |
-| **CSV log** at texture root: `_LifeproofBatchRender_log.csv` | Yes |
+Clicking **Batch Render** opens the **Batch Render panel**. The panel stays open while a batch runs.
 
 ---
 
-## Known limitations
+## Before you run
 
-- **APS / cloud** — Optional in the UI; a working cloud path requires customer-side configuration (`aps_config.json`, Autodesk workflow, etc.).
-- **Photoreal Render workspace** — Exports use **viewport capture**, not the full Fusion Render engine (unless APS is fully implemented for your environment).
-- **Templates** — Appearance/decal names in each `.f3d` must match the add-in’s name lists (or you change `texture_pipeline.py`). See **`docs/APPEARANCE_AND_DECAL.md`**.
+### 1. The models (`.f3d`)
 
----
+- Each model needs a saved **named view** for every `namedView` used in the Render Instructions.
+- The parts that receive the color images must already have **decals placed by the designer**, switched on. The add-in changes the image and size of those decals; it does not create new ones. A decal that is hidden, in a hidden Decals folder, suppressed, or after the timeline marker is left as it is, and only the summary mentions it.
+- To use **Model files (empty = all)**, keep the `.f3d` files directly in the **same folder** as the Render Instructions file (not in a subfolder). A listed model whose `.f3d` is not found there is left out **without a warning**; the `Models:` line at the top of the summary shows which models ran.
+- Helper geometry is hidden automatically in every render. To hide a helper part, body or decal yourself, put `batch_render_hide` in its name, or `hide:batch` / `hide:render` in its **description**. Bodies with helper names (containing for example `uv plane`, `uv map`, `texture plane`, `decal plane` or `substrate`) are hidden too. Scene lights are not hidden by these rules.
 
-## Prerequisites
+### 2. The Render Instructions file (JSON)
 
-1. **Autodesk Fusion 360** (current channel recommended) with **Named Views** available on the design.
-2. **Models** aligned with the appearance or decal naming rules (`docs/APPEARANCE_AND_DECAL.md`).
-3. **Folder layout** per **`docs/FOLDER_LAYOUT.md`** (texture root → one subfolder per color → `_1` / `_2` rasters).
-4. **Named views** in each design for every camera angle you want exported (or use **Max named views** to limit).
+The file is a list with one entry per model. Example (the Bullnose entry, shortened to two render configurations):
 
----
+```json
+[
+  {
+    "fileName": "Bullnose",
+    "decals": [
+      { "componentPartNumber": "Stair Nose",
+        "textureSize": { "width": 9, "length": 50, "unit": "in" } },
+      { "componentPartNumber": "Supplemental Plank",
+        "textureSize": { "width": 7, "length": 50, "unit": "in" } }
+    ],
+    "renderConfigurations": [
+      { "namedView": "Full Front", "hideBodies": [] },
+      { "namedView": "Full Front", "hideBodies": ["Supplemental Plank"] }
+    ]
+  }
+]
+```
 
-## How to run a batch
+| Key | Meaning |
+|-----|---------|
+| `fileName` | The model's file name **without** `.f3d`. Upper/lower case, spaces, hyphens and underscores do not matter (`Square Nose` matches `square-nose.f3d`). Do not write `.f3d` here, or the model will not be found. |
+| `decals` | The parts whose decals get a color image and a size. The **first** entry gets the color set's `-1` image, the **second** gets the `-2` image. A third or later entry reuses `-1` (with a warning). |
+| `componentPartNumber` | The part that carries the decal: its component name, its name in the browser, or its Part Number. `L-Cap` matches `L-Cap (1):1`. |
+| `textureSize` | `width` and `length` of the decal, as numbers greater than 0. `length` goes on the **long** side of the designer's decal, `width` across it. `unit` is optional: `in` (default), `cm` or `mm`. |
+| `renderConfigurations` | One image per entry, per color set. |
+| `namedView` | The name of a named view saved in the model (case, spaces and hyphens do not matter). |
+| `hideBodies` | Optional list of parts to hide for this image: component names, browser names, Part Numbers or body names. |
 
-1. In Fusion: **SOLID** workspace → **MODIFY** → **Lifeproof Batch Render**.
-2. Set the options below (or use **browse** to pick folder and models).
-3. Click **OK** and wait until Fusion finishes. A summary appears when the batch completes.
+Rules to know:
 
----
+- Key names are **case-sensitive** (`namedView`, not `namedview`). Unknown keys are ignored without a warning, so a typo such as `hideBody` means nothing is hidden.
+- Decals on parts that are **not** listed keep the designer's image.
+- If a model's entry has **no** `decals`, nothing is resized, and the model's decals are matched to `-1` / `-2` by name (a name ending in 1 or 2), else by order (first decal `-1`, second `-2`).
+- Any **error** in the file stops the whole batch before any model opens, even an error in an entry for a model you did not pick. The panel lists up to 12 problems. Entries are counted from 0, so `entry 0` is the first model and `decals[1]` is the second decal. A `line N, column M` in a JSON syntax error is counted from 1, as in a text editor.
+- Exception: if **Model files** is empty and the file cannot be read at all (for example a JSON syntax error), the panel says `No model files given, and none could be found automatically` instead. Check the JSON first.
+- **Warnings** (for example `length` shorter than `width`) do not stop the batch. They appear only in the summary file.
 
-## Command dialog — field reference
+### 3. The texture root folder
 
-Fusion’s side panel may **shorten labels** with “…”. The full meaning of each control is below.
+```text
+Texture root\
+  Color Set 01\
+    Color Set 01-1.jpg     <- the -1 image
+    Color Set 01-2.jpg     <- the -2 image
+  Color Set 02\
+    ...
+```
 
-| # | Control | Purpose |
-|---|---------|--------|
-| 1 | **Pick texture folder and models with file dialogs** | When **on**, after **OK** you choose the **texture root folder** and **`.f3d` files** in Windows dialogs; the typed path fields are **not** used for those choices. When **off**, type the texture root and model paths manually. |
-| 2 | **Texture root folder** | Full path to the folder that **contains** your color subfolders (e.g. `Color Set 01`, `Color Set 02`). Each subfolder should include at least one “slot 1” image (see *Folder layout* below). |
-| 3 | **Model files (.f3d)** | One full path per line, or multiple paths separated by **`|`** or **`;`**. Used when browse is **off**. |
-| 4 | **Image width (px)** / **Image height (px)** | Output resolution for each saved image (for example **1920** × **1080**). Invalid values are clamped to a safe range. |
-| 5 | **Max named views per color set** | Limits how many **camera angles** are exported **per color folder** for each model. **`0`** = export **every** named view in the `.f3d`. **`2`** = only the **first two** named views (in Fusion’s order — reorder views in the design if you need specific shots first). This does **not** control how many texture images (`_1` / `_2`) exist; it only caps **views**. |
-| 6 | **Image format** | **PNG** or **JPG** for saved renders. |
-| 7 | **Texture pipeline** | **Auto** — chooses appearance vs decal workflow from the **`.f3d` file name** (e.g. names containing “Decal” vs “Appearance”). **Force Appearance** / **Force Decal** — overrides Auto for testing or special files. |
-| 8 | **Render backend** | **Local (viewport)** — saves what the viewport shows (typical). **APS** — optional cloud rendering; requires separate Autodesk setup (`aps_config.json` and a working workflow). |
-| 9 | **APS network concurrency (threads)** | Used **only when APS** is selected: how many parallel network requests to use (often **3**). This is **not** the number of output images per model. |
-| 10 | **If APS fails, fall back to local viewport capture** | When on, a failed APS attempt can still produce an image using **local** viewport capture. |
-| 11 | **Progress** / **Status** | Shows batch progress and short status text while running. |
-| 12 | **OK** / **Cancel** | **OK** starts the batch. **Cancel** closes without running. |
+- **Every** subfolder of the texture root is treated as a color set, so use a folder that contains only color-set folders. Subfolders inside a color folder are not read.
+- An image whose name ends in `-1` or `_1` is the **-1 image**; `-2` or `_2` is the **-2 image**. Keep **exactly one of each** in every folder, named `<folder name>-1.jpg` and `<folder name>-2.jpg` as above. If several images end in `-1` (or `-2`), the last one in alphabetical order is used, and that includes the copies the add-in writes (see below). When you replace a color image, delete the old one and the add-in's copies.
+- Use **JPG or PNG**. Other formats (`.tif`, `.bmp`, `.webp`) are accepted but cannot be rotated or fitted to the decal.
+- If there is no `-1` image, the first image in alphabetical order is used. If there is no `-2` image, the last image is used. With only one image in the folder, the parts that take `-2` keep their image on the first run, with no warning; on later runs the add-in's own copy counts as a second image. Always provide both images.
+- The add-in **writes into** these folders: the rendered images, plus copies of the two images named `<folder name>-1` and `<folder name>-2` (nothing is copied when your images already have those names).
+- The add-in **deletes** any image whose name contains `flipped` (but not `unflipped`) from the color folders. Do not keep such files there.
+- Files whose names look like earlier renders (two or more ` - ` in the name, or ending in ` (v2)`, ` (v3)` and so on) are never used as color images.
 
----
-
-## Folder layout (texture root)
-
-Under the **texture root**, each **subfolder** is one **color set**:
-
-- **`color-set-name-1.jpg`** (or `.png`) — **slot 1** (primary / main image). Required for that color to run.
-- **`color-set-name-2.jpg`** (optional) — **slot 2** (secondary image, e.g. pattern or label), if your workflow uses two images.
-
-Exact naming rules follow your project’s **Lifeproof** folder convention; the add-in scans subfolders and finds slot images automatically.
-
----
-
-## How many images are generated?
-
-For each **model** and each **color folder** (that has a valid slot‑1 image):
-
-**Number of images ≈ (number of named views used) × (that color folder).**
-
-- If the `.f3d` defines **three** named views (e.g. Close Up, Full Front, Full Back) and **Max named views** is **0**, you get **three** files per color folder for that model — **this is expected**, not a defect.
-- If another model has **two** named views, you get **two** files per color folder.
-- If **Max named views** is set to **2**, you never get more than **two** views per color folder, even if the design has more bookmarks (only the **first two** in Fusion’s list are used).
-
-**Important:** Output filenames are built from the **model name**, the **color-set image stem** (usually from slot 1), and the **view name** — not “one file per `_1` and one per `_2`”. Both textures can be applied to the scene before a single view is captured.
-
----
-
-## Where files appear
-
-| Output | Location |
-|--------|----------|
-| Rendered images | Inside each **color subfolder** under the texture root (with optional `(v2)` style versioning if a file already exists). |
-| CSV log | **`_LifeproofBatchRender_log.csv`** in the **texture root** folder. |
-| Text summary | **`_LifeproofBatchRender_summary.txt`** in the **texture root** folder (when generated by your workflow). |
+The original images are never changed. When an image has to be rotated or fitted to a decal, the add-in uses a temporary copy in the Windows temp folder and deletes it after the batch.
 
 ---
 
-## Acceptance checklist (optional sign-off)
+## Running a batch
 
-Use this when validating the add-in on your hardware:
+### The Batch Render panel
 
-- [ ] Add-in loads without script errors.
-- [ ] Command appears under **SOLID → MODIFY → Lifeproof Batch Render**.
-- [ ] With a test texture root and test models, exports are created for **each color × each named view** used (or **Viewport** fallback if the design has no named views).
-- [ ] Output filenames follow **`{model} – {image stem} – {view}`** plus extension.
-- [ ] Re-running produces **`(v2)`** (or higher) when names collide.
-- [ ] Log file records each attempt with timestamp and success flag.
-- [ ] Where description rules exist, visibility matches the **Named View** names in those rules (spot-check 2–3 views).
+| Field | What to enter |
+|-------|---------------|
+| **Render Instructions Location** | Full path of the Render Instructions file. **...** opens a file dialog (`.json` / `.txt`). |
+| **Texture root folder** | The folder that holds the color-set folders. **...** opens a folder dialog. |
+| **Model files (empty = all)** | Leave **empty** to render every model listed in the Render Instructions, taken from the same folder as that file. Or click **...** to pick one or more `.f3d` files from one folder; a new pick replaces the list. Typed paths are separated by `|`. |
+| **Image width (px)** / **Image height (px)** | Output size; default **2000 × 1130**. Fusion renders each side at least 108 and at most 4000 pixels. |
+| **Render Quality** | **Draft (25)**, **Standard (50)**, **Final (75)** (default) or **Excellent (100)**. Higher quality takes longer. |
+| **Image format** | **PNG** (default) or **JPG**. |
+
+Click **Render**. The add-in first checks the paths; a problem is shown in red under **Status** and nothing starts.
+
+### While it runs
+
+- The fields and buttons are locked. **Status** shows each step (for example `Rendering 3 of 72: …`) and the green bar shows how many images are done.
+- You may close the panel; the batch continues and the panel comes back when it finishes.
+- There is **no Cancel button**. The only way to stop a batch early is to close Fusion.
+- Do **not** switch document tabs, open or close documents, or edit a model while a batch runs. The add-in works on the active document.
+- Do **not** keep the CSV log open in Excel during a batch. Rows that cannot be written are lost without a warning.
+- Render time depends on the computer, the image size and the quality. On our test computer, one image at 2000 × 1130 and **Final (75)** took about 1 to 1.5 minutes.
+
+The panel remembers the settings of your last **Render** click until Fusion is closed or the add-in is stopped.
+
+### When it finishes
+
+The panel shows `Done. Renders OK: X  Failed: Y`, followed by any skipped models, decal problems and size warnings, and the paths of the summary and log files. The message is shown in **red** if any render failed, any decal could not be updated, or nothing was rendered.
+
+Afterwards:
+
+- Every model stays open as an extra Fusion document with the last color set applied. **Close these documents without saving.** Your `.f3d` files were not changed.
+- The batch turns off the display of the ground reflection, origin, planes, axes and layout grid. Turn them back on in Fusion if you need them.
 
 ---
+
+## What you get
+
+### Images
+
+Images are saved in each **color folder**, named:
+
+```text
+<model file name> - <-1 image name> - <named view>[ - no <hidden parts>].png
+```
+
+For example:
+
+```text
+Bullnose - Color Set 01-1 - Full Front.png
+Bullnose - Color Set 01-1 - Full Front - no Supplemental Plank.png
+```
+
+- The model name is the `.f3d` file name; the view is written as in the Render Instructions.
+- The ` - no …` part appears only when the configuration hides parts.
+- An existing file is never overwritten. A new run adds ` (v2)`, ` (v3)` and so on.
+- **Number of images** = render configurations × color folders, for each model. The current Render Instructions file gives **18 images per color folder** for the 8 models.
+
+### Logs (in the texture root folder)
+
+| File | Contents |
+|------|----------|
+| `_LifeproofBatchRender_log.csv` | One row per image, added to on every run. Columns: `timestamp`, `model`, `color_set`, `view`, `output`, `success`, `notes`. `success` is `1` (saved), `0` (render failed) or `skipped` (whole model skipped; `notes` says why). |
+| `_LifeproofBatchRender_summary.txt` | Full details of the **last** run (replaced each time): models, decal sizes, named views found, hidden parts, warnings and totals. |
+| `_LifeproofBatchRender_plugin.log` | Short technical log, added to on every run. |
+
+---
+
+## When something goes wrong
+
+Check the **summary file** after every batch that finishes; some problems appear only there. If the panel shows `The batch stopped with an error:`, no new summary was written: send the panel text and `_LifeproofBatchRender_startup.log` (in the add-in folder) with your report.
+
+| You see | Meaning and what to do |
+|---------|------------------------|
+| A red message before the batch starts | A path is empty or wrong; use the **...** buttons to pick the file or folder. With **Model files** empty, `No model files given, and none could be found automatically` can also mean that no `.f3d` next to the Render Instructions matches a `fileName`, or that the JSON cannot be read at all. |
+| `Render Instructions could not be used: …` | The JSON has errors. Fix the listed problems and run again. Entries and `decals[…]` are counted from 0; a `line N, column M` is counted from 1. |
+| `=== Model.f3d → SKIPPED ===`, `Nothing to render for this model`, or CSV `skipped` | The model has no entry in the Render Instructions (check `fileName`), or none of its `namedView` names exists in the model. |
+| A model has no images and no `SKIPPED` line | With **Model files** empty, only `.f3d` files next to the Render Instructions whose name matches a `fileName` are rendered; the others are left out without a message. Compare the summary's `Models:` line with the Render Instructions. |
+| `NO MATCH for namedView '…'` | That view is not saved in the model, so that image is skipped. |
+| `NO MATCH for hideBodies '…'` | Nothing matched that name; the image was rendered with the part visible. |
+| `kept as authored — "…" is not listed` | That decal's part is not in `decals`, so it keeps the designer's image. A misspelled `componentPartNumber` looks like this too. |
+| `SIZE WARNING` / `NOTE: N decal size warning(s)` | The size was not applied (the decal kept the designer's size), or it may not cover the whole part. The image was still rendered; check it. |
+| `WARNING: N decal problem(s)` in the panel; `… FAILED …` or `check this render` in the summary | A part did not get the color set correctly. With `image NOT changed`, it kept the designer's texture. The status is shown in red. |
+| `Open failed for …` | The model could not be opened. It is listed only in the summary. |
+| The add-in does not start | A message box says `Batch Render failed to start` (or `could not open its panel`). Send `_LifeproofBatchRender_startup.log` from the add-in folder with your report. |
+
+**After updating the add-in files**, open **Scripts and Add-Ins**, select **LifeproofBatchRender**, click **Stop**, then **Run** (or restart Fusion). Re-opening the panel is not enough. The `Code loaded:` line near the top of the summary file shows which build ran; `STALE` there means the old code is still running.
+
+---
+
+## Acceptance checklist
+
+- [ ] The add-in runs without an error message, and **Batch Render** appears under **SOLID → MODIFY**.
+- [ ] The panel opens and stays open during a batch; the green progress bar moves.
+- [ ] A test batch with two color folders creates one image per render configuration in each color folder.
+- [ ] File names follow `<model> - <-1 image> - <named view>[ - no <hidden parts>]`.
+- [ ] Decals show the sizes from the Render Instructions, with `-1` and `-2` on the right parts (Bullnose: Stair Nose `-1`, Supplemental Plank `-2`).
+- [ ] The parts in `hideBodies` are hidden in those images.
+- [ ] Running again adds ` (v2)` files instead of overwriting (with the color images named `<folder name>-1` / `-2`).
+- [ ] The CSV log has a row with `success` = `1` for each image, and the summary file is written.

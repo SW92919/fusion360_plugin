@@ -1687,7 +1687,7 @@ def _vector_len(v):
 
 
 class ModelPathsBlobTests(unittest.TestCase):
-    """The dialog's model-files box: only one of two picked models was rendered."""
+    """The panel's model-files box: only one of two picked models was rendered."""
 
     A = r"C:\Users\L.C\Fusion360Model\Resources\Models\3-in-1.f3d"
     B = r"C:\Users\L.C\Fusion360Model\Resources\Models\Bullnose.f3d"

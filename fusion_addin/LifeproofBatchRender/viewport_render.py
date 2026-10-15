@@ -177,11 +177,11 @@ def activate_named_view(app: adsk.core.Application, named_view: adsk.fusion.Name
         vp = app.activeViewport
         src = named_view.camera
         if src:
-            # Assigning the NamedView's camera object wholesale does NOT stick on
-            # this Fusion build (the viewport kept its default view for every
-            # named view). Copy the eye/target/up onto the viewport's OWN camera
-            # object and reassign — that applies reliably. isSmoothTransition off
-            # so it snaps instantly (no mid-animation capture).
+            # Best effort only: on the client's build neither assigning the
+            # NamedView's camera nor copying eye/target/up onto the viewport's OWN
+            # camera sticks, so the render is handed the named view's camera
+            # directly (save_fusion_local_render). isSmoothTransition off so it
+            # snaps instantly.
             cam = vp.camera
             try:
                 cam.isSmoothTransition = False
@@ -226,14 +226,13 @@ def save_fusion_local_render(
 ) -> bool:
     """Ray-traced local export via ``Rendering.startLocalRender`` (Render workspace API).
 
-    Uses the active viewport camera. Requires ``design.renderManager``; returns False if the
-    API is unavailable or the render fails/timeouts.
+    Renders through ``camera`` when given, else the active viewport camera. Requires
+    ``design.renderManager``; returns False if the API is unavailable or the render
+    fails/timeouts.
 
-    ``render_quality`` is the Fusion Render-quality slider (25 draft … 100
-    final). Ray-trace time scales steeply with it; 60 is the speed/quality
-    sweet spot for these matte product stills (≈half the time of 90 with no
-    visible difference on a textured part against a plain backdrop). Raise
-    toward 90 only if you need print-grade output and can wait.
+    ``render_quality`` is the Fusion Render-quality slider (clamped to 25-100). The
+    panel passes 25 / 50 / 75 / 100 (default 75); ray-trace time scales steeply
+    with it.
     """
     path = filepath
     low = path.lower()

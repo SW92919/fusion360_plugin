@@ -120,7 +120,7 @@ def write_color_set_delivery_swatches(cs: ColorSetTextures) -> Tuple[int, List[s
     """Copy slot rasters to predictable names next to batch renders.
 
     Clients often expect ``color-set-01-1.jpg`` / ``color-set-02-2.png`` alongside the
-    viewport PNGs (same folder as source textures). Uses the **color subfolder name**
+    renders (same folder as source textures). Uses the **color subfolder name**
     as the stem prefix; preserves the source file extension.
     """
     lines: List[str] = []

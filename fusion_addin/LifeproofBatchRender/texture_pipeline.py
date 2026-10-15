@@ -1,6 +1,5 @@
 # Fusion 360: apply colour-set images to the designer's authored decals and size
-# them from the Render Instructions. The name sets below match the client's .f3d
-# (Browser names).
+# them from the Render Instructions.
 
 from __future__ import annotations
 
@@ -76,7 +75,7 @@ _DECAL_TRAILING_SLOT_RE = re.compile(r"([12])\s*$")
 def decal_name_slot(name: str) -> Optional[int]:
     """Return 1 or 2 for a decal name, else None — tolerant of naming.
 
-    Matches the documented ``SLOT*_DECAL_NAMES`` (normalized: case/space/sep
+    Matches ``SLOT*_DECAL_NAMES`` (normalized: case/space/sep
     insensitive), then falls back to the trailing digit, so ANY decal whose name
     ends in 1 or 2 resolves — ``Decal-1``, ``Slot_2``, ``Pattern1``, ``grid 2``,
     ``Custom_A-1`` all work regardless of exact wording. Names with no trailing
@@ -96,9 +95,10 @@ def decal_name_slot(name: str) -> Optional[int]:
     return None
 
 
-# When the named matches above produce zero updates, fall back to positional
-# matching (first decal -> slot 1, second decal -> slot 2). Disable to force
-# strict naming.
+# A slot that no decal name claims goes to the first unclaimed decal (slot 1,
+# then slot 2); skipped when the model's Render Instructions list decals. Also
+# read by root_has_slot2_decal_target for every model: with it off, a model whose
+# decal names do not end in 2 gets no _2 image. Disable to force strict naming.
 DECAL_POSITIONAL_FALLBACK: bool = True
 
 
@@ -117,8 +117,8 @@ BATCH_DECAL_MAGNITUDE_CM_PER_UNIT: float = 1.0
 # Per-model decal targets from the Render Instructions JSON, keyed by
 # ``render_instructions.normalize_part_key(componentPartNumber)``. Each value is a
 # ``DecalSizeSpec`` (width_cm / length_cm / slot / part_number). Set once per model
-# by the controller; empty means "no JSON targets" and the legacy filename-derived
-# targeting applies.
+# by the controller; empty (the model's entry lists no decals) means decals are
+# matched by name, then by position.
 _DECAL_TARGETS_BY_PART: Dict[str, Any] = {}
 
 
@@ -154,8 +154,9 @@ DECAL_PROBE_LOG: bool = True
 # Instructions entry specifies, as the magnitudes of the decal's X/Y axes in cm.
 # Decal.transform cannot be assigned; the API's documented route is
 # Decal.redefine(matrix, faces, isChainFaces) with the timeline marker rolled to
-# just before the decal. The designer's centre and axis directions are kept; the
-# decal's longer side receives the JSON length. Off = keep the designer's sizes.
+# just before the decal. The designer's axis directions are kept (the centre moves
+# only to centre the decal on its part); the decal's longer side receives the JSON
+# length. Off = keep the designer's sizes.
 DECAL_APPLY_JSON_SIZE: bool = True
 # A decal whose sides are within this ratio has no clear length direction, so its
 # size is left alone (every decal in the client's models is 5:1 or longer).
@@ -266,8 +267,8 @@ def decal_target_for_names(*names: str) -> Optional[Any]:
 def _json_slot_for_component(comp: Any, occ: Any = None) -> Optional[int]:
     """Slot for an authored decal, from the component whose Decals folder holds it.
 
-    Preferred over ``_json_slot_for_decal`` because it needs nothing from the decal
-    itself — it works even when the decal's face cannot be resolved by the API.
+    Needs nothing from the decal itself, so it works even when the decal's face
+    cannot be resolved by the API.
     """
     if not _DECAL_TARGETS_BY_PART or comp is None:
         return None
@@ -363,8 +364,8 @@ def _json_slot_for_decal_face(decal: Any) -> Tuple[Optional[int], bool]:
     return (slot if slot in (1, 2) else None), True
 
 
-# Skip end-cap / cut faces at the start & end of long bodies (normal parallel
-# to the body's longest axis). Show faces (top, nose, back, sides) are kept.
+# Cut faces at the ends of a long body (normal along its longest axis, dot >= the
+# value below), counted by audit_decal_body_is_show_only. Off = none counted.
 BATCH_DECAL_SKIP_END_CAP_FACES: bool = True
 BATCH_DECAL_END_CAP_NORMAL_DOT: float = 0.82
 
@@ -558,8 +559,8 @@ def audit_decal_body_is_show_only(
     Bullnose renders correctly because its ``Nose Skin`` holds only the visible
     outer surface. A body that still contains end-cap faces will show texture on
     the cut ends no matter what this code does, so the model has to be fixed, not
-    the pipeline. That makes this audit the fastest way to tell whether a given
-    .f3d is ready.
+    the add-in. The sizing pass (``_json_size_plan``) uses it to hold a wrapping
+    decal's length to its part.
 
     Returns ``(is_show_only, human_readable_summary)``.
     """
@@ -636,13 +637,10 @@ def _matrix_from_axes(
 
 
 def _on_face_point(face: adsk.fusion.BRepFace) -> Optional[adsk.core.Point3D]:
-    """Return a Point3D guaranteed to lie on the face surface.
+    """A point on the face, for reading its normal in ``_is_end_cap_face``, or None.
 
-    Fusion rejects ``createInput`` with "Input point is not located on primary
-    face" whenever the supplied point isn't strictly on the face — which is
-    common for fillets, the curved nose, and any non-convex face whose
-    bounding-box center is in empty space. ``BRepFace.pointOnFace`` is the
-    API's documented "give me any point on the face" helper.
+    ``BRepFace.pointOnFace`` first; the fallbacks (parametric mid-point, then the
+    bounding-box centre) can lie off a trimmed or curved face.
     """
     try:
         p = face.pointOnFace
@@ -712,7 +710,7 @@ def _apply_entity_transform(
     entity: Any,
     trf: adsk.core.Matrix3D,
 ) -> Optional[str]:
-    """Assign ``transform`` on DecalInput or Decal."""
+    """Assign ``transform`` on a DecalInput (the stand-in's)."""
     try:
         entity.transform = trf.copy()
         return None
@@ -1072,8 +1070,8 @@ def _replace_unwritable_decal(
     verification and could not be removed (the original then stays hidden).
 
     The designer's placement is reused EXACTLY — same centre, axes, scale and
-    chain flag — on the face found under the decal's centre; no auto-fit or
-    grain alignment is applied. The original is hidden BEFORE the stand-in is
+    chain flag — on the face found under the decal's centre (unless ``size_spec``
+    is given, below). The original is hidden BEFORE the stand-in is
     created so one part can never carry two visible decals, and is brought back if
     the stand-in cannot be verified. Nothing is deleted and nothing is saved.
 
@@ -2300,9 +2298,10 @@ def apply_decal_color_set(
     has in the model; only its image changes. Which raster it takes (``_1`` or
     ``_2``) comes from, in order: the slot it was given on an earlier colour set,
     the Render Instructions entry for the component that owns it, a trailing
-    ``1``/``2`` in its name, then position. When Render Instructions are loaded,
-    only decals on the parts they list are touched (name and position are never
-    consulted), and decals the designer switched off are left alone.
+    ``1``/``2`` in its name, then position. When the model's Render Instructions
+    entry lists decals, only decals on those parts are touched (name and position
+    are never consulted). Decals the designer switched off are skipped by the
+    name pass, but the position fallback (entries without decals) can still pick one.
 
     The raster is first turned to run along the decal's footprint (see
     ``_prepare_decal_image``), because a landscape raster dropped into a decal laid
@@ -2341,9 +2340,9 @@ def apply_decal_color_set(
                 _PROBED_DECAL_KEYS.add(key)
                 lines.append(_decal_probe_line(d, comp, occ, key[1]))
 
-    # With Render Instructions loaded they alone say which parts are textured. A
+    # When the model's entry lists decals, it alone says which parts are textured. A
     # decal on any other part (track, floor, light ...) keeps the designer's image:
-    # the name and position guesses below exist only for runs without them, and
+    # the name and position guesses below are only for entries that list none, and
     # would hand e.g. "Wentworth Verdon Hickory-2" the _2 raster just for its name.
     json_scoped = bool(_DECAL_TARGETS_BY_PART)
     slot_of: Dict[int, int] = {}

@@ -17,7 +17,7 @@ _STARTUP_LOG = _ADDIN_DIR / "_LifeproofBatchRender_startup.log"
 
 # Ordered list of (workspaceId, panelId) targets we will TRY to attach to.
 # We never raise if a target is missing; the command stays available via Fusion's
-# command-search (Ctrl+S) even if no ribbon target works on this build.
+# command search even if no ribbon target works on this build.
 _PANEL_TARGETS = (
     ("FusionSolidEnvironment", "SolidScriptsAddinsPanel"),
     ("FusionSolidEnvironment", "SolidModifyPanel"),

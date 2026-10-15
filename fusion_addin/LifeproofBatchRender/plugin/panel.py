@@ -6,8 +6,8 @@ have no progress-bar input for it. A palette is document-independent and shows a
 HTML page, so the settings, Render button, status text and a green progress bar
 all live in ``html/batch_render.html``.
 
-Page â†’ Python: ``adsk.fusionSendData(action, json)`` arrives in ``_OnIncoming``.
-Python â†’ page: ``palette.sendInfoToHTML(action, json)`` (see ``PanelReporter``).
+Page -> Python: ``adsk.fusionSendData(action, json)`` arrives in ``_OnIncoming``.
+Python -> page: ``palette.sendInfoToHTML(action, json)`` (see ``PanelReporter``).
 The batch itself runs from a custom event, after the page's request has returned,
 so the page is never left waiting on a long call.
 """
@@ -94,7 +94,7 @@ def html_url() -> str:
     """The panel page as a file URL, the way Autodesk's own add-ins pass it.
 
     A plain Windows path reaches the browser with its backslashes escaped
-    ("file:///C:/%5CUsers%5C..." â€” "This site can't be reached", 2026-10-15).
+    ("file:///C:/%5CUsers%5C..." - "This site can't be reached", 2026-10-15).
     """
     return "file:///" + str(HTML_FILE).replace("\\", "/").lstrip("/")
 
@@ -231,7 +231,7 @@ def run_pending(fui: Any) -> None:
     try:
         reporter.started()
         reporter.set_progress(0, 1)
-        reporter.set_status("Startingâ€¦")
+        reporter.set_status("Starting\u2026")
         controller.execute_batch(
             reporter,
             request.texture_root,
@@ -271,7 +271,7 @@ class _OnIncoming(adsk.core.HTMLEventHandler):
         except Exception:
             tb = traceback.format_exc()
             _log("panel request {!r} failed:\n{}".format(getattr(html_args, "action", "?"), tb))
-            reply = {"ok": False, "error": "Internal error â€” see the add-in's startup log.\n\n" + tb}
+            reply = {"ok": False, "error": "Internal error - see the add-in's startup log.\n\n" + tb}
         try:
             html_args.returnData = json.dumps(reply)
         except Exception:
@@ -306,7 +306,7 @@ def start(app: adsk.core.Application, fui: adsk.core.UserInterface, log: Callabl
 
 
 def _layout(palette: adsk.core.Palette) -> None:
-    """Floating, at its working size â€” in the order Autodesk's own add-ins use.
+    """Floating, at its working size - in the order Autodesk's own add-ins use.
 
     Created hidden and shown afterwards, the page sat in a tiny scrolled box in the
     corner of an otherwise empty panel (2026-10-15).

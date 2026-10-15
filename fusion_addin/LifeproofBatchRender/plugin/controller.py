@@ -304,9 +304,8 @@ def _execute_batch_inner(
 
         summary_lines.append("=== {} ===".format(mp.name))
 
-        # Install this model's decal targets. These drive BOTH which components get
-        # a decal (replacing the filename-derived guess, which the model rename
-        # broke) and the exact physical size each one is given.
+        # Install this model's decal targets: which colour image (_1 / _2) each
+        # listed part's decals take, and the size each one is given.
         texture_pipeline.set_decal_targets(
             render_instructions.decal_size_map(entry), model_path=mp
         )
@@ -458,8 +457,8 @@ def _execute_batch_inner(
                 # hidden Render-proxy meshes.
                 _apply_hides()
                 viewport_render.pump_ui()
-                # Re-apply the designer's exact saved camera right before capture so
-                # the visibility toggling above can't nudge the composition.
+                # Re-apply the named view to the viewport (best effort only: the
+                # render below is handed the named view's own camera, nv.camera).
                 viewport_render.activate_named_view(app, nv)
                 viewport_render.apply_named_view_framing(app)
                 viewport_render.pump_ui()
