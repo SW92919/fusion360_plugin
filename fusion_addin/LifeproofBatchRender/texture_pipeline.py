@@ -407,6 +407,26 @@ DECAL_REPLACE_UNWRITABLE_AUTHORED: bool = True
 # Log one state line per authored decal per model.
 DECAL_PROBE_LOG: bool = True
 
+# --- Render Instructions decal size (deliverable 2) -------------------------
+# Give every authored decal on a listed part the width x length its Render
+# Instructions entry specifies, as the magnitudes of the decal's X/Y axes in cm.
+# Decal.transform cannot be assigned; the API's documented route is
+# Decal.redefine(matrix, faces, isChainFaces) with the timeline marker rolled to
+# just before the decal. The designer's centre and axis directions are kept; the
+# decal's longer side receives the JSON length. Off = keep the designer's sizes.
+DECAL_APPLY_JSON_SIZE: bool = True
+# A decal whose sides are within this ratio has no clear length direction, so its
+# size is left alone (every decal in the client's models is 5:1 or longer).
+DECAL_SIZE_MIN_ELONGATION: float = 1.2
+# A JSON width more than this fraction narrower than the designer's decal may
+# leave the part's edges bare, so it is reported.
+DECAL_SIZE_NARROWER_WARN: float = 0.03
+# Distance (cm) from a part's end that counts as "not reached".
+DECAL_SIZE_END_GAP_CM: float = 0.3
+# A resized decal whose length Fusion turned further than this (degrees, on the
+# surface) would show the grain crooked, so the designer's size is put back.
+DECAL_SIZE_MAX_TURN_DEG: float = 5.0
+
 # Per-model bookkeeping for authored decals, keyed by (component id, index in that
 # component's Decals folder). Reset by ``set_decal_targets`` for every model.
 _AUTHORED_SLOT_BY_KEY: Dict[Tuple[str, int], int] = {}
@@ -421,6 +441,16 @@ _DESIGNER_INACTIVE_BY_KEY: Dict[Tuple[str, int], str] = {}
 # Stand-ins that failed verification and could not be removed: they carry the part
 # from then on, but every colour set is flagged for a visual check.
 _SUSPECT_STAND_IN_KEYS: Set[Tuple[str, int]] = set()
+# Render Instructions sizes: decals already handled this model, sizes waiting for
+# the stand-in of a decal whose own face link is broken, and whether the sizing
+# pass has run for the open model.
+_SIZED_KEYS: Set[Tuple[str, int]] = set()
+_STANDIN_SIZE_BY_KEY: Dict[Tuple[str, int], Any] = {}
+_JSON_SIZES_DONE: List[bool] = [False]
+# Set when the timeline marker could not be put back: no further decal is sized.
+_SIZING_ABORTED: List[bool] = [False]
+# "The JSON size may not cover this part" notes, popped by the controller.
+_DECAL_SIZE_WARNINGS: List[str] = []
 _DECAL_SWAP_FAILURES: List[str] = []
 _CURRENT_MODEL_PATH: Optional[Path] = None
 _EMBEDDED_SIZES_BY_MODEL: Dict[Path, list] = {}
@@ -449,6 +479,12 @@ def set_decal_targets(
     _SKIP_REPORTED_KEYS.clear()
     _DESIGNER_INACTIVE_BY_KEY.clear()
     _SUSPECT_STAND_IN_KEYS.clear()
+    _SIZED_KEYS.clear()
+    _STANDIN_SIZE_BY_KEY.clear()
+    _JSON_SIZES_DONE[0] = False
+    _SIZING_ABORTED[0] = False
+    del _DECAL_SIZE_WARNINGS[:]
+    del _DECAL_SWAP_FAILURES[:]
     _EMBEDDED_SIZES_BY_MODEL.clear()
 
 
@@ -502,6 +538,40 @@ def _json_slot_for_component(comp: Any, occ: Any = None) -> Optional[int]:
     spec = decal_target_for_names(*names)
     slot = getattr(spec, "slot", None) if spec is not None else None
     return slot if slot in (1, 2) else None
+
+
+def _json_spec_for_decal(decal: Any, comp: Any, occ: Any) -> Optional[Any]:
+    """The Render Instructions entry (DecalSizeSpec) for the part a decal textures.
+
+    Same routing as the slot: the owning component for a decal in a part's own
+    Decals folder, the face's occurrence for one in the ROOT folder.
+    """
+    if not _DECAL_TARGETS_BY_PART:
+        return None
+    if occ is None:
+        try:
+            face = decal.faces[0]
+            part_occ = face.assemblyContext if face is not None else None
+        except Exception:
+            return None
+        if part_occ is None:
+            return None
+        getters = (
+            lambda: part_occ.name,
+            lambda: part_occ.component.name,
+            lambda: part_occ.component.partNumber,
+        )
+    else:
+        getters = (lambda: occ.name, lambda: comp.name, lambda: comp.partNumber)
+    names: List[str] = []
+    for getter in getters:
+        try:
+            value = getter()
+        except Exception:
+            continue
+        if value:
+            names.append(value)
+    return decal_target_for_names(*names)
 
 
 def _json_slot_for_decal_face(decal: Any) -> Tuple[Optional[int], bool]:
@@ -5619,7 +5689,12 @@ def _find_face_at_point(
 
 
 def _replace_unwritable_decal(
-    decal: Any, comp: Any, target: str, label: str, in_root: bool = False
+    decal: Any,
+    comp: Any,
+    target: str,
+    label: str,
+    in_root: bool = False,
+    size_spec: Optional[Any] = None,
 ) -> Tuple[Optional[Any], List[str], Optional[Any]]:
     """Stand-in for an authored decal that refuses a new image.
 
@@ -5636,6 +5711,10 @@ def _replace_unwritable_decal(
     root-decal visibility before every render, which would show the original on
     top of the stand-in) and for one with wrapping off (it covers a chosen set of
     faces that cannot be read back, so a stand-in could only cover one of them).
+
+    ``size_spec`` (Render Instructions entry): the stand-in is created at that
+    width x length instead of the designer's, centred on its part (the original
+    cannot be redefined because its faces are unreadable).
     """
     notes: List[str] = []
     if in_root:
@@ -5687,6 +5766,28 @@ def _replace_unwritable_decal(
     if face is None:
         notes.append("{}: no unambiguous face under the decal — left as authored".format(label))
         return None, notes, None
+
+    size_warnings: List[str] = []
+    sized = False
+    if size_spec is not None:
+        try:
+            plan = _json_size_plan(origin, x_axis, y_axis, z_axis, size_spec, [face], chain, face)
+        except Exception as ex:
+            plan = {
+                "ok": False,
+                "notes": [],
+                "warnings": [],
+                "reason": "unexpected error ({})".format(str(ex) or type(ex).__name__),
+            }
+        notes.extend("{}: {}".format(label, n) for n in plan["notes"])
+        if plan["ok"]:
+            m, origin = plan["matrix"], plan["origin"]
+            mag_x, mag_y = plan["mag_x"], plan["mag_y"]
+            size_warnings = list(plan["warnings"])
+            sized = True
+        else:
+            size_warnings = ["size not applied — {}".format(plan["reason"])]
+            notes.append("{}: Render Instructions size not applied ({})".format(label, plan["reason"]))
 
     try:
         decals = comp.decals
@@ -5769,10 +5870,20 @@ def _replace_unwritable_decal(
         )
         return None, notes, new_decal
 
-    notes.append(
-        "{}: REPLACED with an identical-placement stand-in on body '{}' "
-        "(original hidden, not deleted)".format(label, _safe_body_name(face))
-    )
+    if sized:
+        k = float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT) or 1.0
+        notes.append(
+            "{}: REPLACED with a stand-in on body '{}' at the designer's position, "
+            "sized from the Render Instructions: {:.1f} x {:.1f} cm (original hidden, "
+            "not deleted)".format(label, _safe_body_name(face), mag_x * k, mag_y * k)
+        )
+    else:
+        notes.append(
+            "{}: REPLACED with an identical-placement stand-in on body '{}' "
+            "(original hidden, not deleted)".format(label, _safe_body_name(face))
+        )
+    for warning in size_warnings:
+        _size_warning(label, warning, notes)
     return new_decal, notes, None
 
 
@@ -5881,18 +5992,24 @@ def _decal_centre_on_face(decal: Any) -> Optional[bool]:
     """
     try:
         origin = decal.transform.getAsCoordinateSystem()[0]
-        faces = [f for f in decal.faces if f is not None]
+        listed = decal.faces
+        # Index, don't iterate: on a dead reference Fusion returns None for
+        # faces[0] but an empty wrapper when the list is iterated (Bullnose nose).
+        faces = [listed[i] for i in range(len(listed))]
     except Exception:
         return None
-    if not faces:
-        return None
+    checked = False
     for face in faces:
-        try:
-            if face.isPointOnFace(origin, _DECAL_CENTRE_ON_FACE_TOL):
-                return True
-        except Exception:
+        if face is None:
             continue
-    return False
+        try:
+            on_face = face.isPointOnFace(origin, _DECAL_CENTRE_ON_FACE_TOL)
+        except Exception:
+            continue  # an unreadable face says nothing either way
+        checked = True
+        if on_face:
+            return True
+    return False if checked else None
 
 
 def _decal_probe_line(decal: Any, comp: Any, occ: Any, index: int) -> str:
@@ -5938,6 +6055,739 @@ def _decal_probe_line(decal: Any, comp: Any, occ: Any, index: int) -> str:
     )
 
 
+def _closest_point_on_face(face: Any, point: Any) -> Optional[Tuple[Any, float]]:
+    """The point of ``face`` nearest ``point`` and its distance in cm, or None.
+
+    Decal.redefine takes a centre only when it lies on the primary face within
+    Fusion's own tight tolerance ("Input point is not located on primary face").
+    Designer centres can read back a hair off their face, and a centre moved along
+    a decal's (slightly tilted) length axis leaves the surface, so the sizing pass
+    puts every centre exactly on its face first.
+    """
+    try:
+        ev = face.evaluator
+        ok, param = ev.getParameterAtPoint(point)
+        if not ok or param is None:
+            return None
+        ok2, on_face = ev.getPointAtParameter(param)
+        if not ok2 or on_face is None:
+            return None
+        # The surface's nearest point can lie outside the face's boundary.
+        if not face.isPointOnFace(on_face):
+            return None
+        return on_face, float(point.distanceTo(on_face))
+    except Exception:
+        return None
+
+
+def _decal_anchor(
+    faces: List[Any], chain: bool, point: Any
+) -> Optional[Tuple[int, Any, float]]:
+    """``(index, point_on_face, distance_cm)`` for the listed face nearest ``point``.
+
+    With wrapping on only the first face counts (Fusion uses just that one). Ties
+    go to the earlier face, so the designer's primary face is kept when it fits.
+    """
+    best: Optional[Tuple[int, Any, float]] = None
+    for i, face in enumerate(faces[:1] if chain else faces):
+        if face is None:
+            continue
+        hit = _closest_point_on_face(face, point)
+        if hit is not None and (best is None or hit[1] < best[2] - 1e-6):
+            best = (i, hit[0], hit[1])
+    return best
+
+
+def _primary_first(faces: List[Any], primary: int) -> List[Any]:
+    """``faces`` with ``faces[primary]`` moved to the front (Fusion's primary face)."""
+    faces = list(faces)
+    if 0 < primary < len(faces):
+        faces.insert(0, faces.pop(primary))
+    return faces
+
+
+def _primary_index(
+    faces: List[Any], chain: bool, origin: Any, wanted: Any, fallback: int
+) -> int:
+    """Index in ``faces`` of the face to pass first: the one under ``origin``.
+
+    Fusion lists a decal's faces primary-first, so after a resize that changed
+    the primary face, faces fetched again come back in a different order from the
+    caller's list (an undo would then lead with the wrong face and be refused).
+    The face is found by where the centre is, then by identity, then by position.
+    """
+    if origin is not None:
+        anchor = _decal_anchor(faces, chain, origin)
+        if anchor is not None and anchor[2] <= _DECAL_CENTRE_ON_FACE_TOL:
+            return anchor[0]
+    if wanted is not None:
+        for i, face in enumerate(faces):
+            try:
+                if face == wanted:
+                    return i
+            except Exception:
+                continue
+    return fallback if 0 <= fallback < len(faces) else 0
+
+
+def _matrix_onto_face(matrix: Any, face: Any) -> Tuple[Optional[Any], str]:
+    """``matrix`` with its origin moved onto ``face``, axes kept; ``(None, why)`` if not.
+
+    Used with the timeline rolled back, where a face can sit slightly apart from
+    where the finished model shows it. Moves of more than DECAL_SIZE_END_GAP_CM
+    are refused (the read-back check would undo them anyway).
+    """
+    try:
+        origin, x_axis, y_axis, z_axis = matrix.getAsCoordinateSystem()
+    except Exception as ex:
+        return None, "its placement cannot be read ({})".format(ex)
+    hit = _closest_point_on_face(face, origin)
+    if hit is None:
+        return None, "its centre cannot be placed on that face"
+    on_face, off = hit
+    if off > float(DECAL_SIZE_END_GAP_CM):
+        return None, "at the decal's step in the timeline its centre is {:.2f} cm from that face".format(off)
+    if off <= 1e-9:
+        return None, "its centre is on that face"
+    m, err = _matrix_from_axes(on_face, x_axis, y_axis, z_axis)
+    return m, err or ""
+
+
+def _squared_designer_matrix(
+    origin: Any, x_axis: Any, y_axis: Any, z_axis: Any, faces: List[Any], chain: bool
+) -> Tuple[Optional[Any], int]:
+    """The designer's own size and position on a frame Decal.redefine accepts.
+
+    Some designer frames read back slightly skewed (Quarter Round: "X and Z axes
+    ... must be perpendicular"), so they cannot be written back as they are.
+    Returns ``(matrix or None, primary face index)``.
+    """
+    primary, o = 0, origin
+    anchor = _decal_anchor(faces, chain, origin)
+    if anchor is not None and anchor[2] <= _DECAL_CENTRE_ON_FACE_TOL:
+        primary, o = anchor[0], anchor[1]
+    frame = _square_decal_frame(o, x_axis, y_axis, z_axis, faces[primary] if faces else None)
+    if frame is None:
+        return None, primary
+    mx, my = _vector_length(x_axis), _vector_length(y_axis)
+    x_unit, y_unit, z_unit = frame
+    m, _err = _matrix_from_axes(
+        o,
+        adsk.core.Vector3D.create(*(c * mx for c in x_unit)),
+        adsk.core.Vector3D.create(*(c * my for c in y_unit)),
+        adsk.core.Vector3D.create(*z_unit),
+    )
+    return m, primary
+
+
+def _part_extent_along(
+    faces: List[Any], chain: bool, origin: Any, unit: Tuple[float, float, float]
+) -> Optional[Tuple[float, float]]:
+    """``(start, end)`` of the textured part along ``unit``, in cm from ``origin``.
+
+    With wrapping off the decal covers exactly its listed faces; with wrapping on
+    it covers its first face's whole body. Measured from bounding boxes, which is
+    exact along a straight trim (all of the client's parts are straight).
+    """
+    boxes: List[Any] = []
+    for face in faces:
+        if face is None:
+            continue
+        try:
+            boxes.append(face.body.boundingBox if chain else face.boundingBox)
+        except Exception:
+            continue
+        if chain:
+            break
+    lo, hi = math.inf, -math.inf
+    for box in boxes:
+        try:
+            mn, mx = box.minPoint, box.maxPoint
+            xs, ys, zs = (mn.x, mx.x), (mn.y, mx.y), (mn.z, mx.z)
+        except Exception:
+            continue
+        for cx in xs:
+            for cy in ys:
+                for cz in zs:
+                    t = (
+                        (cx - origin.x) * unit[0]
+                        + (cy - origin.y) * unit[1]
+                        + (cz - origin.z) * unit[2]
+                    )
+                    lo, hi = min(lo, t), max(hi, t)
+    return (lo, hi) if lo <= hi else None
+
+
+def _square_decal_frame(
+    origin: Any, x_axis: Any, y_axis: Any, z_axis: Any, face: Any, keep: str = "auto"
+) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]]]:
+    """Unit X, Y, Z for a decal at ``origin``, exactly square to the surface.
+
+    Decal.redefine rejects a frame whose axes are not perpendicular ("Y and Z axes
+    defined by the matrix, must be perpendicular") — and a decal Fusion has moved
+    on reopening (3-in-1) reads back a frame that is slightly off. Z is the face
+    normal at the origin (on the decal's side). The axis named by ``keep`` ("x",
+    "y", or "auto" = the longer one, which carries the grain) keeps the designer's
+    direction within the surface, and the other follows with the designer's
+    handedness, so a flipped decal stays flipped.
+    """
+    def unit(v: Tuple[float, ...]) -> Optional[Tuple[float, ...]]:
+        n = math.sqrt(sum(c * c for c in v))
+        return tuple(c / n for c in v) if n > 1e-12 else None
+
+    def cross(a: Tuple[float, ...], b: Tuple[float, ...]) -> Tuple[float, ...]:
+        return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+    def dot(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
+        return sum(p * q for p, q in zip(a, b))
+
+    xo = (x_axis.x, x_axis.y, x_axis.z)
+    yo = (y_axis.x, y_axis.y, y_axis.z)
+    zo = unit((z_axis.x, z_axis.y, z_axis.z))
+    if zo is None:
+        return None
+    z = zo
+    try:
+        ok, normal = face.evaluator.getNormalAtPoint(origin)
+        n = unit((normal.x, normal.y, normal.z)) if ok else None
+        if n is not None:
+            z = n if dot(n, zo) >= 0 else tuple(-c for c in n)
+    except Exception:
+        pass
+    right_handed = dot(cross(xo, yo), zo) >= 0
+    if keep == "auto":
+        keep = "x" if dot(xo, xo) >= dot(yo, yo) else "y"
+    if keep == "y":
+        y = unit(tuple(yc - dot(yo, z) * zc for yc, zc in zip(yo, z)))
+        if y is None:
+            return None
+        x = cross(y, z) if right_handed else cross(z, y)
+        return x, y, z
+    x = unit(tuple(xc - dot(xo, z) * zc for xc, zc in zip(xo, z)))
+    if x is None:
+        return None
+    y = cross(z, x) if right_handed else cross(x, z)
+    return x, y, z
+
+
+def _json_size_plan(
+    origin: Any,
+    x_axis: Any,
+    y_axis: Any,
+    z_axis: Any,
+    spec: Any,
+    faces: List[Any],
+    chain: bool,
+    first_face: Any,
+) -> Dict[str, Any]:
+    """New placement for a decal: the JSON width x length, centred on its part.
+
+    Keeps the designer's axis directions; the longer axis gets the JSON length.
+    Moves the centre along that axis only when the decal would otherwise miss an
+    end of the part (3-in-1: Fusion reopens its decal centred on the trim's first
+    end) and the moved centre is still on the decal's first face. Returns ``ok``,
+    ``matrix``, ``origin``, ``mag_x``/``mag_y`` (new), ``was`` (old), ``notes``,
+    ``warnings`` and, when not ok, ``reason``.
+    """
+    plan: Dict[str, Any] = {"ok": False, "notes": [], "warnings": [], "reason": ""}
+    k = float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT) or 1.0
+    mag_x, mag_y = _vector_length(x_axis), _vector_length(y_axis)
+    plan["was"] = (mag_x * k, mag_y * k)
+    if mag_x <= 1e-9 or mag_y <= 1e-9:
+        plan["reason"] = "its size cannot be read"
+        return plan
+    if max(mag_x, mag_y) / min(mag_x, mag_y) < DECAL_SIZE_MIN_ELONGATION:
+        plan["reason"] = (
+            "its sides are nearly equal ({:.1f} x {:.1f} cm), so which one is the "
+            "length is unclear".format(mag_x * k, mag_y * k)
+        )
+        return plan
+    length_cm = float(getattr(spec, "length_cm", 0) or 0)
+    width_cm = float(getattr(spec, "width_cm", 0) or 0)
+    if length_cm <= 0 or width_cm <= 0:
+        plan["reason"] = "the Render Instructions size is missing or zero"
+        return plan
+
+    long_is_x = mag_x >= mag_y
+    long_axis = x_axis if long_is_x else y_axis
+    long_len = _vector_length(long_axis)
+    unit = (long_axis.x / long_len, long_axis.y / long_len, long_axis.z / long_len)
+    # Measure and move along the surface: a designer axis can tilt off it
+    # (3-in-1's re-made decal), and a centre slid along a tilted axis lifts away.
+    square = _square_decal_frame(origin, x_axis, y_axis, z_axis, first_face)
+    if square is not None:
+        unit = tuple(square[0] if long_is_x else square[1])
+    designer_width_cm = (mag_y if long_is_x else mag_x) * k
+
+    # A wrapping decal paints its whole body. On a full solid (one with cut-end
+    # faces, unlike a show-only "Skin") anything longer than the part runs onto the
+    # cut ends — the client's original complaint — so its length is held to the part.
+    solid_body = False
+    if chain and faces and faces[0] is not None:
+        try:
+            show_only, _why = audit_decal_body_is_show_only(faces[0].body)
+            solid_body = not show_only
+        except Exception:
+            solid_body = False
+
+    new_origin = origin
+    half = length_cm / 2.0
+    gap = float(DECAL_SIZE_END_GAP_CM)
+    extent = _part_extent_along(faces, chain, origin, unit)
+    if extent is not None and solid_body and length_cm > (extent[1] - extent[0]) + gap:
+        part_len = extent[1] - extent[0]
+        plan["notes"].append(
+            "length held to the part's {:.1f} cm (Render Instructions: {:.1f} cm): this "
+            "decal wraps a solid body, and more length would run onto its cut ends".format(
+                part_len, length_cm
+            )
+        )
+        length_cm = part_len
+        half = length_cm / 2.0
+    if extent is None:
+        designer_length_cm = max(mag_x, mag_y) * k
+        if length_cm < designer_length_cm - gap:
+            plan["warnings"].append(
+                "the part's length could not be measured and the decal gets shorter "
+                "({:.1f} -> {:.1f} cm), so its ends may be bare".format(designer_length_cm, length_cm)
+            )
+        else:
+            plan["notes"].append("part length could not be measured, so its ends were not checked")
+    else:
+        start, end = extent
+        part_len = end - start
+        if part_len > length_cm + gap:
+            plan["warnings"].append(
+                "the part is {:.1f} cm long but the Render Instructions length is "
+                "{:.1f} cm, so about {:.1f} cm at its ends stays bare".format(
+                    part_len, length_cm, part_len - length_cm
+                )
+            )
+        if start < -half - gap or end > half + gap:
+            shift = (start + end) / 2.0
+            moved = adsk.core.Point3D.create(
+                origin.x + unit[0] * shift,
+                origin.y + unit[1] * shift,
+                origin.z + unit[2] * shift,
+            )
+            # Any listed face will do (T-Molding's 42 faces split along its length);
+            # the one it lands on becomes the primary face below.
+            moved_anchor = _decal_anchor(faces, chain, moved)
+            if moved_anchor is not None:
+                on_face = moved_anchor[2] <= _DECAL_CENTRE_ON_FACE_TOL
+            else:
+                try:
+                    on_face = bool(first_face.isPointOnFace(moved, _DECAL_CENTRE_ON_FACE_TOL))
+                except Exception:
+                    on_face = False
+            if on_face:
+                new_origin = moved
+                plan["notes"].append(
+                    "centred on the part (moved {:+.1f} cm along its length)".format(shift)
+                )
+            elif part_len <= length_cm + gap:
+                plan["warnings"].append(
+                    "it does not reach one end of the part and could not be centred "
+                    "on it, so that end may stay bare"
+                )
+    if solid_body and width_cm > designer_width_cm * (1.0 + float(DECAL_SIZE_NARROWER_WARN)):
+        plan["warnings"].append(
+            "the Render Instructions width ({:.1f} cm) is wider than the designer's "
+            "decal ({:.1f} cm) on a decal that wraps a solid body, so the texture may "
+            "run onto the part's sides".format(width_cm, designer_width_cm)
+        )
+    if width_cm < designer_width_cm * (1.0 - float(DECAL_SIZE_NARROWER_WARN)):
+        plan["warnings"].append(
+            "the Render Instructions width ({:.1f} cm) is narrower than the "
+            "designer's decal ({:.1f} cm), so the part's edges may show bare".format(
+                width_cm, designer_width_cm
+            )
+        )
+
+    # Fusion takes the centre only exactly on the primary face (2026-10-15: the
+    # Bullnose and Square Nose planks, 3-in-1 and T-Molding were all refused).
+    primary = 0
+    anchor = _decal_anchor(faces, chain, new_origin)
+    if anchor is not None:
+        idx, on_face_point, off = anchor
+        if off <= _DECAL_CENTRE_ON_FACE_TOL:
+            primary, new_origin = idx, on_face_point
+            if off > 1e-3:
+                plan["notes"].append("centre put exactly on its face (it read {:.3f} cm off)".format(off))
+        else:
+            plan["notes"].append("its centre is {:.2f} cm from its nearest face".format(off))
+    primary_face = faces[primary] if faces and faces[primary] is not None else first_face
+
+    new_long, new_short = length_cm / k, width_cm / k
+    new_mag_x, new_mag_y = (new_long, new_short) if long_is_x else (new_short, new_long)
+    frame = _square_decal_frame(new_origin, x_axis, y_axis, z_axis, primary_face)
+    if frame is None:
+        plan["reason"] = "its axes cannot be squared to the surface"
+        return plan
+    x_unit, y_unit, z_unit = frame
+    new_x = adsk.core.Vector3D.create(*(c * new_mag_x for c in x_unit))
+    new_y = adsk.core.Vector3D.create(*(c * new_mag_y for c in y_unit))
+    new_z = adsk.core.Vector3D.create(*z_unit)
+    matrix, err = _matrix_from_axes(new_origin, new_x, new_y, new_z)
+    if matrix is None:
+        plan["reason"] = err or "the new placement was rejected"
+        return plan
+    plan.update(
+        ok=True,
+        matrix=matrix,
+        origin=new_origin,
+        mag_x=new_mag_x,
+        mag_y=new_mag_y,
+        length_axis="X" if long_is_x else "Y",
+        primary=primary,
+    )
+    return plan
+
+
+def _redefine_decal(
+    design: Any, decal: Any, matrix: Any, faces: List[Any], chain: bool, primary: int = 0
+) -> Tuple[str, bool]:
+    """Apply ``matrix`` to an existing decal. Returns ``(problem or "", touched)``.
+
+    ``touched`` is True once the timeline marker may have moved (decal and face
+    objects fetched earlier should then be fetched again). ``faces[primary]`` is
+    passed first: Fusion requires the centre on the first face.
+
+    The API requires the marker immediately before the decal. Afterwards it goes
+    back to EXACTLY where the model had it — not to the end: 3-in-1 is saved with
+    its marker part-way along, and an old stair scene after it (planks, a nose,
+    more decals) must stay off. If the marker cannot be put back, sizing stops for
+    the model and the problem is reported with the decal failures.
+    """
+    try:
+        timeline = design.timeline
+        saved_marker = int(timeline.markerPosition)
+        timeline_obj = decal.timelineObject
+    except Exception as ex:
+        return "the timeline cannot be read ({})".format(ex), False
+    if timeline_obj is None:
+        return "it has no timeline entry", False
+    err = ""
+    touched = True
+    try:
+        if timeline_obj.rollTo(True) is False:
+            err = "the timeline marker could not be moved to it"
+        else:
+            pool = list(faces)
+            # Faces as they are with the marker rolled back, when readable.
+            try:
+                listed = decal.faces
+                fresh = [listed[i] for i in range(len(listed))]
+                if len(fresh) == len(faces) and all(f is not None for f in fresh):
+                    pool = fresh
+            except Exception:
+                pass
+            try:
+                centre = matrix.getAsCoordinateSystem()[0]
+            except Exception:
+                centre = None
+            wanted = faces[primary] if 0 <= primary < len(faces) else None
+            use_faces = _primary_first(pool, _primary_index(pool, chain, centre, wanted, primary))
+            if chain:
+                use_faces = use_faces[:1]
+            try:
+                ok = decal.redefine(matrix, use_faces, chain)
+            except Exception as ex:
+                if "primary face" not in str(ex) or not use_faces:
+                    raise
+                # Rolled back, the face can sit a hair apart from where the
+                # finished model shows it: put the centre on it as it is now.
+                retry, why = _matrix_onto_face(matrix, use_faces[0])
+                if retry is None:
+                    raise RuntimeError("{} ({})".format(ex, why))
+                ok = decal.redefine(retry, use_faces, chain)
+            if ok is False:
+                err = "Fusion refused the new size"
+    except Exception as ex:
+        err = str(ex) or type(ex).__name__
+    finally:
+        try:
+            if int(timeline.markerPosition) != saved_marker:
+                timeline.markerPosition = saved_marker
+            if int(timeline.markerPosition) != saved_marker:
+                raise RuntimeError(
+                    "marker at {} instead of {}".format(timeline.markerPosition, saved_marker)
+                )
+        except Exception as ex2:
+            _SIZING_ABORTED[0] = True
+            problem = (
+                "the timeline marker could not be put back ({}); this model's renders "
+                "may show the wrong parts".format(ex2)
+            )
+            _DECAL_SWAP_FAILURES.append("Decal sizing: " + problem)
+            err = (err + "; " if err else "") + problem.upper()
+    return err, touched
+
+
+def _size_warning(label: str, text: str, lines: List[str]) -> None:
+    lines.append("{}: SIZE WARNING — {}".format(label, text))
+    _DECAL_SIZE_WARNINGS.append("{}: {}".format(label, text))
+
+
+def apply_json_decal_sizes(design: Any) -> List[str]:
+    """Give each authored decal on a listed part its Render Instructions size.
+
+    Call right after the model is opened — before the geometry settle and the
+    visibility snapshot — because resizing a decal rolls the timeline back and
+    recomputes the model. Runs once per model (``apply_decal_color_set`` calls it
+    as a fallback). Returns log lines; problems go to ``pop_decal_size_warnings``.
+    """
+    lines: List[str] = []
+    if not (DECAL_APPLY_JSON_SIZE and _DECAL_TARGETS_BY_PART) or _JSON_SIZES_DONE[0]:
+        return lines
+    _JSON_SIZES_DONE[0] = True
+    try:
+        pending = bool(design.snapshots.hasPendingSnapshot)
+    except Exception:
+        pending = False
+    if pending:
+        _size_warning(
+            "This model",
+            "sizes not applied — it has parts moved without a captured position, and "
+            "rolling its timeline would move them back",
+            lines,
+        )
+        return lines
+    _apply_json_sizes(design, lines)
+    return lines
+
+
+def _apply_json_sizes(design: Any, lines: List[str]) -> None:
+    """The sizing pass: one decal at a time, fetched again after every roll.
+
+    A decal that cannot be sized keeps the designer's size and is reported; the
+    colour set is applied either way.
+    """
+    seen: Set[Tuple[str, int]] = set()
+    for _round in range(256):
+        restart = False
+        for d, comp, occ, j in _collect_decals_with_owner(design):
+            try:
+                key = (str(comp.id), j)
+            except Exception:
+                key = ("id{}".format(id(comp)), j)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                restart = _apply_json_size_one(design, d, comp, occ, key, lines)
+            except Exception as ex:
+                _size_warning(
+                    'Decal "{}"'.format(_safe_attr(d, "name")),
+                    "size not applied — unexpected error ({})".format(str(ex) or type(ex).__name__),
+                    lines,
+                )
+            if _SIZING_ABORTED[0]:
+                return
+            if restart:
+                break  # objects fetched before the roll are not reused
+        if not restart:
+            return
+
+
+def _apply_json_size_one(
+    design: Any, d: Any, comp: Any, occ: Any, key: Tuple[str, int], lines: List[str]
+) -> bool:
+    """One decal of the sizing pass. Returns True if the timeline was rolled."""
+    if key in _RETIRED_AUTHORED_KEYS or key in _SIZED_KEYS:
+        return False
+    if key not in _DESIGNER_INACTIVE_BY_KEY:
+        _DESIGNER_INACTIVE_BY_KEY[key] = _designer_inactive_reason(d, comp)
+    if _DESIGNER_INACTIVE_BY_KEY[key]:
+        return False
+    spec = _json_spec_for_decal(d, comp, occ)
+    if spec is None:
+        return False
+    _SIZED_KEYS.add(key)
+    label = 'Decal "{}" on "{}"'.format(_safe_attr(d, "name"), _safe_attr(spec, "part_number"))
+    try:
+        derived = d.isDerived is True
+    except Exception:
+        derived = False
+    if derived:
+        # The API: "You should not attempt to make any edits to the derived decal."
+        _size_warning(label, "size not applied — it is derived from another design", lines)
+        return False
+    try:
+        listed = d.faces
+        faces = [listed[i] for i in range(len(listed))]
+    except Exception as ex:
+        _size_warning(label, "size not applied — its faces cannot be read ({})".format(ex), lines)
+        return False
+    if not faces or any(f is None for f in faces):
+        # Broken face link: redefine needs the faces. If a stand-in replaces this
+        # decal, the stand-in is created at the JSON size instead (checked after the
+        # first colour set, see _report_unapplied_stand_in_sizes).
+        _STANDIN_SIZE_BY_KEY[key] = (spec, label)
+        lines.append(
+            "{}: its face link is broken, so the Render Instructions size "
+            "({:.1f} x {:.1f} cm) goes to its stand-in".format(
+                label, spec.length_cm, spec.width_cm
+            )
+        )
+        return False
+    try:
+        designer = d.transform
+        designer_matrix = designer.copy() if hasattr(designer, "copy") else designer
+        origin, x_axis, y_axis, z_axis = designer.getAsCoordinateSystem()
+        chain = bool(d.isChainFaces)
+    except Exception as ex:
+        _size_warning(label, "size not applied — its placement cannot be read ({})".format(ex), lines)
+        return False
+    plan = _json_size_plan(origin, x_axis, y_axis, z_axis, spec, faces, chain, faces[0])
+    lines.extend("{}: {}".format(label, n) for n in plan["notes"])
+    if not plan["ok"]:
+        _size_warning(label, "size not applied — {}".format(plan["reason"]), lines)
+        return False
+    try:
+        opacity = d.opacity
+    except Exception:
+        opacity = None
+    err, touched = _redefine_decal(design, d, plan["matrix"], faces, chain, plan.get("primary", 0))
+    if err:
+        _size_warning(label, "size not applied — {}".format(err), lines)
+        return touched
+    try:
+        if opacity is not None and abs(float(d.opacity) - float(opacity)) > 1e-9:
+            d.opacity = opacity  # redefine covers placement only; keep the designer's
+    except Exception:
+        pass
+
+    # Read back what Fusion made of it. A clear miss is undone (designer size kept).
+    stored_as: List[str] = []
+    try:
+        o2, x2, y2, _z2 = d.transform.getAsCoordinateSystem()
+        got = (_vector_length(x2), _vector_length(y2))
+        want = (plan["mag_x"], plan["mag_y"])
+        moved = plan["origin"].distanceTo(o2)
+        _o, rx, ry, rz = plan["matrix"].getAsCoordinateSystem()
+
+        def _cos(a: Any, b: Any) -> float:
+            la, lb = _vector_length(a), _vector_length(b)
+            if la <= 1e-12 or lb <= 1e-12:
+                return 0.0
+            return (a.x * b.x + a.y * b.y + a.z * b.z) / (la * lb)
+
+        # Only a turn ON the surface moves the grain. Fusion keeps frames it is
+        # given a little off square (L-Cap, Reducer and Quarter Round read back
+        # "turned" at exactly the asked size and centre and were undone for it,
+        # 2026-10-15), and a reversed axis only mirrors the wood.
+        long_got = x2 if plan["length_axis"] == "X" else y2
+        long_req = rx if plan["length_axis"] == "X" else ry
+        nz = _vector_length(rz)
+        tilt_deg = 0.0
+        if nz > 1e-12:
+            along_n = (long_got.x * rz.x + long_got.y * rz.y + long_got.z * rz.z) / (nz * nz)
+            full = _vector_length(long_got)
+            if full > 1e-12:
+                tilt_deg = math.degrees(math.asin(min(1.0, abs(along_n) * nz / full)))
+            long_got = adsk.core.Vector3D.create(
+                long_got.x - along_n * rz.x, long_got.y - along_n * rz.y, long_got.z - along_n * rz.z
+            )
+        turn_deg = math.degrees(math.acos(min(1.0, abs(_cos(long_got, long_req)))))
+        turned = turn_deg > float(DECAL_SIZE_MAX_TURN_DEG)
+        if turn_deg >= 0.5:
+            stored_as.append("its length turned {:.1f} deg on the surface".format(turn_deg))
+        if tilt_deg >= 0.5:
+            stored_as.append("its length tilted {:.1f} deg off the surface".format(tilt_deg))
+        if _cos(x2, rx) < 0:
+            stored_as.append("its X axis reversed")
+        if _cos(y2, ry) < 0:
+            stored_as.append("its Y axis reversed")
+
+        size_off = any(abs(g - w) > 0.01 * max(w, 1e-9) for g, w in zip(got, want))
+        if size_off or turned or moved > float(DECAL_SIZE_END_GAP_CM):
+            what = "Fusion placed it at {:.2f} x {:.2f} (asked {:.2f} x {:.2f}; centre {:.2f} cm away{})".format(
+                got[0],
+                got[1],
+                want[0],
+                want[1],
+                moved,
+                "; length turned {:.1f} deg on the surface".format(turn_deg) if turned else "",
+            )
+            undo_err, _t = _redefine_decal(design, d, designer_matrix, faces, chain)
+            if undo_err and not _SIZING_ABORTED[0]:
+                # The designer's frame itself can be too far off square for redefine.
+                squared, sq_primary = _squared_designer_matrix(origin, x_axis, y_axis, z_axis, faces, chain)
+                if squared is not None:
+                    err2, _t = _redefine_decal(design, d, squared, faces, chain, sq_primary)
+                    undo_err = "" if not err2 else "{}; squared: {}".format(undo_err, err2)
+            if undo_err:
+                _size_warning(
+                    label,
+                    "{} and putting the designer's size back failed ({}) — check this render".format(
+                        what, undo_err
+                    ),
+                    lines,
+                )
+            else:
+                _size_warning(label, "size not applied — {}; the designer's size was kept".format(what), lines)
+            return True
+        if moved > 0.01:
+            # Under DECAL_SIZE_END_GAP_CM it cannot show (Bullnose plank, 2026-10-15:
+            # 0.136 cm across a 17.8 cm wide decal), so it is logged, not warned.
+            stored_as.append("its centre {:.2f} cm from where it was asked".format(moved))
+    except Exception as ex:
+        _size_warning(label, "the new size could not be read back ({})".format(ex), lines)
+    try:
+        health = d.timelineObject.healthState
+        if int(health) != 0:  # FeatureHealthStates.HealthyFeatureHealthState
+            _size_warning(
+                label,
+                "after resizing, Fusion reports the decal as not healthy (state {}) — "
+                "check this render".format(health),
+                lines,
+            )
+    except Exception:
+        pass
+
+    k = float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT) or 1.0
+    lines.append(
+        "{}: size set from the Render Instructions: {:.1f} x {:.1f} cm (designer's "
+        "{:.1f} x {:.1f} cm at ({:.2f}, {:.2f}, {:.2f}); length along its {} axis{})".format(
+            label,
+            plan["mag_x"] * k,
+            plan["mag_y"] * k,
+            plan["was"][0],
+            plan["was"][1],
+            origin.x,
+            origin.y,
+            origin.z,
+            plan["length_axis"],
+            "; Fusion stored it with " + ", ".join(stored_as) if stored_as else "",
+        )
+    )
+    for warning in plan["warnings"]:
+        _size_warning(label, warning, lines)
+    return True
+
+
+def _report_unapplied_stand_in_sizes() -> List[str]:
+    """Sizes kept for a stand-in that was never made: report them, once."""
+    lines: List[str] = []
+    for key in list(_STANDIN_SIZE_BY_KEY):
+        _spec, label = _STANDIN_SIZE_BY_KEY.pop(key)
+        if key not in _RETIRED_AUTHORED_KEYS:
+            _size_warning(
+                label,
+                "size not applied — its face link is broken and no stand-in was made",
+                lines,
+            )
+    return lines
+
+
+def pop_decal_size_warnings() -> List[str]:
+    """Render Instructions sizes that may not cover their part, since the last call."""
+    out = list(_DECAL_SIZE_WARNINGS)
+    del _DECAL_SIZE_WARNINGS[:]
+    return out
+
+
 def pop_decal_swap_failures() -> List[str]:
     """Decals that still show their authored texture since the last call."""
     out = list(_DECAL_SWAP_FAILURES)
@@ -5979,6 +6829,11 @@ def apply_decal_color_set(
                 "DECAL_TEXTURE_IMAGE_SHIFT_PX to 0"
             )
     total = 0
+
+    # Sizes first (once per model, on the first colour set): every image written
+    # afterwards is then prepared for, and stretched over, the final footprint.
+    # (The controller normally runs this straight after opening the model.)
+    lines.extend(apply_json_decal_sizes(design))
 
     # (decal, component, occurrence, index in that component's Decals folder).
     # The (component id, index) pair identifies a decal for the whole session:
@@ -6200,7 +7055,14 @@ def apply_decal_color_set(
         leftover = None
         if not done and DECAL_REPLACE_UNWRITABLE_AUTHORED:
             new_decal, notes, leftover = _replace_unwritable_decal(
-                d, comp, target, label, in_root=occ is None
+                d,
+                comp,
+                target,
+                label,
+                in_root=occ is None,
+                size_spec=(_STANDIN_SIZE_BY_KEY.get(key) or (None, None))[0]
+                if DECAL_APPLY_JSON_SIZE
+                else None,
             )
             lines.extend(notes)
             if new_decal is not None:
@@ -6241,6 +7103,7 @@ def apply_decal_color_set(
             )
             _DECAL_SWAP_FAILURES.append("{} ({})".format(label, which))
 
+    lines.extend(_report_unapplied_stand_in_sizes())
     return total, lines
 
 
