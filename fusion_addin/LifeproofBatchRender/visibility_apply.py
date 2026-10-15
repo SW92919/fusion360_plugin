@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import FrozenSet, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 import adsk.fusion
 
+from render_instructions import normalize_part_key
 from visibility_rules import visibility_for_description
 
 # Optional exact Fusion Browser names (normalized lower-case / stripped — use
@@ -508,6 +509,109 @@ def _silence_batch_hide_occurrence(occ: adsk.fusion.Occurrence) -> int:
     except Exception:
         pass
     return n
+
+
+def _component_match_keys(comp: adsk.fusion.Component) -> List[str]:
+    """Keys a render configuration's ``hideBodies`` name may legitimately match.
+
+    The client locates a part by its Part Number, but Fusion only populates
+    ``partNumber`` when it has been set explicitly — otherwise it mirrors the
+    component name. Both are checked, so either authoring style resolves.
+    """
+    keys: List[str] = []
+    for attr in ("name", "partNumber"):
+        try:
+            value = getattr(comp, attr, None)
+        except Exception:
+            continue
+        key = normalize_part_key(value or "")
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def hide_components_by_part_number(
+    root: adsk.fusion.Component, names: Sequence[str]
+) -> Tuple[int, List[str]]:
+    """Hide whole components / bodies listed in a render configuration's ``hideBodies``.
+
+    A name is matched against the occurrence name, its component name, the
+    component's Part Number, and body names — each with Fusion's ``(N)`` copy and
+    ``:N`` instance suffixes stripped, because the client writes ``L-Cap`` where the
+    browser shows ``L-Cap (1):1``.
+
+    Returns ``(entities_hidden, log_lines)``. A name matching nothing is reported
+    rather than skipped quietly: an un-hidden part produces a plausible-looking
+    render that is silently wrong, which is worse than a visible failure.
+    """
+    wanted: Dict[str, str] = {}
+    for name in names or ():
+        key = normalize_part_key(name or "")
+        if key:
+            wanted.setdefault(key, name)
+    if not wanted:
+        return 0, []
+
+    hidden = 0
+    matched: Dict[str, List[str]] = {}
+
+    def _record(key: str, label: str) -> None:
+        bucket = matched.setdefault(key, [])
+        if label not in bucket:
+            bucket.append(label)
+
+    for occ in _iter_occurrences_union(root):
+        try:
+            if hasattr(occ, "isValid") and not occ.isValid:
+                continue
+        except Exception:
+            continue
+        keys: List[str] = []
+        try:
+            occ_key = normalize_part_key(occ.name or "")
+            if occ_key:
+                keys.append(occ_key)
+        except Exception:
+            pass
+        try:
+            keys.extend(_component_match_keys(occ.component))
+        except Exception:
+            pass
+        hit = next((k for k in keys if k in wanted), None)
+        if hit is None:
+            continue
+        try:
+            label = occ.name or wanted[hit]
+        except Exception:
+            label = wanted[hit]
+        hidden += _silence_batch_hide_occurrence(occ)
+        _record(hit, label)
+
+    # Bodies at root (or whose owning occurrence did not itself match) — the client
+    # said "the entire Component / Body", so a bare body name is a valid target.
+    for body in _iter_bodies_recursive(root):
+        try:
+            key = normalize_part_key(body.name or "")
+        except Exception:
+            continue
+        if not key or key not in wanted:
+            continue
+        try:
+            if body.isLightBulbOn:
+                body.isLightBulbOn = False
+                hidden += 1
+            _record(key, body.name or wanted[key])
+        except Exception:
+            pass
+
+    lines: List[str] = []
+    for key, original in wanted.items():
+        hits = matched.get(key)
+        if hits:
+            lines.append("Hid '{}' -> {}".format(original, ", ".join(hits)))
+        else:
+            lines.append("NO MATCH for hideBodies '{}' — nothing hidden".format(original))
+    return hidden, lines
 
 
 def apply_batch_render_geometry_hides(

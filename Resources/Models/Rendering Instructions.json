@@ -1,0 +1,238 @@
+[
+  {
+    "fileName": "Bullnose",
+
+    "decals": [
+      {
+        "componentPartNumber": "Stair Nose",
+        "textureSize": {
+          "width": 9,
+          "length": 50,
+          "unit": "in"
+        }
+      },
+      {
+        "componentPartNumber": "Supplemental Plank",
+        "textureSize": {
+          "width": 7,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Full Front",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": [
+          "Supplemental Plank"
+        ]
+      },
+      {
+        "namedView": "Full Back",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Back",
+        "hideBodies": ["Supplemental Plank"]
+      }
+    ]
+  },
+  {
+    "fileName": "Square Nose",
+
+    "decals": [
+      {
+        "componentPartNumber": "Stair Nose",
+        "textureSize": {
+          "width": 9,
+          "length": 50,
+          "unit": "in"
+        }
+      },
+      {
+        "componentPartNumber": "Supplemental Plank",
+        "textureSize": {
+          "width": 7,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Full Front",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": [
+          "Supplemental Plank"
+        ]
+      }
+    ]
+  },
+  {
+    "fileName": "3-in-1",
+
+    "decals": [
+      {
+        "componentPartNumber": "3-In-1",
+        "textureSize": {
+          "width": 3,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Close Up",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": [
+          "Track"
+        ]
+      }
+    ]
+  },
+  {
+    "fileName": "End-Cap",
+
+    "decals": [
+      {
+        "componentPartNumber": "End Cap",
+        "textureSize": {
+          "width": 3,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Close Up",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": [
+          "Track"
+        ]
+      }
+    ]
+  },
+  {
+    "fileName": "L-Cap",
+
+    "decals": [
+      {
+        "componentPartNumber": "L-Cap",
+        "textureSize": {
+          "width": 3,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Close Up",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": []
+      }
+    ]
+  },
+  {
+    "fileName": "Reducer",
+
+    "decals": [
+      {
+        "componentPartNumber": "Reducer",
+        "textureSize": {
+          "width": 3,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Close Up",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": [
+          "Track"
+        ]
+      }
+    ]
+  },
+  {
+    "fileName": "T-Molding",
+
+    "decals": [
+      {
+        "componentPartNumber": "T-Molding",
+        "textureSize": {
+          "width": 2.5,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Close Up",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": [
+          "Track"
+        ]
+      }
+    ]
+  },
+  {
+    "fileName": "Quarter-Round",
+
+    "decals": [
+      {
+        "componentPartNumber": "Quarter Round",
+        "textureSize": {
+          "width": 2,
+          "length": 50,
+          "unit": "in"
+        }
+      }
+    ],
+
+    "renderConfigurations": [
+      {
+        "namedView": "Close Up",
+        "hideBodies": []
+      },
+      {
+        "namedView": "Full Front",
+        "hideBodies": []
+      }
+    ]
+  }
+]

@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "Batch Render",
+    "description": {
+        "": "Reports the component/body structure of the open model and flags which bodies are show-only skins and which are full solids that would put texture on the cut ends. Read-only."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

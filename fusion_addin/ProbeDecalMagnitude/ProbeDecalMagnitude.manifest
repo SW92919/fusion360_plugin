@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "Batch Render",
+    "description": {
+        "": "Measures what a Decal transform axis magnitude means in cm, so BATCH_DECAL_MAGNITUDE_CM_PER_UNIT can be set from a measurement instead of a guess. Creates nothing permanent."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

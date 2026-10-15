@@ -4,30 +4,40 @@ import adsk.core
 
 COMMAND_ID = "LifeproofBatchRenderCmd"
 
-INPUT_USE_BROWSE = "lbr_useBrowse"
+INPUT_INSTRUCTIONS = "lbr_renderInstructions"
 INPUT_TEXTURE_ROOT = "lbr_textureRoot"
 INPUT_MODEL_PATHS = "lbr_modelPaths"
+
+# "Browse..." buttons, each directly under the field it fills. Fusion cannot put a
+# button inside a text input, so they sit on their own row.
+INPUT_BROWSE_INSTRUCTIONS = "lbr_browseInstructions"
+INPUT_BROWSE_TEXTURE_ROOT = "lbr_browseTextureRoot"
+INPUT_BROWSE_MODEL_PATHS = "lbr_browseModelPaths"
+
+BROWSE_INPUT_IDS = (
+    INPUT_BROWSE_INSTRUCTIONS,
+    INPUT_BROWSE_TEXTURE_ROOT,
+    INPUT_BROWSE_MODEL_PATHS,
+)
 INPUT_IMG_W = "lbr_imgW"
 INPUT_IMG_H = "lbr_imgH"
+INPUT_QUALITY = "lbr_renderQuality"
 INPUT_FORMAT = "lbr_format"
 INPUT_PIPELINE = "lbr_pipeline"
-INPUT_MAX_NAMED_VIEWS = "lbr_maxNamedViews"
-INPUT_DECAL_SCALE_XY = "lbr_decalScaleXY"
 INPUT_PROGRESS = "lbr_progress"
 INPUT_STATUS = "lbr_status"
 
+DEFAULT_IMG_W = "2000"
+DEFAULT_IMG_H = "1130"
 
-def input_bool(ins: adsk.core.CommandInputs, iid: str, default: bool = False) -> bool:
-    inp = ins.itemById(iid)
-    if inp is None:
-        return default
-    try:
-        return bool(inp.value)
-    except Exception:
-        try:
-            return bool(inp.boolValue)
-        except Exception:
-            return default
+# Label → Fusion renderQuality (0-100). "Final (75)" is the client's default.
+RENDER_QUALITY_CHOICES = (
+    ("Draft (25)", 25),
+    ("Standard (50)", 50),
+    ("Final (75)", 75),
+    ("Excellent (100)", 100),
+)
+DEFAULT_RENDER_QUALITY = 75
 
 
 def _dropdown_selected_name(ins: adsk.core.CommandInputs, iid: str, default: str) -> str:
@@ -48,64 +58,69 @@ def read_format(ins: adsk.core.CommandInputs) -> str:
 
 
 def read_pipeline(ins: adsk.core.CommandInputs) -> str:
-    return _dropdown_selected_name(ins, INPUT_PIPELINE, "Auto (from .f3d filename)")
+    return _dropdown_selected_name(ins, INPUT_PIPELINE, "Auto (from render instructions)")
 
 
-def read_max_named_views(ins: adsk.core.CommandInputs, default: int = 0) -> int:
-    """0 = render every named view; N > 0 = only first N views (design browser order)."""
-    inp = ins.itemById(INPUT_MAX_NAMED_VIEWS)
+def read_render_quality(ins: adsk.core.CommandInputs, default: int = DEFAULT_RENDER_QUALITY) -> int:
+    """Fusion render quality (0-100) from the dropdown label."""
+    label = _dropdown_selected_name(ins, INPUT_QUALITY, "")
+    for name, value in RENDER_QUALITY_CHOICES:
+        if name == label:
+            return value
+    return default
+
+
+def read_instructions_path(ins: adsk.core.CommandInputs) -> str:
+    """Path to the client's Render Instructions JSON (validated by the controller)."""
+    inp = ins.itemById(INPUT_INSTRUCTIONS)
     if inp is None:
-        return default
+        return ""
     try:
-        from batch_config import parse_positive_int, read_textbox_or_string
+        from batch_config import read_textbox_or_string
 
         raw = read_textbox_or_string(inp).strip()
-        if not raw:
-            return default
-        return parse_positive_int(raw, default, 0, 50)
+        if raw:
+            return raw.strip('"').strip()
     except Exception:
-        return default
-
-
-def read_decal_scale_plane_xy(ins: adsk.core.CommandInputs, default: float = 1.0) -> float:
-    """Fusion Decal Scale Plane XY multiplier (after auto-fit)."""
-    inp = ins.itemById(INPUT_DECAL_SCALE_XY)
-    if inp is None:
-        return default
+        pass
     try:
-        from batch_config import parse_bounded_float, read_textbox_or_string
-
-        raw = read_textbox_or_string(inp).strip()
-        if not raw:
-            try:
-                raw = str(inp.value or "").strip()
-            except Exception:
-                raw = ""
-        if not raw:
-            return default
-        return parse_bounded_float(raw, default, 0.1, 20.0)
+        return str(inp.value or "").strip().strip('"').strip()
     except Exception:
-        return default
+        return ""
+
+
+def _add_browse_button(inputs: adsk.core.CommandInputs, iid: str, label: str) -> None:
+    """Clickable button row. A BoolValueInput with isCheckBox=False renders as one."""
+    try:
+        inputs.addBoolValueInput(iid, label, False, "", False)
+    except Exception:
+        pass
 
 
 def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
-    inputs.addBoolValueInput(
-        INPUT_USE_BROWSE,
-        "Pick texture folder and models with file dialogs (overrides path fields below)",
-        True,
+    inputs.addStringValueInput(
+        INPUT_INSTRUCTIONS,
+        "Render Instructions Location",
         "",
-        False,
+    )
+    _add_browse_button(
+        inputs, INPUT_BROWSE_INSTRUCTIONS, "   ... browse for instructions file"
     )
 
     inputs.addStringValueInput(
         INPUT_TEXTURE_ROOT,
-        "Texture root folder (full path, when browse is off)",
+        "Texture root folder",
         "",
     )
+    _add_browse_button(
+        inputs, INPUT_BROWSE_TEXTURE_ROOT, "   ... browse for texture folder"
+    )
+
     try:
         inputs.addTextBoxCommandInput(
             INPUT_MODEL_PATHS,
-            "Model files (.f3d) — one path per line, or separate with |",
+            "Model files (.f3d) — leave EMPTY to render every model in the "
+            "instructions file; or one path per line to render a subset",
             "",
             5,
             False,
@@ -113,24 +128,23 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
     except Exception:
         inputs.addStringValueInput(
             INPUT_MODEL_PATHS,
-            "Model paths (.f3d), | separated",
+            "Model paths (.f3d), | separated (empty = all from instructions)",
             "",
         )
-
-    inputs.addStringValueInput(INPUT_IMG_W, "Image width (px)", "1920")
-    inputs.addStringValueInput(INPUT_IMG_H, "Image height (px)", "1080")
-
-    inputs.addStringValueInput(
-        INPUT_MAX_NAMED_VIEWS,
-        "Max named views per color set (0 = all; e.g. 2 = first two views only)",
-        "0",
+    _add_browse_button(
+        inputs, INPUT_BROWSE_MODEL_PATHS, "   ... browse for model files (.f3d)"
     )
 
-    inputs.addStringValueInput(
-        INPUT_DECAL_SCALE_XY,
-        "Decal Scale Plane XY (multiplier after auto-fit; 1.0 = auto-fit only)",
-        "1.0",
+    inputs.addStringValueInput(INPUT_IMG_W, "Image width (px)", DEFAULT_IMG_W)
+    inputs.addStringValueInput(INPUT_IMG_H, "Image height (px)", DEFAULT_IMG_H)
+
+    quality = inputs.addDropDownCommandInput(
+        INPUT_QUALITY,
+        "Render Quality",
+        adsk.core.DropDownStyles.TextListDropDownStyle,
     )
+    for name, value in RENDER_QUALITY_CHOICES:
+        quality.listItems.add(name, value == DEFAULT_RENDER_QUALITY)
 
     fmt = inputs.addDropDownCommandInput(
         INPUT_FORMAT,
@@ -145,7 +159,10 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
         "Texture pipeline",
         adsk.core.DropDownStyles.TextListDropDownStyle,
     )
-    pipe.listItems.add("Auto (from .f3d filename)", True)
+    # "Auto" now reads the mode from the Render Instructions entry (decals[]
+    # present → decal), not from the .f3d filename — the new model files no
+    # longer carry a "Decal"/"Appearance" suffix to sniff.
+    pipe.listItems.add("Auto (from render instructions)", True)
     pipe.listItems.add("Force Appearance", False)
     pipe.listItems.add("Force Decal", False)
 
@@ -163,6 +180,32 @@ def build_command_inputs(inputs: adsk.core.CommandInputs) -> None:
             inputs.addStringValueInput(INPUT_STATUS, "Status", "")
         except Exception:
             pass
+
+
+def set_text_input(ins: adsk.core.CommandInputs, iid: str, text: str) -> bool:
+    """Write into a string or textbox input, whichever this build created."""
+    inp = ins.itemById(iid)
+    if inp is None:
+        return False
+    for attr in ("text", "formattedText", "value"):
+        if hasattr(inp, attr):
+            try:
+                setattr(inp, attr, text)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def reset_browse_button(ins: adsk.core.CommandInputs, iid: str) -> None:
+    """Clear a button's pressed state so it can be clicked again."""
+    inp = ins.itemById(iid)
+    if inp is None:
+        return
+    try:
+        inp.value = False
+    except Exception:
+        pass
 
 
 def set_status(ins: adsk.core.CommandInputs, text: str) -> None:

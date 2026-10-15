@@ -14,6 +14,17 @@ from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 import adsk.core  # type: ignore
 import adsk.fusion  # type: ignore
 
+# Mtime of THIS file at the moment it was imported. Fusion keeps one interpreter
+# per session, so an edited file is not reloaded until the add-in is stopped and
+# started again. Comparing this against the file's CURRENT mtime is the only
+# reliable way to tell whether the code running is the code on disk — a stamp
+# built from file mtimes alone reports "fresh" even while stale code executes.
+try:
+    MODULE_IMPORTED_MTIME: float = os.path.getmtime(__file__)
+except Exception:
+    MODULE_IMPORTED_MTIME = 0.0
+
+import image_orient
 from visibility_apply import (
     _body_hide_for_batch,
     _mesh_hide_for_batch,
@@ -164,7 +175,19 @@ APPEARANCE_BROADCAST: bool = False
 #     (this Fusion build doesn't expose decal.faces), so the proven batch
 #     projection path (auto-size + grain-align to length) is what gives correct
 #     coverage and direction — exactly how it worked before the appearance fix.
-FORCE_BODY_COVERAGE: bool = True
+# OFF since 2026-10-14: the client re-authored every model with a decal that is
+# already placed exactly where the texture belongs — covering the visible profile
+# and stopping cleanly at the cut ends. Batch projection existed to work around
+# the OLD models, whose authored decals did not cover properly, and it cannot
+# reproduce that placement: a projected decal is applied to a BODY and Fusion
+# wraps it onto every face of that body (Decal.redefine), so it always reaches
+# the cut ends. Worse, it DELETED the good authored decals first.
+#
+# With this off, decal mode simply swaps imageFilename on the authored decals and
+# inherits the designer's placement, size and orientation.
+#
+# Turn back ON only for a model with NO usable authored decal.
+FORCE_BODY_COVERAGE: bool = False
 
 # When True, batch decals (chain faces + Scale Plane XY) texture visible tread
 # bodies even when a library carrier is available. Keeps manual-decal-like
@@ -310,6 +333,37 @@ BATCH_DECAL_FIT_DEFAULT_AXIS_MULTIPLIER: float = 1.0
 # effect as the Fusion gizmo / Keep Aspect Ratio — NOT separate width/height).
 BATCH_DECAL_USE_SCALE_PLANE_XY: bool = True
 
+# --- Absolute decal sizing (client's Render Instructions) -------------------
+# Size each decal to an exact physical size from the JSON instead of auto-fitting
+# to the body. Independent X/Y magnitudes on DecalInput.transform — the Fusion API
+# supports non-uniform axis magnitudes; horizontalScale/verticalScale do not exist.
+BATCH_DECAL_ABSOLUTE_SIZE: bool = True
+
+# When True a sizing failure aborts the decal (body renders bare = obvious) rather
+# than silently falling back to cover-fit (renders plausible but wrong size).
+BATCH_DECAL_ABSOLUTE_SIZE_STRICT: bool = True
+
+# Centimetres of rendered extent per 1.0 of transform-axis magnitude.
+#
+# 1.0 → magnitude IS the full extent (9 in → |Y| = 22.86)
+# 2.0 → magnitude is the HALF extent  (9 in → |Y| = 11.43)
+#
+# NOT PROVEN from the code, so it is a constant rather than an assumption baked
+# into the arithmetic. The only measurement in this repo is the comment above
+# BATCH_DECAL_FIT_DEFAULT_AXIS_MULTIPLIER ("legacy 2.0 * axis_len undershot render
+# ~2x"), and that is one equation in two unknowns: shortfall = 2 * W / k, where W is
+# (extent actually needed to cover) / (projected bbox span). Chain faces are ON, so a
+# decal wraps and W > 1 on curved parts — a quarter-round of radius r has projected
+# width r but developed width ~1.57r. Both {k=1, W=1} and {k=2, W~1.8} reproduce every
+# number recorded in this file, and Fusion's own stub uses magnitude-as-radius for
+# ellipse axes while calling the decal transform origin the decal's CENTRE.
+#
+# TO SETTLE IT (~1 minute): run tools/probe_decal_magnitude.py in Fusion. It creates a
+# DecalInput on a flat face with chain-faces off, prints the default magnitudes, and
+# compares them against Fusion's documented ~5 cm default patch (referenced in five
+# places in this file). If it reports k=2.0, change this constant — nothing else.
+BATCH_DECAL_MAGNITUDE_CM_PER_UNIT: float = 1.0
+
 # Fusion DECAL dialog **Scale Plane XY** slider — uniform multiplier applied
 # after auto-fit to the body bbox in decal-local axes (manual bullnose ~1.8).
 # Overridden per batch from the plugin UI when set.
@@ -317,6 +371,207 @@ BATCH_DECAL_SCALE_PLANE_XY: float = 1
 
 # Set by controller from UI; None = use ``BATCH_DECAL_SCALE_PLANE_XY`` above.
 _RUNTIME_DECAL_SCALE_PLANE_XY: Optional[float] = None
+
+# Per-model decal targets from the Render Instructions JSON, keyed by
+# ``render_instructions.normalize_part_key(componentPartNumber)``. Each value is a
+# ``DecalSizeSpec`` (width_cm / length_cm / slot / part_number). Set once per model
+# by the controller; empty means "no JSON targets" and the legacy filename-derived
+# targeting applies.
+_DECAL_TARGETS_BY_PART: Dict[str, Any] = {}
+
+
+# --- Authored-decal image swap ----------------------------------------------
+# A decal's footprint is its transform: |X| x |Y| in cm (Bullnose plank 13.0 x
+# 121.5), with the image's horizontal axis along X, and Fusion stretches whatever
+# image it is given over that footprint. Most footprints run along Y (portrait)
+# while the client's colour-set rasters are LANDSCAPE (2500x486 ...), so dropped in
+# as-is the texture runs ACROSS the part. The raster is therefore turned 90 degrees
+# whenever its long side would otherwise lie across the footprint's long side ...
+DECAL_MATCH_AUTHORED_IMAGE_ORIENTATION: bool = True
+# ... deciding from the footprint first, and from the designer's own image only
+# when the footprint is not clearly elongated or unreadable (on Bullnose the two
+# agree; its footprints are 9.3:1 and 5.5:1).
+DECAL_ORIENT_BY_FOOTPRINT: bool = True
+DECAL_FOOTPRINT_DECISIVE_RATIO: float = 1.5
+# Also resample to the authored image's proportions. With the footprint fixed this
+# does not move or resize the decal; it is kept because it is exactly what produced
+# the approved Bullnose renders. Skipped when the authored image ran the other way
+# to the footprint (fitting to it would only throw resolution away).
+DECAL_CONFORM_TO_AUTHORED_ASPECT: bool = True
+# Clockwise vs counter-clockwise only decides which END of the part the image
+# starts from (a 180-degree difference). Flip if directional artwork reads backwards.
+DECAL_IMAGE_ROTATE_CLOCKWISE: bool = True
+# When an authored decal refuses a new image (its face reference is broken in the
+# .f3d), hide it and create a stand-in with the SAME placement. Off = just report.
+DECAL_REPLACE_UNWRITABLE_AUTHORED: bool = True
+# Log one state line per authored decal per model.
+DECAL_PROBE_LOG: bool = True
+
+# Per-model bookkeeping for authored decals, keyed by (component id, index in that
+# component's Decals folder). Reset by ``set_decal_targets`` for every model.
+_AUTHORED_SLOT_BY_KEY: Dict[Tuple[str, int], int] = {}
+_AUTHORED_IMAGE_BY_KEY: Dict[Tuple[str, int], Tuple[Any, Any, str]] = {}
+_RETIRED_AUTHORED_KEYS: Set[Tuple[str, int]] = set()
+_PROBED_DECAL_KEYS: Set[Tuple[str, int]] = set()
+_SKIP_REPORTED_KEYS: Set[Tuple[str, int]] = set()
+# Why each decal never renders AS THE DESIGNER SAVED IT ("" = it renders). Taken the
+# first time a decal is seen, before anything is written, so a decal this add-in
+# hid itself is never mistaken for one the designer switched off.
+_DESIGNER_INACTIVE_BY_KEY: Dict[Tuple[str, int], str] = {}
+# Stand-ins that failed verification and could not be removed: they carry the part
+# from then on, but every colour set is flagged for a visual check.
+_SUSPECT_STAND_IN_KEYS: Set[Tuple[str, int]] = set()
+_DECAL_SWAP_FAILURES: List[str] = []
+_CURRENT_MODEL_PATH: Optional[Path] = None
+_EMBEDDED_SIZES_BY_MODEL: Dict[Path, list] = {}
+# Picking a decal's image among several embedded ones (see _pick_embedded_image),
+# as natural-log differences of width/height: 0.03 ~ 3 %, 0.05 ~ 5 %.
+_EMBEDDED_FOOTPRINT_MATCH_TOL: float = 0.03
+_EMBEDDED_SIMILAR_TOL: float = 0.05
+
+
+def set_decal_targets(
+    targets: Optional[Dict[str, Any]], model_path: Optional[Path] = None
+) -> None:
+    """Install this model's JSON decal targets (part_key -> DecalSizeSpec).
+
+    Called once per model, so it is also where the per-model authored-decal
+    bookkeeping is reset — component ids and decal indexes mean nothing across
+    documents.
+    """
+    global _DECAL_TARGETS_BY_PART, _CURRENT_MODEL_PATH
+    _DECAL_TARGETS_BY_PART = dict(targets or {})
+    _CURRENT_MODEL_PATH = Path(model_path) if model_path else None
+    _AUTHORED_SLOT_BY_KEY.clear()
+    _AUTHORED_IMAGE_BY_KEY.clear()
+    _RETIRED_AUTHORED_KEYS.clear()
+    _PROBED_DECAL_KEYS.clear()
+    _SKIP_REPORTED_KEYS.clear()
+    _DESIGNER_INACTIVE_BY_KEY.clear()
+    _SUSPECT_STAND_IN_KEYS.clear()
+    _EMBEDDED_SIZES_BY_MODEL.clear()
+
+
+def get_decal_targets() -> Dict[str, Any]:
+    return _DECAL_TARGETS_BY_PART
+
+
+def _part_key(name: str) -> str:
+    """Normalize a Fusion browser name for comparison with a JSON part number."""
+    try:
+        from render_instructions import normalize_part_key
+
+        return normalize_part_key(name or "")
+    except Exception:
+        return re.sub(r"[\s\-_]+", "-", (name or "").strip().lower()).strip("-")
+
+
+def decal_target_for_names(*names: str) -> Optional[Any]:
+    """First JSON decal target matching any of these occurrence/component/body names."""
+    if not _DECAL_TARGETS_BY_PART:
+        return None
+    for name in names:
+        if not name:
+            continue
+        spec = _DECAL_TARGETS_BY_PART.get(_part_key(name))
+        if spec is not None:
+            return spec
+    return None
+
+
+def _json_slot_for_component(comp: Any, occ: Any = None) -> Optional[int]:
+    """Slot for an authored decal, from the component whose Decals folder holds it.
+
+    Preferred over ``_json_slot_for_decal`` because it needs nothing from the decal
+    itself — it works even when the decal's face cannot be resolved by the API.
+    """
+    if not _DECAL_TARGETS_BY_PART or comp is None:
+        return None
+    names: List[str] = []
+    for getter in (
+        lambda: occ.name,
+        lambda: comp.name,
+        lambda: comp.partNumber,
+    ):
+        try:
+            value = getter()
+        except Exception:
+            continue
+        if value:
+            names.append(value)
+    spec = decal_target_for_names(*names)
+    slot = getattr(spec, "slot", None) if spec is not None else None
+    return slot if slot in (1, 2) else None
+
+
+def _json_slot_for_decal_face(decal: Any) -> Tuple[Optional[int], bool]:
+    """``(slot, face_readable)`` from the part a ROOT-folder decal's face is on.
+
+    The root Decals folder says nothing about which part a decal textures, and
+    the ROOT's own name must never be used: in most of the one-tone models it is
+    the product name itself ("End Cap", "L-Cap" ...) and would match the trim for
+    every root decal. The face does tell: a face on a sub-part is a proxy whose
+    ``assemblyContext`` is that part's occurrence. A face with no assembly context
+    lies on a root body — not a listed part.
+    """
+    try:
+        face = decal.faces[0]
+    except Exception:
+        return None, False
+    if face is None:
+        return None, False
+    if not _DECAL_TARGETS_BY_PART:
+        return None, True
+    try:
+        occ = face.assemblyContext
+    except Exception:
+        occ = None
+    if occ is None:
+        return None, True
+    names: List[str] = []
+    for getter in (
+        lambda: occ.name,
+        lambda: occ.component.name,
+        lambda: occ.component.partNumber,
+    ):
+        try:
+            value = getter()
+        except Exception:
+            continue
+        if value:
+            names.append(value)
+    spec = decal_target_for_names(*names)
+    slot = getattr(spec, "slot", None) if spec is not None else None
+    return (slot if slot in (1, 2) else None), True
+
+
+def _size_spec_for_body(
+    body: Optional[Any], occurrence_label: str = ""
+) -> Optional[Any]:
+    """JSON decal size for the part this body belongs to, or None.
+
+    The JSON names COMPONENTS ("Stair Nose"), so the occurrence and component names
+    are tried before the body's own name — a body is typically called something like
+    ``Nose Skin (7)`` and would not match.
+    """
+    if not _DECAL_TARGETS_BY_PART:
+        return None
+    names: List[str] = []
+    if occurrence_label and occurrence_label != "(root)":
+        names.append(occurrence_label)
+    if body is not None:
+        for getter in (
+            lambda: body.parentComponent.name,
+            lambda: body.parentComponent.partNumber,
+            lambda: body.name,
+        ):
+            try:
+                value = getter()
+            except Exception:
+                continue
+            if value:
+                names.append(value)
+    return decal_target_for_names(*names)
 
 
 def get_decal_scale_plane_xy() -> float:
@@ -447,6 +702,26 @@ BATCH_DECAL_BODY_PREFER_KEYWORDS: Tuple[str, ...] = (
     "satin",
     "striped",
 )
+
+# Body-NAME fragments marking the visible show surface. The client's models name
+# it "<Part> Skin" — ``Nose Skin``, ``Plank Skin`` — and that is the body the
+# texture has to land on.
+#
+# Ranked ABOVE BATCH_DECAL_BODY_PREFER_KEYWORDS because those are matched against
+# a haystack that includes the body's APPEARANCE name, and an internal body can
+# carry a "Steel - Satin" appearance too. That is exactly what went wrong on
+# Bullnose: Supplemental Plank's internal ``Body2`` (appearance "Steel - Satin2")
+# scored 4x and took the decal, leaving ``Plank Skin`` bare and the steel body
+# showing through the render.
+#
+# "wear layer" is the same idea under the older naming: in Square Nose the Stair
+# Nose holds both ``Nose`` and ``Nose Wear Layer``, whose scores came out 141723 vs
+# 141722 — a one-unit margin, i.e. a coin flip between the substrate and the visible
+# surface. BATCH_DECAL_ROOT_ANCHOR_BODIES already lists "Nose Wear Layer" ahead of
+# "Nose" for exactly this reason; this makes that preference apply to body scoring
+# too instead of only to the root-anchor path.
+BATCH_DECAL_BODY_PREFER_NAME_KEYWORDS: Tuple[str, ...] = ("skin", "wear layer", "wearlayer")
+BATCH_DECAL_BODY_PREFER_NAME_KEYWORD_RANK: float = 50.0
 
 # When True, the plugin also rewrites ``imageFilename`` on every user-
 # authored decal in the .f3d (anything not named ``LifeproofBatchDecal_*``).
@@ -582,7 +857,6 @@ _DECAL_SLOT: Dict[int, int] = {}
 # slot even though its name became "Color Set 0X-1" after the first swap. Without
 # this, later color sets fall back to positional order and can swap _1/_2 onto
 # the wrong physical decal. Cleared per batch in clear_decal_shift_temp_files.
-_AUTHORED_DECAL_SLOT: Dict[str, int] = {}
 
 
 class TemplateDecalHint:
@@ -612,6 +886,7 @@ class DecalPlacementRecord:
         "chain_faces",
         "template_hint",
         "center_override",
+        "size_spec",
     )
 
     def __init__(
@@ -623,7 +898,11 @@ class DecalPlacementRecord:
         chain_faces: Optional[bool],
         template_hint: Optional[TemplateDecalHint],
         center_override: Optional[adsk.core.Point3D] = None,
+        size_spec: Optional[Any] = None,
     ) -> None:
+        # Absolute size must survive the delete/recreate that every colour set
+        # triggers, or only the first colour set would be correctly sized.
+        self.size_spec = size_spec
         self.decals_collection = decals_collection
         self.face = face
         self.body = body
@@ -678,7 +957,6 @@ def clear_decal_shift_temp_files() -> None:
         _unlink_silent(p)
     _decal_shift_temp_paths.clear()
     _decal_shift_pil_warning_emitted = False
-    _AUTHORED_DECAL_SLOT.clear()
 
 
 def _roll_image_horizontal_to_temp_png(src: Path, dx_px: int) -> Optional[str]:
@@ -1303,18 +1581,28 @@ def _set_decal_image(decal: "adsk.fusion.Decal", image_path: str) -> Tuple[bool,
         return False, str(ex)
 
 
-def _collect_all_decals(design: adsk.fusion.Design) -> List[adsk.fusion.Decal]:
-    """Return every Decal in the design (root + every sub-component), deduped.
+def _collect_decals_with_owner(
+    design: adsk.fusion.Design,
+) -> List[Tuple[adsk.fusion.Decal, Any, Any, int]]:
+    """Every Decal as ``(decal, owning_component, an_occurrence_or_None, index)``.
+
+    ``index`` is the decal's position in its component's Decals folder; together
+    with the component id it identifies the decal for the whole session.
 
     Decals can live on the root component **or inside any nested component**
     (e.g. ``Plank:1 → Decals``). Walking only ``root.decals`` would miss those
     and leave their ``imageFilename`` untouched, so the render keeps the
     original placeholder texture on the affected surface.
+
+    The owner is recorded HERE, from the collection the decal was found in,
+    because ``Decal`` has no ``parentComponent`` and going through
+    ``decal.faces[0].body`` fails on a decal whose face the API cannot resolve
+    (Bullnose's "dusk-cherry - 1 - Horizontal" reports ``faces == [None]``).
     """
-    decals: List[adsk.fusion.Decal] = []
+    found: List[Tuple[adsk.fusion.Decal, Any, Any, int]] = []
     seen: set = set()
 
-    def _drain(comp: adsk.fusion.Component) -> None:
+    def _drain(comp: adsk.fusion.Component, occ: Any) -> None:
         try:
             key = comp.id
         except Exception:
@@ -1332,25 +1620,31 @@ def _collect_all_decals(design: adsk.fusion.Design) -> List[adsk.fusion.Decal]:
             return
         for j in range(n):
             try:
-                decals.append(comp_decals.item(j))
+                found.append((comp_decals.item(j), comp, occ, j))
             except Exception:
                 continue
 
     try:
-        _drain(design.rootComponent)
+        _drain(design.rootComponent, None)
     except Exception:
-        return decals
+        return found
     try:
         occs = design.rootComponent.allOccurrences
     except Exception:
-        return decals
+        return found
     for i in range(occs.count):
         try:
-            comp = occs.item(i).component
+            occ = occs.item(i)
+            comp = occ.component
         except Exception:
             continue
-        _drain(comp)
-    return decals
+        _drain(comp, occ)
+    return found
+
+
+def _collect_all_decals(design: adsk.fusion.Design) -> List[adsk.fusion.Decal]:
+    """Return every Decal in the design (root + every sub-component), deduped."""
+    return [d for d, _comp, _occ, _j in _collect_decals_with_owner(design)]
 
 
 def _entity_is_visible(entity: Any, *, default: bool = True) -> bool:
@@ -1792,6 +2086,28 @@ def _occurrence_is_batch_target(
     label = (occurrence_label or "").strip()
     if not label:
         return False
+    # The Render Instructions name the target components explicitly, so when they
+    # are present they are the authority. The legacy path below derives the target
+    # from the .f3d FILENAME, which stopped matching when the client renamed the
+    # models (Bullnose.f3d no longer contains "Treads Plus", and the components are
+    # "Stair Nose" / "Supplemental Plank") — that would decal nothing at all.
+    if _DECAL_TARGETS_BY_PART:
+        # Every JSON target is a real occurrence in these models (Stair Nose:1,
+        # L-Cap (1):1, 3-In-1:1 ...). Root is skipped so a design whose root
+        # component shares the product's name cannot be decaled a second time
+        # on top of the occurrence that already matched.
+        if label == "(root)":
+            return False
+        names = [label]
+        if comp is not None:
+            for attr in ("name", "partNumber"):
+                try:
+                    value = getattr(comp, attr, None)
+                except Exception:
+                    continue
+                if value:
+                    names.append(value)
+        return decal_target_for_names(*names) is not None
     if label == "(root)":
         if not BATCH_DECAL_MAIN_BODY_FROM_FILENAME or not main_token or comp is None:
             return False
@@ -1819,6 +2135,13 @@ def _resolve_forced_body_name(
     mapped = _occurrence_forced_body_name_from_map(occurrence_label)
     if mapped:
         return mapped
+    # With Render Instructions targets, do NOT guess a body name from the .f3d
+    # filename. That path derives the body from the OCCURRENCE name, which is the
+    # component ("End Cap (1)") while the body inside is "End Cap" — so it pinned a
+    # body that does not exist and every one of those models produced 0 decals.
+    # Returning None lets the show-body scoring choose, which is what already works.
+    if _DECAL_TARGETS_BY_PART:
+        return None
     label = (occurrence_label or "").strip()
     if label == "(root)" and BATCH_DECAL_MAIN_BODY_FROM_FILENAME and main_token:
         return _resolve_root_batch_anchor_body(comp, main_token)
@@ -2058,6 +2381,13 @@ def _body_decal_rank_multiplier(
     for prefer in BATCH_DECAL_BODY_PREFER_NAMES:
         if _body_name_matches_map_anchor(body_name, prefer):
             return float(BATCH_DECAL_BODY_PREFER_NAME_RANK)
+    # Body NAME only — deliberately not the appearance haystack below, so a
+    # "<Part> Skin" show body always beats an internal body that merely happens
+    # to carry a Steel/Satin appearance.
+    name_only = _normalize_fusion_body_name(body_name).lower()
+    for kw in BATCH_DECAL_BODY_PREFER_NAME_KEYWORDS:
+        if kw and kw.lower() in name_only:
+            return float(BATCH_DECAL_BODY_PREFER_NAME_KEYWORD_RANK)
     haystack = _body_filter_haystack(body, label, original_appearance_names)
     for kw in BATCH_DECAL_BODY_PREFER_KEYWORDS:
         if kw.lower() in haystack:
@@ -2230,6 +2560,63 @@ def _is_end_cap_face(
     lx, ly, lz = _body_unit_length_axis(body)
     dot = abs(normal[0] * lx + normal[1] * ly + normal[2] * lz)
     return dot >= float(BATCH_DECAL_END_CAP_NORMAL_DOT)
+
+
+def audit_decal_body_is_show_only(
+    body: adsk.fusion.BRepBody,
+) -> Tuple[bool, str]:
+    """Is this body a show-only 'Skin', or a full solid that includes cut ends?
+
+    ``isChainFaces=True`` makes Fusion wrap the decal onto EVERY face of the body
+    (Autodesk's own wording in Decal.redefine), so the add-in cannot stop the
+    texture reaching the cut ends — the BODY decides the painted set.
+
+    Bullnose renders correctly because its ``Nose Skin`` holds only the visible
+    outer surface. A body that still contains end-cap faces will show texture on
+    the cut ends no matter what this code does, so the model has to be fixed, not
+    the pipeline. That makes this audit the fastest way to tell whether a given
+    .f3d is ready.
+
+    Returns ``(is_show_only, human_readable_summary)``.
+    """
+    try:
+        faces = body.faces
+        n = faces.count
+    except Exception as ex:
+        return False, "faces unreadable ({})".format(ex)
+    if not n:
+        return False, "no faces"
+
+    n_end_cap = 0
+    end_cap_area = 0.0
+    total_area = 0.0
+    for i in range(n):
+        try:
+            f = faces.item(i)
+        except Exception:
+            continue
+        try:
+            area = _face_area(f)
+        except Exception:
+            area = 0.0
+        total_area += area
+        try:
+            if _is_end_cap_face(f, body):
+                n_end_cap += 1
+                end_cap_area += area
+        except Exception:
+            continue
+
+    show_only = n_end_cap == 0
+    verdict = "SHOW-ONLY (safe to chain-wrap)" if show_only else (
+        "FULL SOLID — {} cut-end face(s), {:.0f} cm²: the texture WILL reach the "
+        "cut ends. Needs a show-only skin body like Bullnose's 'Nose Skin'.".format(
+            n_end_cap, end_cap_area
+        )
+    )
+    return show_only, "{} face(s), {:.0f} cm² total, {} end-cap → {}".format(
+        n, total_area, n_end_cap, verdict
+    )
 
 
 def _face_qualifies_for_decal(
@@ -2527,7 +2914,13 @@ def _matrix_from_axes(
     y_axis: adsk.core.Vector3D,
     z_axis: adsk.core.Vector3D,
 ) -> Tuple[Optional[adsk.core.Matrix3D], Optional[str]]:
-    """Build a Matrix3D from a decal coordinate system (multi-method fallback)."""
+    """Build a Matrix3D from a decal coordinate system (multi-method fallback).
+
+    ``setWithCoordinateSystem`` returns a bool — Fusion rejects a coordinate system
+    whose axes are degenerate or not usable. That result used to be discarded, so a
+    rejected system returned an untouched identity matrix that then read as success
+    and silently placed the decal at Fusion's default size and orientation.
+    """
     m = adsk.core.Matrix3D.create()
     for method_name in (
         "setWithCoordinateSystem",
@@ -2536,7 +2929,9 @@ def _matrix_from_axes(
     ):
         try:
             method = getattr(m, method_name)
-            method(origin, x_axis, y_axis, z_axis)
+            result = method(origin, x_axis, y_axis, z_axis)
+            if result is False:
+                return None, "{} rejected the coordinate system".format(method_name)
             return m, None
         except TypeError:
             continue
@@ -2589,6 +2984,123 @@ def _apply_xy_scale_to_transform(
     except Exception as ex:
         last_err = str(ex)
     return None, last_err
+
+
+def _resolve_size_axis_targets(
+    trf: adsk.core.Matrix3D,
+    body: Optional[adsk.fusion.BRepBody],
+    width_cm: float,
+    length_cm: float,
+) -> Tuple[float, float, str]:
+    """Decide which decal-local axis carries ``length_cm`` vs ``width_cm``.
+
+    ``length`` is the part's LONG direction (the client's 50 in) and ``width`` runs
+    across it. Grain alignment normally rotates decal-local X onto the body length
+    (``BATCH_DECAL_ALIGN_GRAIN_USE_Y_AXIS`` is False), but that rotation can be
+    skipped — curved faces, a template hint, or a body whose long axis can't be
+    determined — so the assignment is resolved from the ACTUAL axes rather than
+    assumed. Same dot-product test ``_apply_bbox_floor_to_decal_needs`` uses.
+
+    Returns ``(target_x_cm, target_y_cm, note)``.
+    """
+    default = (length_cm, width_cm, "x=length (grain default)")
+    if body is None:
+        return default
+    try:
+        _origin, x_axis, y_axis, _z_axis = trf.getAsCoordinateSystem()
+    except Exception:
+        return default
+    x_u = _vec3_normalize(_vec3_from_vector3d(x_axis))
+    y_u = _vec3_normalize(_vec3_from_vector3d(y_axis))
+    if x_u is None or y_u is None:
+        return default
+    try:
+        long_axis = _body_unit_length_axis(body)
+    except Exception:
+        return default
+    if long_axis is None:
+        return default
+    dot_x = abs(_vec3_dot(x_u, long_axis))
+    dot_y = abs(_vec3_dot(y_u, long_axis))
+    if dot_y > dot_x:
+        return (
+            width_cm,
+            length_cm,
+            "y=length (|dot| y={:.2f} > x={:.2f})".format(dot_y, dot_x),
+        )
+    return (
+        length_cm,
+        width_cm,
+        "x=length (|dot| x={:.2f} >= y={:.2f})".format(dot_x, dot_y),
+    )
+
+
+def _apply_absolute_size_to_matrix(
+    trf: adsk.core.Matrix3D,
+    body: Optional[adsk.fusion.BRepBody],
+    width_cm: float,
+    length_cm: float,
+) -> Tuple[Optional[str], Optional[adsk.core.Matrix3D], List[str]]:
+    """Set INDEPENDENT X/Y axis magnitudes so the decal lands at an exact size.
+
+    Unlike ``_apply_scale_plane_xy_to_matrix`` (one uniform factor chosen to COVER
+    the body) this ignores the body's extent entirely: the decal becomes exactly
+    ``width_cm`` x ``length_cm``, which is what the client's JSON specifies.
+
+    Origin, Z axis and in-plane rotation are preserved — only the X/Y magnitudes
+    change. Returns ``(error, matrix, diagnostic_lines)``.
+    """
+    diag: List[str] = []
+    if width_cm <= 0.0 or length_cm <= 0.0:
+        return "non-positive target size", None, diag
+    try:
+        origin, x_axis, y_axis, z_axis = trf.getAsCoordinateSystem()
+    except Exception as ex:
+        return "getAsCoordinateSystem: {}".format(ex), None, diag
+
+    x_len = _vector_length(x_axis)
+    y_len = _vector_length(y_axis)
+    if x_len < 1e-9 or y_len < 1e-9:
+        return "degenerate decal axes", None, diag
+
+    target_x_cm, target_y_cm, axis_note = _resolve_size_axis_targets(
+        trf, body, width_cm, length_cm
+    )
+
+    k = max(float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT), 1e-9)
+    mag_x = target_x_cm / k
+    mag_y = target_y_cm / k
+
+    try:
+        new_x = adsk.core.Vector3D.create(
+            x_axis.x / x_len * mag_x, x_axis.y / x_len * mag_x, x_axis.z / x_len * mag_x
+        )
+        new_y = adsk.core.Vector3D.create(
+            y_axis.x / y_len * mag_y, y_axis.y / y_len * mag_y, y_axis.z / y_len * mag_y
+        )
+    except Exception as ex:
+        return "axis rebuild: {}".format(ex), None, diag
+
+    rebuilt, err = _matrix_from_axes(origin, new_x, new_y, z_axis)
+    if rebuilt is None:
+        return err or "matrix rebuild failed", None, diag
+
+    diag.append(
+        "absolute size: target {:.2f}x{:.2f} cm ({:.2f}x{:.2f} in) | {} | "
+        "magnitudes {:.3f}x{:.3f} (k={:.2f} cm/unit) | was {:.3f}x{:.3f}".format(
+            target_x_cm,
+            target_y_cm,
+            target_x_cm / 2.54,
+            target_y_cm / 2.54,
+            axis_note,
+            mag_x,
+            mag_y,
+            k,
+            x_len,
+            y_len,
+        )
+    )
+    return None, rebuilt, diag
 
 
 def _slice_image_for_tile(
@@ -3179,10 +3691,17 @@ def _decal_readback_log_line(decal: adsk.fusion.Decal) -> str:
         m = decal.transform
         if m is not None:
             _o, x_axis, y_axis, _z = m.getAsCoordinateSystem()
+            # Report the RAW magnitudes plus the size they imply under the current
+            # BATCH_DECAL_MAGNITUDE_CM_PER_UNIT. This line used to hard-code a x2
+            # (half-extent) reading while the sizing arithmetic assumed x1 — the two
+            # disagreed, so the instrument could not be used to check the geometry.
+            mx = _vector_length(x_axis)
+            my = _vector_length(y_axis)
+            k = max(float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT), 1e-9)
             parts.append(
-                "decalSizeXY=({:.2f}x{:.2f} cm)".format(
-                    _vector_length(x_axis) * 2.0,
-                    _vector_length(y_axis) * 2.0,
+                "decalMagXY=({:.3f}x{:.3f}) => {:.2f}x{:.2f} cm @k={:.1f} "
+                "({:.2f}x{:.2f} in)".format(
+                    mx, my, mx * k, my * k, k, mx * k / 2.54, my * k / 2.54
                 )
             )
             uv_deg = _decal_x_axis_angle_in_face_plane_deg(m)
@@ -3262,8 +3781,12 @@ def _configure_decal_create_input(
     *,
     chain_faces: Optional[bool] = None,
     template_hint: Optional[TemplateDecalHint] = None,
+    size_spec: Optional[Any] = None,
 ) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[adsk.core.Matrix3D], List[str], Optional[bool]]:
-    """Apply chain faces, grain align, Z angle, and Scale Plane XY on ``DecalInput``.
+    """Apply chain faces, grain align, Z angle, and sizing on ``DecalInput``.
+
+    ``size_spec`` (a ``render_instructions.DecalSizeSpec``) switches sizing from
+    auto cover-fit to the exact physical size the client's JSON asks for.
 
     Returns ``(error, scale_xy_factor, scale_warning, final_transform, scale_diag, use_chain)``.
     """
@@ -3329,7 +3852,42 @@ def _configure_decal_create_input(
     scale_diag: List[str] = []
     need_x = 0.0
     need_y = 0.0
-    if BATCH_DECAL_USE_SCALE_PLANE_XY:
+
+    # Absolute sizing from the Render Instructions wins over cover-fit: the client
+    # specifies an exact physical size per component, so the body's extent is
+    # irrelevant. Cover-fit still runs for decals with no JSON target (tiles,
+    # secondary parts) and when absolute sizing is switched off.
+    if size_spec is not None and BATCH_DECAL_ABSOLUTE_SIZE:
+        abs_err, abs_trf, scale_diag = _apply_absolute_size_to_matrix(
+            trf,
+            body,
+            float(getattr(size_spec, "width_cm", 0.0)),
+            float(getattr(size_spec, "length_cm", 0.0)),
+        )
+        if abs_trf is not None:
+            trf = abs_trf
+            scale_warn = "absolute {:.1f}x{:.1f} in".format(
+                float(getattr(size_spec, "width_in", 0.0)),
+                float(getattr(size_spec, "length_in", 0.0)),
+            )
+        elif BATCH_DECAL_ABSOLUTE_SIZE_STRICT:
+            # Hard-fail rather than fall back to cover-fit: a wrong-sized decal
+            # renders plausibly and ships silently, a missing one is obvious.
+            return (
+                "absolute decal size failed for '{}': {}".format(
+                    getattr(size_spec, "part_number", "?"), abs_err or "unknown"
+                ),
+                None,
+                None,
+                None,
+                scale_diag,
+                use_chain,
+            )
+        else:
+            scale_warn = "ABSOLUTE SIZE FAILED ({}) — cover fit used".format(abs_err)
+            size_spec = None  # fall through to cover-fit below
+
+    if size_spec is None and BATCH_DECAL_USE_SCALE_PLANE_XY:
         scale_err, scale_xy, scaled_trf, need_x, need_y, scale_diag = (
             _apply_scale_plane_xy_to_matrix(
                 trf, face, body, image_path, chain_faces=use_chain
@@ -3339,10 +3897,10 @@ def _configure_decal_create_input(
             trf = scaled_trf
         elif scale_err:
             scale_warn = scale_err
-    if scale_xy is not None and scale_warn is None:
-        scale_warn = "scale_xy={:.2f} need={:.0f}x{:.0f}cm".format(
-            scale_xy, need_x, need_y
-        )
+        if scale_xy is not None and scale_warn is None:
+            scale_warn = "scale_xy={:.2f} need={:.0f}x{:.0f}cm".format(
+                scale_xy, need_x, need_y
+            )
 
     assign_err = _apply_entity_transform(decal_input, trf)
     if assign_err:
@@ -3363,6 +3921,7 @@ def _create_decal_on_face(
     chain_faces: Optional[bool] = None,
     template_hint: Optional[TemplateDecalHint] = None,
     record_placement: bool = True,
+    size_spec: Optional[Any] = None,
 ) -> Tuple[Optional[adsk.fusion.Decal], str, List[str]]:
     """Create one decal on ``face`` (or ``faces``) using ``createInput``.
 
@@ -3403,6 +3962,7 @@ def _create_decal_on_face(
             image_path,
             chain_faces=chain_faces,
             template_hint=template_hint,
+            size_spec=size_spec,
         )
         if orient_err:
             last_err = orient_err
@@ -3439,6 +3999,7 @@ def _create_decal_on_face(
                     chain_faces=use_chain,
                     template_hint=template_hint,
                     center_override=center_override if center_override is not None else center,
+                    size_spec=size_spec,
                 ),
             )
         if scale_warn:
@@ -3665,6 +4226,7 @@ def create_batch_decals_for_all_bodies(
                     body=body,
                     image_path=image_path,
                     template_hint=template_hint,
+                    size_spec=_size_spec_for_body(body, label),
                 )
                 if decal is None:
                     lines.append(
@@ -3679,6 +4241,14 @@ def create_batch_decals_for_all_bodies(
                 rb = _decal_readback_log_line(decal)
                 extra = " ({})".format(err) if err else ""
                 face_diag = _face_show_diagnostic_line(primary, body)
+                _ok_skin, _skin_note = audit_decal_body_is_show_only(body)
+                lines.append(
+                    "  {}: {} {}".format(
+                        body_label,
+                        "SKIN OK —" if _ok_skin else "*** NOT A SKIN BODY ***",
+                        _skin_note,
+                    )
+                )
                 lines.append(
                     "  {}: 1 chain decal on primary face ({:.0f} cm², {}){}{}{}".format(
                         body_label,
@@ -3831,9 +4401,22 @@ def create_batch_decals_for_all_bodies(
             body_candidates.append(best)
             skipped = len(local_picks) - 1
             if skipped > 0:
+                # Name the winner AND the runners-up with their scores. Picking the
+                # wrong body here is invisible in the render except as an untextured
+                # part, so the decision has to be readable in the log.
+                def _pick_label(p):
+                    try:
+                        return "{}={:.0f}".format(p[3], p[0])
+                    except Exception:
+                        return "?"
+
+                others = [p for p in local_picks if p is not best]
                 lines.append(
-                    "  {}: one decal on largest show body (skipped {} sub-bodies)".format(
-                        label, skipped
+                    "  {}: one decal on best show body -> {} (skipped {}: {})".format(
+                        label,
+                        _pick_label(best),
+                        skipped,
+                        ", ".join(_pick_label(p) for p in others[:6]) or "-",
                     )
                 )
         elif (
@@ -3972,6 +4555,7 @@ def create_batch_decals_for_all_bodies(
                 body=body,
                 image_path=image_path,
                 template_hint=template_hint,
+                size_spec=_size_spec_for_body(body, body_label),
             )
             if decal is None:
                 lines.append(
@@ -3987,6 +4571,14 @@ def create_batch_decals_for_all_bodies(
             if err:
                 extra = " ({})".format(err)
             face_diag = _face_show_diagnostic_line(face, body)
+            _ok_skin, _skin_note = audit_decal_body_is_show_only(body)
+            lines.append(
+                "  {}: {} {}".format(
+                    body_label,
+                    "SKIN OK —" if _ok_skin else "*** NOT A SKIN BODY ***",
+                    _skin_note,
+                )
+            )
             lines.append(
                 "  {}: 1 chain decal on primary face ({:.0f} cm², {}){}{}{}".format(
                     body_label,
@@ -4274,9 +4866,28 @@ def create_batch_decals_for_all_bodies(
     for d in created:
         rec = _DECAL_PLACEMENT_CACHE.get(id(d))
         body = rec.body if rec is not None else None
-        ap_name = _orig_appearance_name_for_body(body)
-        slot = appearance_name_slot(ap_name)
-        src = "body"
+        ap_name = ""
+        slot = None
+        src = ""
+
+        # The Render Instructions are the client's authority, so decals[] order wins
+        # over anything left in the .f3d. It used to be consulted LAST, which made
+        # Bullnose and Square Nose disagree: Bullnose took the JSON order (nose -> _1)
+        # while Square Nose still had authored decals that inherited the opposite
+        # (nose -> _2), so the same product family rendered with the two colours
+        # swapped. decals[0] takes the _1 raster, decals[1] the _2.
+        spec = getattr(rec, "size_spec", None) if rec is not None else None
+        if spec is None:
+            spec = _size_spec_for_body(body)
+        jslot = getattr(spec, "slot", None) if spec is not None else None
+        if jslot in (1, 2):
+            slot, src = jslot, "render-instructions"
+            ap_name = "({})".format(getattr(spec, "part_number", "json part"))
+
+        if slot is None:
+            ap_name = _orig_appearance_name_for_body(body)
+            slot = appearance_name_slot(ap_name)
+            src = "body"
         if slot is None and rec is not None:
             fslot, fname = _face_appearance_slot(rec.face)
             if fslot is not None:
@@ -4288,6 +4899,7 @@ def create_batch_decals_for_all_bodies(
                 ap_name = ap_name or "(authored Honeycomb slot)"
         if slot not in (1, 2):
             slot = 1
+            src = src or "default"
         _DECAL_SLOT[id(d)] = slot
         if slot == 2:
             n_slot2 += 1
@@ -4385,6 +4997,9 @@ def _update_batch_decals_via_recreate(
         return 0, lines, decals
     out: List[adsk.fusion.Decal] = []
     n_slot2 = 0
+    n_ok = 0
+    n_failed = 0
+    n_size_lost = 0
     pump_every = max(int(BATCH_DECAL_UI_PUMP_INTERVAL), 1)
     for idx, d in enumerate(decals):
         old_id = id(d)
@@ -4406,6 +5021,7 @@ def _update_batch_decals_via_recreate(
             out.append(d)
             continue
         face = _resolve_recreate_face(record)
+        size_spec = getattr(record, "size_spec", None)
         new_decal, err, _scale_diag = _create_decal_on_face(
             record.decals_collection,
             image_win,
@@ -4416,8 +5032,30 @@ def _update_batch_decals_via_recreate(
             image_path=image_path,
             chain_faces=record.chain_faces,
             template_hint=record.template_hint,
+            size_spec=size_spec,
         )
         if new_decal is None:
+            n_failed += 1
+            if size_spec is not None:
+                # Do NOT re-image the old decal: it was sized for this part, but a
+                # failed recreate means we cannot prove the new one would be. An
+                # imageFilename swap here yields a plausible render at a possibly
+                # wrong size — the exact failure this guards against. Leaving the
+                # previous colour in place makes the problem visible instead.
+                n_size_lost += 1
+                lines.append(
+                    "  Decal '{}': recreate FAILED ({}) — ABSOLUTE SIZE LOST for part "
+                    "'{}'; left unchanged rather than re-imaged at an unverified size".format(
+                        dn, err, getattr(size_spec, "part_number", "?")
+                    )
+                )
+                out.append(d)
+                if (idx + 1) % pump_every == 0:
+                    try:
+                        adsk.doEvents()
+                    except Exception:
+                        pass
+                continue
             ok, swap_err = _set_decal_image(d, image_win)
             if ok:
                 lines.append(
@@ -4439,6 +5077,7 @@ def _update_batch_decals_via_recreate(
                 except Exception:
                     pass
             continue
+        n_ok += 1
         try:
             d.deleteMe()
         except Exception as ex:
@@ -4470,13 +5109,21 @@ def _update_batch_decals_via_recreate(
             except Exception:
                 pass
     slot2_note = " ({} on _2 image)".format(n_slot2) if n_slot2 else ""
+    fail_note = ""
+    if n_failed:
+        fail_note = ", {} FAILED".format(n_failed)
+        if n_size_lost:
+            fail_note += " ({} absolute-sized)".format(n_size_lost)
     lines.insert(
         0,
-        "Batch decal update: {} / {} recreate(s){}".format(
-            len(out), len(decals), slot2_note
+        "Batch decal update: {} / {} recreated OK{}{}".format(
+            n_ok, len(decals), fail_note, slot2_note
         ),
     )
-    return len(out), lines, out
+    # Report ACTUAL successes, not len(out) — every branch appends to ``out``, so
+    # its length always equalled the input and could never signal a failure. The
+    # controller reads this to decide whether a colour set textured at all.
+    return n_ok, lines, out
 
 
 def _update_batch_decals_via_image_swap(
@@ -4644,13 +5291,658 @@ def cleanup_batch_decals(decals: List[adsk.fusion.Decal]) -> int:
     return n
 
 
-def _decal_entity_token(d: Any) -> str:
-    """Stable identity for a decal — unchanged by imageFilename/name edits."""
+def _authored_image_info(
+    decal: Any, key: Tuple[str, int]
+) -> Tuple[Optional[Tuple[int, int]], Optional[str], str]:
+    """``(size, orientation, source)`` of the image the DESIGNER gave this decal.
+
+    Cached per decal for the current model, and read BEFORE the first write — once
+    we swap the image the decal reports ours instead. Three sources, most direct
+    first; each can legitimately fail, so the result may be ``(None, None, ...)``.
+    """
+    if key in _AUTHORED_IMAGE_BY_KEY:
+        return _AUTHORED_IMAGE_BY_KEY[key]
+
+    size: Optional[Tuple[int, int]] = None
+    source = "unknown"
+    suffix = ""
+
+    # 1) The file Fusion says the decal was created from, when it still exists.
     try:
-        t = d.entityToken
-        return str(t) if t else ""
+        current = str(decal.imageFilename or "")
     except Exception:
-        return ""
+        current = ""
+    if current:
+        suffix = Path(current).suffix.lower()
+        try:
+            if os.path.isfile(current):
+                size = image_orient.image_size(Path(current))
+                if size:
+                    source = "decal image file"
+        except Exception:
+            size = None
+
+    # 2) Ask the decal to save its image (documented for exactly this case).
+    if size is None:
+        tmp = image_orient.cache_root() / "authored" / "p{}_{}_{}.png".format(
+            os.getpid(), len(_AUTHORED_IMAGE_BY_KEY), key[1]
+        )
+        try:
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            if tmp.exists():
+                tmp.unlink()  # saveImage refuses to overwrite
+            if decal.saveImage(str(tmp)):
+                size = image_orient.image_size(tmp)
+                if size:
+                    source = "decal.saveImage"
+        except Exception:
+            size = None
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    orient = image_orient.orientation_of(size)
+
+    # 3) The images embedded in the .f3d. Fusion stores them under new names, so
+    #    which image belongs to which decal has to be inferred (see below).
+    if size is None and _CURRENT_MODEL_PATH is not None:
+        if _CURRENT_MODEL_PATH not in _EMBEDDED_SIZES_BY_MODEL:
+            _EMBEDDED_SIZES_BY_MODEL[_CURRENT_MODEL_PATH] = image_orient.embedded_image_sizes(
+                _CURRENT_MODEL_PATH
+            )
+        embedded = _EMBEDDED_SIZES_BY_MODEL[_CURRENT_MODEL_PATH]
+        want = _image_suffix_key(suffix)
+        same_type = [s for ext, s in embedded if want and _image_suffix_key(ext) == want] or [
+            s for _ext, s in embedded
+        ]
+        e_size, e_orient, e_source = _pick_embedded_image(decal, same_type)
+        if e_orient is not None:
+            size, orient, source = e_size, e_orient, e_source
+
+    info = (size, orient, source)
+    _AUTHORED_IMAGE_BY_KEY[key] = info
+    return info
+
+
+def _image_suffix_key(suffix: str) -> str:
+    s = (suffix or "").lower()
+    return {".jpeg": ".jpg", ".tif": ".tiff"}.get(s, s)
+
+
+def _decal_footprint_size(decal: Any) -> Optional[Tuple[float, float]]:
+    """``(|X|, |Y|)`` of the decal's transform — the area it covers, in cm.
+
+    Measured on Bullnose: plank 13.0 x 121.5, nose 123.7 x 22.6 — the parts' real
+    visible width and length, so the magnitudes are the footprint itself and the
+    image's horizontal axis runs along X.
+    """
+    try:
+        _o, x_axis, y_axis, _z = decal.transform.getAsCoordinateSystem()
+        mag_x, mag_y = _vector_length(x_axis), _vector_length(y_axis)
+    except Exception:
+        return None
+    if mag_x <= 1e-9 or mag_y <= 1e-9:
+        return None
+    return mag_x, mag_y
+
+
+def _decal_footprint_aspect(decal: Any) -> Optional[float]:
+    """X/Y magnitude ratio of the decal's transform — the proportions it covers."""
+    footprint = _decal_footprint_size(decal)
+    return footprint[0] / footprint[1] if footprint else None
+
+
+def _pick_embedded_image(
+    decal: Any, candidates: List[Tuple[int, int]]
+) -> Tuple[Optional[Tuple[int, int]], Optional[str], str]:
+    """This decal's image among the .f3d's embedded images of its file type.
+
+    In order of confidence: the only candidate; the candidate whose proportions
+    the decal's footprint has (a designer placing an image without stretching it
+    gives exactly that, and a coincidental 3% match is unlikely); any candidate
+    when all are within 5% of each other; otherwise orientation alone, when every
+    candidate agrees on it. Anything else is reported as unknown — never guessed.
+    """
+    if not candidates:
+        return None, None, "unknown"
+    if len(candidates) == 1:
+        size = candidates[0]
+        return size, image_orient.orientation_of(size), ".f3d embedded image"
+
+    aspects = [(image_orient.aspect_of(s), s) for s in candidates]
+    aspects = [(a, s) for a, s in aspects if a]
+    footprint = _decal_footprint_aspect(decal)
+    if footprint and aspects:
+        scored = sorted(
+            (min(abs(math.log(footprint / a)), abs(math.log(footprint * a))), s)
+            for a, s in aspects
+        )
+        if scored[0][0] <= _EMBEDDED_FOOTPRINT_MATCH_TOL:
+            size = scored[0][1]
+            return (
+                size,
+                image_orient.orientation_of(size),
+                ".f3d embedded image with the decal's proportions",
+            )
+
+    if aspects:
+        ordered = sorted(aspects)
+        if math.log(ordered[-1][0] / ordered[0][0]) <= _EMBEDDED_SIMILAR_TOL:
+            size = ordered[len(ordered) // 2][1]
+            return (
+                size,
+                image_orient.orientation_of(size),
+                ".f3d embedded images ({} of near-identical proportions)".format(len(ordered)),
+            )
+
+    orients = {image_orient.orientation_of(s) for s in candidates}
+    if len(orients) == 1 and None not in orients:
+        return None, orients.pop(), ".f3d embedded images (orientation only)"
+    return None, None, "unknown"
+
+
+def _prepare_decal_image(
+    base: str, decal: Any, key: Tuple[str, int]
+) -> Tuple[str, str]:
+    """Path to hand to ``decal.imageFilename`` plus a log note.
+
+    Fusion stretches whatever image it is given over the decal's footprint, so the
+    colour-set raster is turned 90 degrees when needed to put its long side along
+    the footprint's long side. The footprint decides; the authored image's
+    orientation is the fallback when the footprint is unreadable or square (on
+    Bullnose the two agree for both decals). When they agree, the raster is also
+    resampled to the authored proportions, as in the approved Bullnose renders.
+    Falls back to ``base`` untouched whenever the direction cannot be determined.
+    """
+    if not DECAL_MATCH_AUTHORED_IMAGE_ORIENTATION:
+        return base, "orientation matching off"
+    incoming = image_orient.image_size(Path(base))
+    if incoming is None:
+        return base, "NOT ADJUSTED: cannot read size of {}".format(Path(base).name)
+
+    auth_size, auth_orient, source = _authored_image_info(decal, key)
+    footprint = _decal_footprint_size(decal) if DECAL_ORIENT_BY_FOOTPRINT else None
+    fp_orient = image_orient.orientation_of(footprint)
+    directional = (image_orient.PORTRAIT, image_orient.LANDSCAPE)
+    # Only a clearly elongated footprint outranks the designer's image; a nearly
+    # square one says little about which way the part runs.
+    fp_decisive = (
+        fp_orient in directional
+        and max(footprint) / min(footprint) >= DECAL_FOOTPRINT_DECISIVE_RATIO
+    )
+    if fp_decisive:
+        want = fp_orient
+        agree = (auth_orient == fp_orient) if auth_orient in directional else None
+    elif auth_orient in directional:
+        want, agree = auth_orient, None
+    else:
+        return base, (
+            "NOT ADJUSTED: neither the decal's footprint nor its authored image "
+            "shows which way the texture runs"
+        )
+
+    rotate = image_orient.needs_rotation(want, image_orient.orientation_of(incoming))
+    aspect = (
+        image_orient.aspect_of(auth_size)
+        if (DECAL_CONFORM_TO_AUTHORED_ASPECT and auth_size and agree is not False)
+        else None
+    )
+    prepared, how = image_orient.prepared_copy(
+        Path(base),
+        rotate=rotate,
+        clockwise=bool(DECAL_IMAGE_ROTATE_CLOCKWISE),
+        target_aspect=aspect,
+    )
+    if prepared is None:
+        return base, "NOT ADJUSTED: {}".format(how)
+
+    out = image_orient.image_size(prepared) or incoming
+    natural = (incoming[1], incoming[0]) if rotate else incoming
+    # How far the texture is stretched across its SHORT side to fill the authored
+    # area (1.00 = the client's image already had the designer's proportions).
+    try:
+        stretch = (min(out) / float(max(out))) / (min(natural) / float(max(natural)))
+    except ZeroDivisionError:
+        stretch = 1.0
+    note = "footprint {} | authored {} ({}, via {}) | incoming {}x{} | {}{} -> {}x{} [{}]".format(
+        "{:.1f}x{:.1f} cm ({})".format(footprint[0], footprint[1], fp_orient)
+        if footprint
+        else "unknown",
+        "{}x{}".format(*auth_size) if auth_size else "size unknown",
+        auth_orient,
+        source,
+        incoming[0],
+        incoming[1],
+        "rotated 90 " if rotate else "not rotated ",
+        "+ fitted to authored proportions (x{:.2f} across)".format(stretch)
+        if abs(stretch - 1.0) > 0.01
+        else "",
+        out[0],
+        out[1],
+        how,
+    )
+    if agree is False:
+        note += (
+            " | NOTE the authored image ran the other way to the footprint; "
+            "followed the footprint"
+        )
+    return _win_path(prepared), note
+
+
+def _find_face_at_point(
+    comp: Any, point: Any, z_axis: Any
+) -> Tuple[Optional[Any], List[str]]:
+    """The face of ``comp`` a decal centred on ``point`` (normal ``z_axis``) sits on.
+
+    Used only to rebuild a decal whose own face reference the API cannot resolve.
+    A candidate must contain the point AND face the same way as the decal; a
+    "... Skin" / wear-layer body wins over the solid beneath it. Returns
+    ``(None, notes)`` rather than guessing when nothing qualifies or two bodies tie.
+    """
+    notes: List[str] = []
+    try:
+        z_len = math.sqrt(z_axis.x ** 2 + z_axis.y ** 2 + z_axis.z ** 2)
+    except Exception:
+        z_len = 0.0
+    if z_len < 1e-9:
+        return None, ["decal Z axis is degenerate"]
+
+    try:
+        face_type = adsk.fusion.BRepEntityTypes.BRepFaceEntityType
+    except Exception:
+        face_type = None
+
+    for tol in (1e-4, 1e-3, 1e-2):
+        faces: List[Any] = []
+        if face_type is not None:
+            try:
+                hits = comp.findBRepUsingPoint(point, face_type, tol, False)
+                for i in range(hits.count):
+                    f = adsk.fusion.BRepFace.cast(hits.item(i))
+                    if f is not None:
+                        faces.append(f)
+            except Exception as ex:
+                notes.append("findBRepUsingPoint(tol={}): {}".format(tol, ex))
+        if not faces:
+            try:
+                bodies = comp.bRepBodies
+                for bi in range(bodies.count):
+                    body_faces = bodies.item(bi).faces
+                    for fi in range(body_faces.count):
+                        f = body_faces.item(fi)
+                        try:
+                            if f.isPointOnFace(point, tol):
+                                faces.append(f)
+                        except Exception:
+                            continue
+            except Exception as ex:
+                notes.append("face scan(tol={}): {}".format(tol, ex))
+
+        ranked = []
+        for f in faces:
+            try:
+                ok, n = f.evaluator.getNormalAtPoint(point)
+                if not ok:
+                    continue
+                ndot = (n.x * z_axis.x + n.y * z_axis.y + n.z * z_axis.z) / z_len
+                body_name = f.body.name or ""
+                skin = any(
+                    kw in _normalize_fusion_body_name(body_name).lower()
+                    for kw in BATCH_DECAL_BODY_PREFER_NAME_KEYWORDS
+                )
+                area = float(f.area)
+            except Exception:
+                continue
+            notes.append(
+                "candidate body='{}' tol={} n.z={:+.3f} skin={} area={:.0f}cm2".format(
+                    body_name, tol, ndot, skin, area
+                )
+            )
+            if ndot >= 0.98:
+                ranked.append((1 if skin else 0, area, body_name, f))
+        if not ranked:
+            continue
+        ranked.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        best = ranked[0]
+        rivals = [r for r in ranked[1:] if r[0] == best[0] and r[2] != best[2]]
+        if rivals:
+            notes.append(
+                "ambiguous: '{}' and '{}' both qualify".format(best[2], rivals[0][2])
+            )
+            return None, notes
+        return best[3], notes
+    notes.append("no face of this component contains the decal's centre")
+    return None, notes
+
+
+def _replace_unwritable_decal(
+    decal: Any, comp: Any, target: str, label: str, in_root: bool = False
+) -> Tuple[Optional[Any], List[str], Optional[Any]]:
+    """Stand-in for an authored decal that refuses a new image.
+
+    Returns ``(stand_in, notes, leftover)``. ``leftover`` is a stand-in that failed
+    verification and could not be removed (the original then stays hidden).
+
+    The designer's placement is reused EXACTLY — same centre, axes, scale and
+    chain flag — on the face found under the decal's centre; no auto-fit or
+    grain alignment is applied. The original is hidden BEFORE the stand-in is
+    created so one part can never carry two visible decals, and is brought back if
+    the stand-in cannot be verified. Nothing is deleted and nothing is saved.
+
+    Declined outright for a decal in the ROOT Decals folder (the batch restores
+    root-decal visibility before every render, which would show the original on
+    top of the stand-in) and for one with wrapping off (it covers a chosen set of
+    faces that cannot be read back, so a stand-in could only cover one of them).
+    """
+    notes: List[str] = []
+    if in_root:
+        return None, [
+            "{}: no stand-in — it lives in the root Decals folder, whose visibility "
+            "the batch restores before every render".format(label)
+        ], None
+    try:
+        m = decal.transform
+        origin, x_axis, y_axis, z_axis = m.getAsCoordinateSystem()
+        mag_x = _vector_length(x_axis)
+        mag_y = _vector_length(y_axis)
+    except Exception as ex:
+        return None, ["{}: cannot read the decal's placement ({})".format(label, ex)], None
+    try:
+        chain = bool(decal.isChainFaces)
+    except Exception as ex:
+        return None, ["{}: cannot read isChainFaces ({})".format(label, ex)], None
+    notes.append(
+        "{}: authored placement centre=({:.3f},{:.3f},{:.3f}) size={:.3f}x{:.3f} "
+        "chain={}".format(label, origin.x, origin.y, origin.z, mag_x, mag_y, chain)
+    )
+    if not chain:
+        # Wrapping off: the decal covers exactly the faces the designer picked.
+        # A dead reference reads as [None] however many were picked (3-in-1's
+        # covers ~8: the top and both rounded edges), so the list can be trusted
+        # only when every entry resolves and there is exactly one.
+        try:
+            chosen = list(decal.faces)
+        except Exception:
+            chosen = []
+        if not chosen or any(f is None for f in chosen):
+            notes.append(
+                "{}: no stand-in — wrapping is off and the faces it was applied to "
+                "cannot be read back, so a stand-in could cover only part of them".format(
+                    label
+                )
+            )
+            return None, notes, None
+        if len(chosen) != 1:
+            notes.append(
+                "{}: no stand-in — wrapping is off and it covers {} chosen faces; a "
+                "stand-in is only made for a single face".format(label, len(chosen))
+            )
+            return None, notes, None
+
+    face, face_notes = _find_face_at_point(comp, origin, z_axis)
+    notes.extend("{}:   {}".format(label, n) for n in face_notes)
+    if face is None:
+        notes.append("{}: no unambiguous face under the decal — left as authored".format(label))
+        return None, notes, None
+
+    try:
+        decals = comp.decals
+        count_before = decals.count
+    except Exception as ex:
+        notes.append("{}: decals collection unavailable ({})".format(label, ex))
+        return None, notes, None
+
+    # Hide first. If this fails nothing has been created yet.
+    try:
+        decal.isLightBulbOn = False
+        if decal.isLightBulbOn:
+            raise RuntimeError("light bulb stayed on")
+    except Exception as ex:
+        notes.append("{}: could not hide the original ({}) — left as authored".format(label, ex))
+        return None, notes, None
+
+    def _restore_original() -> None:
+        try:
+            decal.isLightBulbOn = True
+        except Exception as ex2:
+            notes.append("{}: WARNING could not re-show the original ({})".format(label, ex2))
+
+    new_decal = None
+    problem = ""
+    try:
+        inp = decals.createInput(target, [face], origin)
+        if inp is None:
+            raise RuntimeError("createInput returned None")
+        if not _set_decal_input_chain_faces(inp, chain):
+            raise RuntimeError("could not set isChainFaces on the input")
+        try:
+            inp.opacity = decal.opacity
+        except Exception:
+            pass
+        err = _apply_entity_transform(inp, m)
+        if err:
+            raise RuntimeError(err)
+        new_decal = decals.add(inp)
+        if new_decal is None:
+            raise RuntimeError("decals.add returned None")
+
+        # Verify the stand-in really reproduces the authored placement.
+        o2, x2, y2, _z2 = new_decal.transform.getAsCoordinateSystem()
+        if origin.distanceTo(o2) > 1e-3:
+            problem = "centre moved by {:.4f} cm".format(origin.distanceTo(o2))
+        for want, got, axis in (
+            (mag_x, _vector_length(x2), "X"),
+            (mag_y, _vector_length(y2), "Y"),
+        ):
+            if not problem and abs(got - want) > 0.01 * max(want, 1e-9):
+                problem = "{} size {:.3f} != authored {:.3f}".format(axis, got, want)
+        if not problem and bool(new_decal.isChainFaces) != chain:
+            problem = "chain flag differs"
+        if not problem and decals.count != count_before + 1:
+            problem = "decal count {} (expected {})".format(decals.count, count_before + 1)
+        if not problem and decal.isLightBulbOn:
+            problem = "original is visible again"
+    except Exception as ex:
+        problem = str(ex)
+
+    if problem:
+        notes.append("{}: stand-in rejected ({})".format(label, problem))
+        removed = True
+        if new_decal is not None:
+            try:
+                new_decal.deleteMe()
+                removed = comp.decals.count == count_before
+            except Exception as ex:
+                removed = False
+                notes.append("{}: could not delete the stand-in ({})".format(label, ex))
+        if removed:
+            _restore_original()
+            notes.append("{}: rolled back — part keeps its authored texture".format(label))
+            return None, notes, None
+        # Better one unverified decal than two stacked ones.
+        notes.append(
+            "{}: WARNING stand-in could not be removed; original left hidden so "
+            "the part does not carry two decals — check this render".format(label)
+        )
+        return None, notes, new_decal
+
+    notes.append(
+        "{}: REPLACED with an identical-placement stand-in on body '{}' "
+        "(original hidden, not deleted)".format(label, _safe_body_name(face))
+    )
+    return new_decal, notes, None
+
+
+def _safe_body_name(face: Any) -> str:
+    try:
+        return face.body.name or "?"
+    except Exception:
+        return "?"
+
+
+def _safe_attr(obj: Any, attr: str) -> str:
+    try:
+        return str(getattr(obj, attr) or "?")
+    except Exception:
+        return "?"
+
+
+def _designer_inactive_reason(decal: Any, comp: Any) -> str:
+    """Why this decal never shows in a render as saved, or "" when it does.
+
+    Only states that are readably set count — anything unreadable is treated as
+    active. Deliberately not ``isVisible``: a decal on a part hidden for one render
+    configuration is still part of the look and must keep receiving images.
+    """
+    try:
+        if decal.isLightBulbOn is False:
+            return "switched off in the model"
+    except Exception:
+        pass
+    try:
+        if comp is not None and comp.isDecalFolderLightBulbOn is False:
+            return "its Decals folder is switched off in the model"
+    except Exception:
+        pass
+    try:
+        timeline_obj = decal.timelineObject
+    except Exception:
+        timeline_obj = None
+    if timeline_obj is not None:
+        try:
+            if timeline_obj.isSuppressed is True:
+                return "suppressed in the timeline"
+        except Exception:
+            pass
+        try:
+            if timeline_obj.isRolledBack is True:
+                return "after the timeline marker (rolled back)"
+        except Exception:
+            pass
+    return ""
+
+
+def _decal_folder_label(comp: Any, occ: Any) -> str:
+    """Where a decal is kept, for log lines."""
+    if occ is None:
+        return "root Decals folder"
+    return 'in "{}"'.format(_safe_attr(comp, "name"))
+
+
+def _decal_part_label(decal: Any, comp: Any, occ: Any) -> str:
+    """The part a decal textures, for log lines."""
+    if occ is not None:
+        return '"{}"'.format(_safe_attr(comp, "name"))
+    try:
+        face_occ = decal.faces[0].assemblyContext
+    except Exception:
+        face_occ = None
+    if face_occ is None:
+        return "a body of the root component"
+    return '"{}"'.format(_safe_attr(face_occ, "name"))
+
+
+def _register_stand_in(
+    key: Tuple[str, int], comp: Any, slot: int, target: str
+) -> Optional[Tuple[str, int]]:
+    """Give the decal just added to ``comp`` the original's slot and image info."""
+    try:
+        new_key = (key[0], comp.decals.count - 1)
+    except Exception:
+        return None
+    _AUTHORED_SLOT_BY_KEY[new_key] = slot
+    # Later colour sets must be prepared exactly as the original was, or the
+    # stand-in's texture would drift from the designer's.
+    info = _AUTHORED_IMAGE_BY_KEY.get(key)
+    if not info or info[0] is None:
+        made = image_orient.image_size(Path(target))
+        info = (made, image_orient.orientation_of(made), "stand-in image")
+    _AUTHORED_IMAGE_BY_KEY[new_key] = info
+    _PROBED_DECAL_KEYS.add(new_key)
+    _DESIGNER_INACTIVE_BY_KEY[new_key] = ""
+    return new_key
+
+
+# How far (cm) a decal's centre may sit from its surface and still count as on it.
+# A centre on a curved face can lie on the display chord ~0.012 cm inside.
+_DECAL_CENTRE_ON_FACE_TOL: float = 0.1
+
+
+def _decal_centre_on_face(decal: Any) -> Optional[bool]:
+    """Whether the decal's centre lies on one of its own faces (None = cannot tell).
+
+    Fusion positions a decal from its centre, which must lie on its first face.
+    Every designer decal in the client's models passes. 3-in-1's re-made decal
+    (rotated 90 degrees in the dialog) read back 6 cm off its face after the
+    model was reopened, and the colour set then landed on the wrong strip.
+    """
+    try:
+        origin = decal.transform.getAsCoordinateSystem()[0]
+        faces = [f for f in decal.faces if f is not None]
+    except Exception:
+        return None
+    if not faces:
+        return None
+    for face in faces:
+        try:
+            if face.isPointOnFace(origin, _DECAL_CENTRE_ON_FACE_TOL):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _decal_probe_line(decal: Any, comp: Any, occ: Any, index: int) -> str:
+    """One-line state dump of an authored decal (logged once per model)."""
+    bits: List[str] = []
+    for label, getter in (
+        ("name", lambda: decal.name),
+        ("comp", lambda: comp.name),
+        ("occ", lambda: occ.name if occ is not None else "(root)"),
+        ("visible", lambda: decal.isVisible),
+        ("bulb", lambda: decal.isLightBulbOn),
+        ("folderBulb", lambda: comp.isDecalFolderLightBulbOn),
+        ("suppressed", lambda: decal.timelineObject.isSuppressed),
+        ("rolledBack", lambda: decal.timelineObject.isRolledBack),
+        ("chain", lambda: decal.isChainFaces),
+        ("nFaces", lambda: len(decal.faces)),
+        ("face0", lambda: "None" if decal.faces[0] is None else "ok"),
+        ("body", lambda: decal.faces[0].body.name),
+        ("derived", lambda: decal.isDerived),
+        ("timelineIdx", lambda: decal.timelineObject.index),
+        ("health", lambda: decal.timelineObject.healthState),
+        (
+            "size",
+            lambda: "{:.3f}x{:.3f}".format(
+                _vector_length(decal.transform.getAsCoordinateSystem()[1]),
+                _vector_length(decal.transform.getAsCoordinateSystem()[2]),
+            ),
+        ),
+        (
+            "centre",
+            lambda: "({0.x:.2f},{0.y:.2f},{0.z:.2f})".format(
+                decal.transform.getAsCoordinateSystem()[0]
+            ),
+        ),
+        ("centreOnFace", lambda: _decal_centre_on_face(decal)),
+    ):
+        try:
+            bits.append("{}={}".format(label, getter()))
+        except Exception as ex:
+            bits.append("{}=ERR({})".format(label, str(ex)[:48]))
+    return "  Decal probe [{}#{}]: {}".format(
+        bits[1].split("=", 1)[-1] if len(bits) > 1 else "?", index, ", ".join(bits)
+    )
+
+
+def pop_decal_swap_failures() -> List[str]:
+    """Decals that still show their authored texture since the last call."""
+    out = list(_DECAL_SWAP_FAILURES)
+    del _DECAL_SWAP_FAILURES[:]
+    return out
 
 
 def apply_decal_color_set(
@@ -4658,107 +5950,296 @@ def apply_decal_color_set(
     slot1: Optional[Path],
     slot2: Optional[Path],
 ) -> Tuple[int, List[str]]:
-    """
-    Set Decal.imageFilename for decals whose names match SLOT*_DECAL_NAMES.
+    """Put this colour set's rasters on the decals the designer authored.
 
-    Walks every component in the design (including sub-components such as
-    ``Plank:1``) so decals authored inside occurrences are updated too.
+    Every component's Decals folder is walked. Each decal keeps the placement it
+    has in the model; only its image changes. Which raster it takes (``_1`` or
+    ``_2``) comes from, in order: the slot it was given on an earlier colour set,
+    the Render Instructions entry for the component that owns it, a trailing
+    ``1``/``2`` in its name, then position. When Render Instructions are loaded,
+    only decals on the parts they list are touched (name and position are never
+    consulted), and decals the designer switched off are left alone.
 
-    If ``DECAL_POSITIONAL_FALLBACK`` is enabled, missing slot assignments are
-    filled positionally (first decal -> slot 1, second -> slot 2) **even when
-    the named pass already matched another slot** — e.g. a sole decal named
-    ``Honeycomb-2`` would otherwise receive only ``*_2`` and never ``*_1``.
+    The raster is first turned to run along the decal's footprint (see
+    ``_prepare_decal_image``), because a landscape raster dropped into a decal laid
+    out lengthwise lands with its long side across the part.
+
+    Returns ``(decals_now_showing_this_colour_set, log_lines)``. A decal that could
+    not be updated is logged, recorded for ``pop_decal_swap_failures`` and NOT
+    counted.
     """
     lines: List[str] = []
-    _need_pil = int(DECAL_TEXTURE_IMAGE_SHIFT_PX) != 0 or int(CARRIER_TEXTURE_IMAGE_SHIFT_PX) != 0
-    if _need_pil:
+    if int(DECAL_TEXTURE_IMAGE_SHIFT_PX) != 0:
         try:
             import PIL  # noqa: F401 # type: ignore
         except ImportError:
             lines.append(
                 "Texture bitmap shift: install Pillow in Fusion's Python "
                 "(Scripts → python -m pip install pillow) or set "
-                "DECAL_TEXTURE_IMAGE_SHIFT_PX / CARRIER_TEXTURE_IMAGE_SHIFT_PX to 0"
+                "DECAL_TEXTURE_IMAGE_SHIFT_PX to 0"
             )
     total = 0
 
-    decal_list = _collect_all_decals(design)
-
-    # Resolve each decal's slot with a STABLE priority so a decal keeps its slot
-    # across every color set:
-    #   1) cached slot by entityToken (from an earlier color set) — survives the
-    #      rename Fusion applies when imageFilename changes;
-    #   2) name match (Honeycomb-1 -> slot 1, etc.);
-    #   3) positional fallback (first unassigned -> slot 1, next -> slot 2).
-    slot_by_idx: Dict[int, int] = {}
-    src_by_idx: Dict[int, str] = {}
-    for idx, d in enumerate(decal_list):
-        tok = _decal_entity_token(d)
+    # (decal, component, occurrence, index in that component's Decals folder).
+    # The (component id, index) pair identifies a decal for the whole session:
+    # Fusion renames a decal after every image it is given, and entity tokens
+    # must not be compared or re-resolved (doing so broke a working decal).
+    entries: List[Tuple[Any, Any, Any, Tuple[str, int]]] = []
+    for d, comp, occ, j in _collect_decals_with_owner(design):
         try:
-            dn = d.name or ""
+            cid = str(comp.id)
         except Exception:
-            dn = ""
-        dslot = decal_name_slot(dn)
-        if tok and tok in _AUTHORED_DECAL_SLOT:
-            slot_by_idx[idx] = _AUTHORED_DECAL_SLOT[tok]
-            src_by_idx[idx] = "slot"
-        elif dslot == 1:
-            slot_by_idx[idx] = 1
-            src_by_idx[idx] = "slot"
-        elif dslot == 2:
-            slot_by_idx[idx] = 2
-            src_by_idx[idx] = "slot"
+            cid = "id{}".format(id(comp))
+        key = (cid, j)
+        if key in _RETIRED_AUTHORED_KEYS:
+            continue  # hidden original that a stand-in has taken over from
+        entries.append((d, comp, occ, key))
 
-    if DECAL_POSITIONAL_FALLBACK and decal_list:
-        assigned = set(slot_by_idx.values())
+    if DECAL_PROBE_LOG:
+        for d, comp, occ, key in entries:
+            if key not in _PROBED_DECAL_KEYS:
+                _PROBED_DECAL_KEYS.add(key)
+                lines.append(_decal_probe_line(d, comp, occ, key[1]))
+
+    # With Render Instructions loaded they alone say which parts are textured. A
+    # decal on any other part (track, floor, light ...) keeps the designer's image:
+    # the name and position guesses below exist only for runs without them, and
+    # would hand e.g. "Wentworth Verdon Hickory-2" the _2 raster just for its name.
+    json_scoped = bool(_DECAL_TARGETS_BY_PART)
+    slot_of: Dict[int, int] = {}
+    source_of: Dict[int, str] = {}
+    for idx, (d, comp, occ, key) in enumerate(entries):
+        if key not in _DESIGNER_INACTIVE_BY_KEY:
+            _DESIGNER_INACTIVE_BY_KEY[key] = _designer_inactive_reason(d, comp)
+        inactive = _DESIGNER_INACTIVE_BY_KEY[key]
+        if inactive:
+            # Never shows in a render as the designer saved it. Left alone — in
+            # particular no stand-in is made for it, which WOULD show.
+            if key not in _SKIP_REPORTED_KEYS:
+                _SKIP_REPORTED_KEYS.add(key)
+                lines.append(
+                    'Decal "{}" ({}): {} — left as is'.format(
+                        _safe_attr(d, "name"), _decal_folder_label(comp, occ), inactive
+                    )
+                )
+            continue
+        if key in _AUTHORED_SLOT_BY_KEY:
+            slot_of[idx] = _AUTHORED_SLOT_BY_KEY[key]
+            source_of[idx] = "slot"
+            continue
+        if occ is None:
+            # ROOT Decals folder: only the decal's face can say which part it is on.
+            jslot, face_readable = _json_slot_for_decal_face(d)
+            source = "render-instructions slot (via its face)"
+        else:
+            jslot, face_readable = _json_slot_for_component(comp, occ), True
+            source = "render-instructions slot"
+        if jslot in (1, 2):
+            slot_of[idx] = jslot
+            source_of[idx] = source
+            continue
+        if json_scoped:
+            if not face_readable:
+                # It may well sit on a listed part, and it keeps its old image in
+                # every render, so this is a failure — not a deliberate skip.
+                label = 'Decal "{}" (root Decals folder)'.format(_safe_attr(d, "name"))
+                lines.append(
+                    "{}: FAILED — cannot tell which part it textures, its face reference "
+                    "cannot be read; image NOT changed. Fix it in the model: in Fusion, "
+                    "edit this decal and re-select ALL the faces it should cover (or "
+                    "re-create it inside the part's own component), then save the "
+                    "model.".format(label)
+                )
+                _DECAL_SWAP_FAILURES.append(label)
+            elif key not in _SKIP_REPORTED_KEYS:
+                _SKIP_REPORTED_KEYS.add(key)
+                lines.append(
+                    'Decal "{}" ({}): kept as authored — {} is not listed in the render '
+                    "instructions".format(
+                        _safe_attr(d, "name"),
+                        _decal_folder_label(comp, occ),
+                        _decal_part_label(d, comp, occ),
+                    )
+                )
+            continue
+        try:
+            dslot = decal_name_slot(d.name or "")
+        except Exception:
+            dslot = None
+        if dslot in (1, 2):
+            slot_of[idx] = dslot
+            source_of[idx] = "name slot"
+
+    if DECAL_POSITIONAL_FALLBACK and entries and not json_scoped:
+        assigned = set(slot_of.values())
         if slot1 and 1 not in assigned:
-            for idx in range(len(decal_list)):
-                if idx not in slot_by_idx:
-                    slot_by_idx[idx] = 1
-                    src_by_idx[idx] = "positional slot"
+            for idx in range(len(entries)):
+                if idx not in slot_of:
+                    slot_of[idx] = 1
+                    source_of[idx] = "positional slot"
                     assigned.add(1)
                     break
         if slot2 and 2 not in assigned:
-            if len(decal_list) >= 2:
-                for idx in range(len(decal_list)):
-                    if idx not in slot_by_idx:
-                        slot_by_idx[idx] = 2
-                        src_by_idx[idx] = "positional slot"
+            if len(entries) >= 2:
+                for idx in range(len(entries)):
+                    if idx not in slot_of:
+                        slot_of[idx] = 2
+                        source_of[idx] = "positional slot"
                         assigned.add(2)
                         break
-            elif len(decal_list) == 1 and 1 not in assigned:
-                slot_by_idx[0] = 2
-                src_by_idx[0] = "positional slot, sole decal"
+            elif len(entries) == 1 and 1 not in assigned:
+                slot_of[0] = 2
+                source_of[0] = "positional slot, sole decal"
                 assigned.add(2)
 
-    for idx, d in enumerate(decal_list):
-        slot = slot_by_idx.get(idx)
+    # Pass 1 — the plain write, for every decal. Fallbacks wait until all of
+    # these are done so nothing they do can disturb a decal that writes fine.
+    failed: List[Tuple[int, str, str, str, str]] = []
+    for idx, (d, comp, occ, key) in enumerate(entries):
+        slot = slot_of.get(idx)
         if slot == 1 and slot1:
             slot_path: Optional[Path] = slot1
         elif slot == 2 and slot2:
             slot_path = slot2
         else:
             continue
-        target = _win_path_for_decal_image(slot_path)
-        if not target:
+        base = _win_path_for_decal_image(slot_path)
+        if not base:
             continue
-        which = "{} {}".format(src_by_idx.get(idx, "slot"), slot)
+        which = "{} {}".format(source_of.get(idx, "slot"), slot)
+        try:
+            name_before = d.name or "?"
+        except Exception:
+            name_before = "?"
+
+        if _decal_centre_on_face(d) is False:
+            # Still written (better the colour set somewhere than not at all), but
+            # the render will show it on the wrong strip of the part.
+            lines.append(
+                'Decal "{}" ({}): WARNING its centre is not on its own surface, so the '
+                "colour set will land in the wrong place. Re-make this decal in Fusion "
+                "without rotating it (Z Angle 0).".format(name_before, which)
+            )
+            _DECAL_SWAP_FAILURES.append(
+                'Decal "{}" ({}): placed off its surface — check this render'.format(
+                    name_before, which
+                )
+            )
+
+        target, prep_note = _prepare_decal_image(base, d, key)
         ok, err = _set_decal_image(d, target)
-        if ok:
+        if not ok and target != base:
+            # Never let the adjusted copy cost a write that would otherwise work.
+            ok_base, _err_base = _set_decal_image(d, base)
+            if ok_base:
+                ok = True
+                prep_note = "adjusted copy rejected ({}); wrote the original image — {}".format(
+                    err, prep_note
+                )
+                target = base
+
+        if not ok:
+            failed.append((idx, target, which, err, prep_note))
+            lines.append(
+                'Decal "{}" ({}): direct write refused ({})'.format(name_before, which, err)
+            )
+            continue
+
+        total += 1
+        _AUTHORED_SLOT_BY_KEY[key] = slot
+        try:
+            name_after = d.name or "?"
+        except Exception:
+            name_after = "?"
+        renamed = name_after == Path(target).stem
+        lines.append(
+            'Decal "{}" ({}): image -> {}{}'.format(
+                name_after, which, target, "" if renamed else " [not confirmed by rename]"
+            )
+        )
+        lines.append("    {}".format(prep_note))
+        if key in _SUSPECT_STAND_IN_KEYS:
+            lines.append(
+                'Decal "{}" ({}): WARNING this is a stand-in that failed verification '
+                "in an earlier colour set — check this render".format(name_after, which)
+            )
+            _DECAL_SWAP_FAILURES.append(
+                'Decal "{}" ({}): unverified stand-in — check this render'.format(
+                    name_after, which
+                )
+            )
+        nudge_err = _nudge_decal_texture_origin(d)
+        if nudge_err:
+            lines.append('Decal "{}" ({}): transform nudge — {}'.format(name_after, which, nudge_err))
+
+    # Pass 2 — only decals whose write was refused.
+    for idx, target, which, err, prep_note in failed:
+        d, comp, occ, key = entries[idx]
+        slot = slot_of.get(idx, 1)
+        try:
+            label = 'Decal "{}"'.format(d.name or "?")
+        except Exception:
+            label = "Decal"
+        done = False
+
+        # The same decal reached through its timeline entry occasionally resolves
+        # where the collection's wrapper does not. Costs nothing to try.
+        try:
+            alt = adsk.fusion.Decal.cast(d.timelineObject.entity)
+            if alt is not None and alt.faces and alt.faces[0] is not None:
+                ok_alt, err_alt = _set_decal_image(alt, target)
+                if ok_alt:
+                    done = True
+                    lines.append("{} ({}): image -> {} [via timeline entry]".format(label, which, target))
+                    lines.append("    {}".format(prep_note))
+                else:
+                    lines.append("{}: timeline-entry write refused ({})".format(label, err_alt))
+        except Exception as ex:
+            lines.append("{}: timeline entry unavailable ({})".format(label, str(ex)[:80]))
+
+        leftover = None
+        if not done and DECAL_REPLACE_UNWRITABLE_AUTHORED:
+            new_decal, notes, leftover = _replace_unwritable_decal(
+                d, comp, target, label, in_root=occ is None
+            )
+            lines.extend(notes)
+            if new_decal is not None:
+                done = True
+                lines.append("    {}".format(prep_note))
+                _RETIRED_AUTHORED_KEYS.add(key)
+                _register_stand_in(key, comp, slot, target)
+            elif leftover is not None:
+                # The unverified stand-in now carries the part. The hidden original
+                # must not be retried: a retry would stack a second stand-in.
+                _RETIRED_AUTHORED_KEYS.add(key)
+                stand_in_key = _register_stand_in(key, comp, slot, target)
+                if stand_in_key is not None:
+                    _SUSPECT_STAND_IN_KEYS.add(stand_in_key)
+
+        if done:
             total += 1
-            tok = _decal_entity_token(d)
-            if tok:
-                _AUTHORED_DECAL_SLOT[tok] = slot
-            try:
-                dn2 = d.name
-            except Exception:
-                dn2 = "?"
-            lines.append('Decal "{}" ({}): image -> {}'.format(dn2, which, target))
-            nudge_err = _nudge_decal_texture_origin(d)
-            if nudge_err:
-                lines.append('Decal "{}" ({}): transform nudge — {}'.format(dn2, which, nudge_err))
+            _AUTHORED_SLOT_BY_KEY.setdefault(key, slot)
+        elif leftover is not None:
+            lines.append(
+                "{} ({}): FAILED ({}) — an unverified stand-in now carries this part; "
+                "check this render.".format(label, which, err)
+            )
+            _DECAL_SWAP_FAILURES.append("{} ({})".format(label, which))
         else:
-            lines.append('Decal ({}): failed ({})'.format(which, err))
+            face_hint = ""
+            try:
+                if d.faces and d.faces[0] is None:
+                    face_hint = (
+                        " Its face reference is broken in the .f3d: in Fusion, edit this "
+                        "decal, re-select its face, and save the model."
+                    )
+            except Exception:
+                pass
+            lines.append(
+                "{} ({}): FAILED ({}) — image NOT changed, this part keeps its "
+                "authored texture.{}".format(label, which, err, face_hint)
+            )
+            _DECAL_SWAP_FAILURES.append("{} ({})".format(label, which))
 
     return total, lines
 

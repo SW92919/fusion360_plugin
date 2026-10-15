@@ -3,12 +3,14 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import adsk.core
 import adsk.fusion
 
 import batch_config
+import image_orient
+import render_instructions
 import support_paths
 import texture_pipeline
 import visibility_apply
@@ -24,12 +26,57 @@ def _log_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _code_build_stamp() -> str:
+    """Report the RUNNING build, and shout if it is older than the files on disk.
+
+    Fusion keeps one interpreter per session, so editing a .py does nothing until
+    the add-in is stopped and started again — re-running the command re-executes
+    STALE code. A stamp built only from file mtimes says "fresh" while old code
+    runs, which has already cost two debugging rounds. Comparing the mtime
+    captured when texture_pipeline was imported against its mtime now is what
+    actually detects that.
+    """
+    try:
+        tp_file = Path(texture_pipeline.__file__).resolve()
+        loaded = float(getattr(texture_pipeline, "MODULE_IMPORTED_MTIME", 0.0) or 0.0)
+        on_disk = tp_file.stat().st_mtime
+
+        newest = 0.0
+        newest_name = "?"
+        for py in tp_file.parent.rglob("*.py"):
+            try:
+                mtime = py.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest:
+                newest, newest_name = mtime, py.name
+
+        def _fmt(ts: float) -> str:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
+
+        # One second of slack for filesystem timestamp granularity.
+        stale = loaded and (on_disk - loaded) > 1.0
+        note = ""
+        if stale:
+            note = (
+                "  *** STALE: running code imported from a {} build, but "
+                "texture_pipeline.py on disk is {}. Fusion will not reload an edited "
+                "file until the add-in is STOPPED and STARTED again (re-running the "
+                "command is not enough). Any fix made since then is NOT active. ***"
+            ).format(_fmt(loaded), _fmt(on_disk))
+        return "running build {} | newest source on disk {} ({}){}".format(
+            _fmt(loaded), _fmt(newest), newest_name, note
+        )
+    except Exception as ex:
+        return "(unavailable: {})".format(ex)
+
+
 def _append_log(log_path: Path, row: List[str]) -> None:
     new_file = not log_path.exists()
     with open(log_path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new_file:
-            w.writerow(["timestamp", "model", "color_set", "view", "output", "success", "backend"])
+            w.writerow(["timestamp", "model", "color_set", "view", "output", "success", "notes"])
         w.writerow(row)
 
 
@@ -40,12 +87,73 @@ def _save_local_image(
     render_width: int,
     render_height: int,
     camera=None,
+    render_quality: int = 75,
 ) -> bool:
     """Ray-traced local export via ``Rendering.startLocalRender``."""
     path = str(out_path.resolve())
     return viewport_render.save_fusion_local_render(
-        design, app, path, render_width, render_height, camera=camera
+        design,
+        app,
+        path,
+        render_width,
+        render_height,
+        camera=camera,
+        render_quality=render_quality,
     )
+
+
+def _resolve_render_tasks(
+    design: adsk.fusion.Design,
+    entry: "render_instructions.ModelInstructions",
+) -> Tuple[List[Tuple[Any, str, Tuple[str, ...], str]], List[str]]:
+    """Map the JSON's renderConfigurations onto the design's saved named views.
+
+    Returns ``(tasks, log_lines)`` where each task is
+    ``(named_view, view_name, hide_bodies, visibility_label)``. A configuration
+    naming a view the model does not have is dropped and reported — rendering it
+    from whatever camera happened to be active would ship a wrong image quietly.
+    """
+    available: Dict[str, Any] = {}
+    order: List[str] = []
+    for nv in viewport_render.list_named_views(design):
+        try:
+            name = nv.name or ""
+        except Exception:
+            continue
+        key = render_instructions.normalize_name_key(name)
+        if key and key not in available:
+            available[key] = nv
+            order.append(name)
+
+    lines: List[str] = [
+        "Named views in model ({}): {}".format(
+            len(order), ", ".join(order) if order else "(none)"
+        )
+    ]
+    tasks: List[Tuple[Any, str, Tuple[str, ...], str]] = []
+    missing: List[str] = []
+    for cfg in entry.render_configurations:
+        nv = available.get(render_instructions.normalize_name_key(cfg.named_view))
+        if nv is None:
+            missing.append(cfg.named_view)
+            continue
+        tasks.append((nv, cfg.named_view, cfg.hide_bodies, cfg.label))
+
+    for nv, view_name, hides, label in tasks:
+        lines.append(
+            "Render config: '{}'{}{}".format(
+                view_name,
+                " | hide: {}".format(", ".join(hides)) if hides else "",
+                " | label: '{}'".format(label) if label else "",
+            )
+        )
+    for name in missing:
+        lines.append(
+            "NO MATCH for namedView '{}' — not saved in this model; that image is skipped".format(
+                name
+            )
+        )
+    return tasks, lines
 
 
 def execute_batch(
@@ -57,29 +165,25 @@ def execute_batch(
     render_height: int,
     output_ext: str,
     pipeline_selection: str,
-    max_named_views: int,
-    decal_scale_plane_xy: float,
+    instructions_path: Path,
+    render_quality: int,
 ) -> None:
     log_path = logutil.default_log_path(texture_root)
     logutil.append_log(log_path, "execute_batch start")
 
-    texture_pipeline.set_runtime_decal_scale_plane_xy(decal_scale_plane_xy)
-    try:
-        _execute_batch_inner(
-            fui,
-            ins,
-            texture_root,
-            models,
-            render_width,
-            render_height,
-            output_ext,
-            pipeline_selection,
-            max_named_views,
-            decal_scale_plane_xy,
-            log_path,
-        )
-    finally:
-        texture_pipeline.set_runtime_decal_scale_plane_xy(None)
+    _execute_batch_inner(
+        fui,
+        ins,
+        texture_root,
+        models,
+        render_width,
+        render_height,
+        output_ext,
+        pipeline_selection,
+        instructions_path,
+        render_quality,
+        log_path,
+    )
 
 
 def _execute_batch_inner(
@@ -91,8 +195,8 @@ def _execute_batch_inner(
     render_height: int,
     output_ext: str,
     pipeline_selection: str,
-    max_named_views: int,
-    decal_scale_plane_xy: float,
+    instructions_path: Path,
+    render_quality: int,
     log_path: Path,
 ) -> None:
 
@@ -109,7 +213,22 @@ def _execute_batch_inner(
         fui.messageBox("No model files selected.")
         return
 
+    # The render instructions now drive views, hides and decal sizes, so a bad file
+    # means nothing can render correctly — fail here rather than part-way through.
+    instructions = render_instructions.load_instructions(instructions_path)
+    if not instructions.ok:
+        detail = "\n".join(render_instructions.describe_problems(instructions, limit=12))
+        fui.messageBox(
+            "Render Instructions could not be used:\n\n{}\n\n"
+            "Fix the file and run again.".format(detail)
+        )
+        logutil.append_log(log_path, "render instructions rejected: {}".format(detail))
+        return
+
     texture_pipeline.clear_decal_shift_temp_files()
+    # Prepared (rotated / fitted) copies of the colour-set rasters live in a temp
+    # cache; start clean so a raster edited since the last run is re-prepared.
+    image_orient.clear_cache()
 
     app = adsk.core.Application.get()
     csv_log = texture_root / "_LifeproofBatchRender_log.csv"
@@ -119,17 +238,20 @@ def _execute_batch_inner(
         "Models: {}".format(len(models)),
         "Output: {} × {} {}".format(render_width, render_height, output_ext.upper()),
         "Pipeline mode: {}".format(pipeline_selection),
-        (
-            "Max named views per color set: 0 (all views in each design)"
-            if max_named_views <= 0
-            else "Max named views per color set: {} (first {} views in design order only)".format(
-                max_named_views, max_named_views
-            )
+        # Which build actually ran. Fusion caches modules for the whole session,
+        # so without this a stale build and a fresh log look identical.
+        "Code loaded: {}".format(_code_build_stamp()),
+        "Render instructions: {} ({} model entries)".format(
+            instructions.source, len(instructions.models)
         ),
-        "Decal Scale Plane XY: {:.2f}".format(decal_scale_plane_xy),
+        "Render quality: {}".format(render_quality),
         "",
         "Delivery swatches (texture copies per color folder):",
     ]
+    if instructions.problems:
+        summary_lines.append("Render instruction warnings:")
+        summary_lines.extend(render_instructions.describe_problems(instructions))
+        summary_lines.append("")
     for cs in color_sets:
         for purge_line in support_paths.purge_ignored_texture_sidecars(cs.folder):
             summary_lines.append("  {}".format(purge_line))
@@ -139,8 +261,20 @@ def _execute_batch_inner(
 
     renders_ok = 0
     renders_fail = 0
+    models_skipped = 0
+    # Decals that kept the model's original texture. Renders still succeed in
+    # that case, so without this the totals read 'Failed: 0' over a wrong image.
+    decal_failures: List[str] = []
 
-    total_steps: Optional[int] = None
+    # Estimate from the JSON rather than the first model — configuration counts
+    # differ per model now, so the old "first model × everything" guess would skew
+    # the progress bar. Over-counts only when a named view is missing from a model.
+    planned = 0
+    for _mp in models:
+        _entry = render_instructions.find_for_model(instructions, _mp)
+        if _entry is not None:
+            planned += len(_entry.render_configurations)
+    total_steps: Optional[int] = max(1, planned * max(1, len(color_sets)))
     done_steps = 0
 
     def bump_progress(msg: str) -> None:
@@ -153,13 +287,49 @@ def _execute_batch_inner(
         viewport_render.pump_ui()
 
     for mp in models:
-        mode = batch_config.resolve_pipeline_mode(
-            pipeline_selection,
-            mp,
-            support_paths.infer_texture_mode,
-        )
         model_stem = mp.stem
+
+        entry = render_instructions.find_for_model(instructions, mp)
+        if entry is None:
+            reason = render_instructions.unmatched_model_message(mp, instructions)
+            summary_lines.append("=== {} → SKIPPED ===".format(mp.name))
+            summary_lines.append("  {}".format(reason))
+            logutil.append_log(log_path, "skip {}: {}".format(mp.name, reason))
+            try:
+                _append_log(
+                    csv_log, [_log_timestamp(), model_stem, "", "", "", "skipped", reason]
+                )
+            except Exception:
+                pass
+            models_skipped += 1
+            continue
+
+        # The .f3d filenames no longer carry "Decal"/"Appearance", so the old
+        # filename sniff (support_paths.infer_texture_mode) would call every model
+        # "appearance" via its fallback and texture nothing. The JSON is the
+        # authority now: a non-empty decals[] means decal mode.
+        mode = batch_config.resolve_pipeline_mode(
+            pipeline_selection, mp, lambda _p, _entry=entry: _entry.texture_mode
+        )
         summary_lines.append("=== {} → {} ===".format(mp.name, mode))
+
+        # Install this model's decal targets. These drive BOTH which components get
+        # a decal (replacing the filename-derived guess, which the model rename
+        # broke) and the exact physical size each one is given.
+        texture_pipeline.set_decal_targets(
+            render_instructions.decal_size_map(entry), model_path=mp
+        )
+        if entry.decals:
+            summary_lines.append(
+                "  Decal targets from instructions: {}".format(
+                    "; ".join(
+                        "{} = {:.1f}x{:.1f} in -> _{}".format(
+                            d.part_number, d.width_in, d.length_in, d.slot
+                        )
+                        for d in entry.decals
+                    )
+                )
+            )
 
         doc, err = model_handler.open_model(app, mp)
         if not doc:
@@ -190,73 +360,32 @@ def _execute_batch_inner(
                 "ON (hide:/show: in descriptions)" if texture_pipeline.APPLY_NAMED_VIEW_VISIBILITY else "OFF (use file visibility as opened)"
             )
         )
-        view_tasks, vmsg = model_handler.named_view_tasks(design)
-        if vmsg:
-            summary_lines.append(vmsg)
-        n_named_views_in_design = len(view_tasks)
-        if max_named_views > 0 and len(view_tasks) > max_named_views:
-            view_tasks = view_tasks[:max_named_views]
+        # The JSON's renderConfigurations are now the complete deliverable list:
+        # an ordered set of (named view, components to hide) pairs, where the same
+        # view may legitimately repeat with a different hide-list.
+        view_tasks, view_lines = _resolve_render_tasks(design, entry)
+        summary_lines.extend("  {}".format(x) for x in view_lines)
+        if not view_tasks:
             summary_lines.append(
-                "  Named views in design: {}; exporting first {} only (UI max)".format(
-                    n_named_views_in_design, max_named_views
-                )
+                "  Nothing to render for this model — no configuration matched a saved view."
             )
-
-        # View source: PREFER the .f3d's own saved named views (the designer's
-        # exact "Nose Front"/"Nose Rear" product cameras the client signed off
-        # on). Only fall back to computed low-angle 3/4 hero shots when the
-        # model has NO saved named views. Honoring the saved views is fully
-        # automatic — the plugin reads them from the file, nothing manual.
-        prefer_named = bool(getattr(viewport_render, "PREFER_SAVED_NAMED_VIEWS", True))
-        have_named_views = n_named_views_in_design > 0
-        use_saved_named_views = prefer_named and have_named_views
-        force_iso = (not use_saved_named_views) and bool(
-            getattr(viewport_render, "FORCE_ISOMETRIC_VIEW", False)
-        )
-        iso_label_to_cam: dict = {}
-        if use_saved_named_views:
-            # Drop working/draft views (iso, top, bottom, macro). Keep close-up
-            # and full-length hero views — multi-part models need both.
-            _is_deliverable = getattr(viewport_render, "is_deliverable_view_name", None)
-            if callable(_is_deliverable):
-                kept = [(nv, name) for (nv, name) in view_tasks if _is_deliverable(name)]
-                dropped = [name for (nv, name) in view_tasks if not _is_deliverable(name)]
-                if kept:
-                    view_tasks = kept
-                    if dropped:
-                        summary_lines.append(
-                            "  Saved views filtered — dropped working views: {}".format(
-                                ", ".join(dropped)
-                            )
-                        )
-            summary_lines.append(
-                "  Camera: honoring {} saved named view(s) from the file "
-                "(designer's product cameras): {}".format(
-                    len(view_tasks),
-                    ", ".join(str(vn_name) for _nv, vn_name in view_tasks),
+            try:
+                _append_log(
+                    csv_log,
+                    [
+                        _log_timestamp(),
+                        model_stem,
+                        "",
+                        "",
+                        "",
+                        "skipped",
+                        "no renderConfigurations matched a named view in the model",
+                    ],
                 )
-            )
-        if force_iso:
-            iso_orients = list(getattr(viewport_render, "ISO_VIEW_ORIENTATIONS", ()))
-            if not iso_orients:
-                iso_orients = [("Front 3-4", 30.0, 20.0)]
-            # Each entry is (label, azimuth_degrees, elevation_degrees).
-            iso_label_to_cam = {
-                row[0]: (
-                    float(row[1]) if len(row) > 1 else 30.0,
-                    float(row[2]) if len(row) > 2 else 20.0,
-                )
-                for row in iso_orients
-            }
-            view_tasks = [(None, row[0]) for row in iso_orients]
-            summary_lines.append(
-                "  Camera: forced low product-hero angles — {} per color set "
-                "({} saved named view(s) ignored): {}".format(
-                    len(view_tasks),
-                    n_named_views_in_design,
-                    ", ".join(row[0] for row in iso_orients),
-                )
-            )
+            except Exception:
+                pass
+            models_skipped += 1
+            continue
 
         an, dn = texture_pipeline.list_appearance_and_decal_names(design)
         summary_lines.append(
@@ -267,9 +396,6 @@ def _execute_batch_inner(
                 ", ".join(dn) if dn else "(none)",
             )
         )
-
-        if total_steps is None:
-            total_steps = max(1, len(models) * len(color_sets) * max(1, len(view_tasks)))
 
         occ_snap, body_snap, mesh_snap, decal_snap = visibility_apply.capture_visibility(root)
         batch_hide_tokens = visibility_apply.collect_batch_hide_persistent_tokens(root)
@@ -316,6 +442,39 @@ def _execute_batch_inner(
                 )
                 for line in decal_lines:
                     summary_lines.append("  " + line)
+                # Roll the per-body skin audit up to model level. isChainFaces paints
+                # the WHOLE body, so a non-skin body means the texture reaches the cut
+                # ends no matter what this code does — that is a model fix, not a code
+                # fix, and this is how we tell whether it has been done.
+                _not_skin = [
+                    ln for ln in decal_lines if "NOT A SKIN BODY" in ln
+                ]
+                if _not_skin:
+                    summary_lines.append(
+                        "  *** {} body/bodies on {} are FULL SOLIDS, not show-only skins. "
+                        "Texture will appear on the cut ends and may not cover the whole "
+                        "outer face. Fix is in the model: add a show-only skin body like "
+                        "Bullnose's 'Nose Skin'. ***".format(len(_not_skin), mp.name)
+                    )
+                    logutil.append_log(
+                        log_path,
+                        "{}: {} non-skin decal body/bodies".format(mp.name, len(_not_skin)),
+                    )
+                if not batch_decals and entry.decals:
+                    # The JSON asked for decals and none were placed, so every render
+                    # of this model will come out untextured. That is otherwise only
+                    # visible by looking at the images.
+                    summary_lines.append(
+                        "  *** NO DECALS PLACED on {} — the render instructions ask for "
+                        "{}, but no show body qualified. Every image for this model will "
+                        "be untextured. See the per-occurrence lines above. ***".format(
+                            mp.name,
+                            ", ".join(d.part_number for d in entry.decals),
+                        )
+                    )
+                    logutil.append_log(
+                        log_path, "NO DECALS PLACED on {}".format(mp.name)
+                    )
         elif mode == "decal" and texture_pipeline.FORCE_BODY_COVERAGE:
             summary_lines.append("  Pre-batch appearance audit:")
             for line in texture_pipeline.audit_design_appearances(design):
@@ -389,6 +548,9 @@ def _execute_batch_inner(
                         summary_lines.append("  " + line)
 
         zero_texture_color_sets: List[str] = []
+        # Hide results are identical for every colour set, so report each
+        # configuration once rather than repeating it per colour.
+        logged_hides: set = set()
 
         for cs in color_sets:
             if not cs.slot1:
@@ -402,11 +564,21 @@ def _execute_batch_inner(
             tex_lines: List[str] = []
             if batch_decals:
                 decal_image = s1 or cs.slot1
+                n_expected = len(batch_decals)
                 # slot-2 bodies (Vinyl Skin-2) receive the _2 raster; the rest _1.
                 n_tex, dec_lines, batch_decals = texture_pipeline.update_batch_decal_images(
                     batch_decals, decal_image, s2
                 )
                 tex_lines.extend(dec_lines)
+                # n_tex is now a real success count, so a partial failure is
+                # visible instead of being averaged away by the list length.
+                if n_tex < n_expected:
+                    tex_lines.append(
+                        "DECAL UPDATE FAILURES: {} of {} decal(s) did not recreate — "
+                        "any absolute size may not be applied for this color set".format(
+                            n_expected - n_tex, n_expected
+                        )
+                    )
                 if mode == "appearance":
                     n_app, app_lines = texture_pipeline.apply_hybrid_appearance_for_batch(
                         design, s1, s2
@@ -433,6 +605,10 @@ def _execute_batch_inner(
                 n_tex, tex_lines = texture_pipeline.apply_color_set_for_open_design(
                     mode, s1, s2, carrier=carrier
                 )
+            for failed_decal in texture_pipeline.pop_decal_swap_failures():
+                decal_failures.append(
+                    "{} | {} | {}".format(mp.name, cs.folder.name, failed_decal)
+                )
             if n_tex == 0:
                 zero_texture_color_sets.append(cs.folder.name)
             # Emit the texture log lines even when 0 updates — they carry the
@@ -447,60 +623,60 @@ def _execute_batch_inner(
             except Exception:
                 pass
 
-            for nv, view_name in view_tasks:
+            for nv, view_name, hide_bodies, vis_label in view_tasks:
+
+                def _apply_hides(_hides=hide_bodies) -> List[str]:
+                    """Helper hides, then the configuration's own — explicit wins."""
+                    visibility_apply.apply_batch_render_geometry_hides(
+                        root, batch_hide_tokens
+                    )
+                    if not _hides:
+                        return []
+                    _n, _lines = visibility_apply.hide_components_by_part_number(
+                        root, _hides
+                    )
+                    return _lines
+
                 visibility_apply.restore_visibility(
                     occ_snap, body_snap, mesh_snap, decal_snap
                 )
                 if texture_pipeline.APPLY_NAMED_VIEW_VISIBILITY:
                     visibility_apply.apply_visibility_for_named_view(root, view_name)
-                visibility_apply.apply_batch_render_geometry_hides(root, batch_hide_tokens)
-                if force_iso:
-                    _az, _el = iso_label_to_cam.get(view_name, (30.0, 20.0))
-                    viewport_render.apply_isometric_view_framing(
-                        app, design, _az, _el
-                    )
-                elif nv is not None:
-                    viewport_render.activate_named_view(app, nv)
-                    viewport_render.apply_named_view_framing(
-                        app, view_name, preserve_orientation=True, design=design
-                    )
-                else:
-                    try:
-                        app.activeViewport.refresh()
-                    except Exception:
-                        pass
-                    viewport_render.apply_named_view_framing(app, view_name or "Viewport")
+                hide_lines = _apply_hides()
+                hide_key = (view_name, vis_label)
+                if hide_lines and hide_key not in logged_hides:
+                    logged_hides.add(hide_key)
+                    for line in hide_lines:
+                        summary_lines.append("  {}".format(line))
+
+                viewport_render.activate_named_view(app, nv)
+                viewport_render.apply_named_view_framing(
+                    app, view_name, preserve_orientation=True, design=design
+                )
                 viewport_render.pump_ui()
-                visibility_apply.apply_batch_render_geometry_hides(root, batch_hide_tokens)
-                viewport_render.pump_ui()
-                # Reframe once helpers/lights are off — otherwise ViewFit bounds still
+                # Reframe once helpers are off — otherwise ViewFit bounds still
                 # include proxy solids hidden after the first fit (wrong crop vs manual hide).
-                if force_iso:
-                    _az, _el = iso_label_to_cam.get(view_name, (30.0, 20.0))
-                    viewport_render.apply_isometric_view_framing(
-                        app, design, _az, _el
-                    )
-                elif nv is not None:
-                    # Re-apply the designer's exact saved camera right before
-                    # capture so the visibility toggling above can't nudge the
-                    # composition (PRESERVE_NAMED_VIEW_COMPOSITION trusts it 1:1).
-                    viewport_render.activate_named_view(app, nv)
-                    viewport_render.apply_named_view_framing(
-                        app, view_name, preserve_orientation=True, design=design
-                    )
-                else:
-                    viewport_render.apply_named_view_framing(app, view_name or "Viewport")
+                _apply_hides()
+                viewport_render.pump_ui()
+                # Re-apply the designer's exact saved camera right before capture so
+                # the visibility toggling above can't nudge the composition
+                # (PRESERVE_NAMED_VIEW_COMPOSITION trusts it 1:1).
+                viewport_render.activate_named_view(app, nv)
+                viewport_render.apply_named_view_framing(
+                    app, view_name, preserve_orientation=True, design=design
+                )
                 viewport_render.pump_ui()
 
                 # Last-chance hide after ``apply_named_view_framing`` (camera updates can
                 # resurrect Render-proxy meshes until bulbs are toggled again).
-                visibility_apply.apply_batch_render_geometry_hides(root, batch_hide_tokens)
+                _apply_hides()
                 viewport_render.pump_ui()
 
                 base = support_paths.build_output_basename(
                     model_stem,
                     cs.output_image_stem,
                     view_name,
+                    vis_label,
                 )
                 out_path = support_paths.versioned_path(cs.folder / (base + output_ext))
 
@@ -527,13 +703,22 @@ def _execute_batch_inner(
                     render_width,
                     render_height,
                     camera=render_cam,
+                    render_quality=render_quality,
                 )
 
                 ts = _log_timestamp()
                 try:
                     _append_log(
                         csv_log,
-                        [ts, model_stem, cs.folder.name, view_name, str(out_path), "1" if ok else "0", "local_fusion"],
+                        [
+                            ts,
+                            model_stem,
+                            cs.folder.name,
+                            view_name,
+                            str(out_path),
+                            "1" if ok else "0",
+                            vis_label,
+                        ],
                     )
                 except Exception:
                     pass
@@ -598,7 +783,18 @@ def _execute_batch_inner(
         summary_lines.extend(["  {}".format(x) for x in _post_purge])
 
     summary_lines.append("")
-    summary_lines.append("Renders OK: {}  Failed: {}".format(renders_ok, renders_fail))
+    if decal_failures:
+        summary_lines.append(
+            "*** {} decal problem(s) - these parts do not show the colour set "
+            "correctly (see each line): ***".format(len(decal_failures))
+        )
+        summary_lines.extend("  {}".format(x) for x in decal_failures)
+        summary_lines.append("")
+    summary_lines.append(
+        "Renders OK: {}  Failed: {}  Models skipped: {}  Decal updates failed: {}".format(
+            renders_ok, renders_fail, models_skipped, len(decal_failures)
+        )
+    )
     summary_lines.append("CSV log: {}".format(csv_log))
     summary_lines.append("Plugin log: {}".format(log_path))
 
@@ -616,6 +812,20 @@ def _execute_batch_inner(
         "Pipeline: {}".format(pipeline_selection),
         "",
         "Renders OK: {}  Failed: {}".format(renders_ok, renders_fail),
+        *(
+            ["Models skipped (no render-instructions entry): {}".format(models_skipped)]
+            if models_skipped
+            else []
+        ),
+        *(
+            [
+                "",
+                "WARNING: {} decal problem(s) - those parts do not show the colour "
+                "set correctly. See the summary.".format(len(decal_failures)),
+            ]
+            if decal_failures
+            else []
+        ),
         "",
         "Full summary: {}".format(summary_path),
         "CSV log:      {}".format(csv_log),
@@ -627,6 +837,13 @@ def _execute_batch_inner(
         uip.set_progress(ins, 100, 100)
     except Exception:
         pass
-    fui.messageBox(short_text, "Lifeproof Batch Render")
-    logutil.append_log(log_path, "execute_batch done ok={} fail={}".format(renders_ok, renders_fail))
+    fui.messageBox(short_text, "Batch Render")
+    logutil.append_log(
+        log_path,
+        "execute_batch done ok={} fail={} decal_failures={}".format(
+            renders_ok, renders_fail, len(decal_failures)
+        ),
+    )
     texture_pipeline.clear_decal_shift_temp_files()
+    # Only now: Fusion may still read a prepared image until the last render.
+    image_orient.clear_cache()
