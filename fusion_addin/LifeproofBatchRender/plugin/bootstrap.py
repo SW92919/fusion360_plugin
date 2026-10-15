@@ -137,11 +137,15 @@ def _dialog_model_paths(fui: adsk.core.UserInterface) -> List[Path]:
     paths: List[Path] = []
     try:
         names = dlg.filenames
-        for i in range(names.count):
-            paths.append(Path(names.item(i)))
+        # The API returns a plain list[str]; reading it as a collection (.count /
+        # .item) failed and silently kept only one of several picked files.
+        if hasattr(names, "count") and hasattr(names, "item") and not isinstance(names, list):
+            names = [names.item(i) for i in range(names.count)]
+        paths = [Path(n) for n in names if n]
     except Exception:
-        if dlg.filename:
-            paths.append(Path(dlg.filename))
+        paths = []
+    if not paths and dlg.filename:
+        paths.append(Path(dlg.filename))
     return paths
 
 
@@ -295,10 +299,12 @@ def run(context):
                     elif iid == uip.INPUT_BROWSE_MODEL_PATHS:
                         picked = _dialog_model_paths(fui)
                         if picked:
+                            # " |" as well as a line break: Fusion's text box can drop
+                            # the break, and the "|" still keeps the paths apart.
                             uip.set_text_input(
                                 ins,
                                 uip.INPUT_MODEL_PATHS,
-                                "\n".join(str(p) for p in picked),
+                                " |\n".join(str(p) for p in picked),
                             )
                 except Exception:
                     _log("OnInputChanged failed:\n" + traceback.format_exc())

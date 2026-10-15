@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Callable, List
 
@@ -9,10 +10,24 @@ import adsk.core
 
 
 def parse_model_paths_blob(text: str) -> List[Path]:
+    """Model paths from the dialog's text box: one per line, or ``|`` / ``;`` separated.
+
+    Robust to what Fusion's multi-line text box can hand back: HTML line breaks,
+    and two picked paths run together after it dropped the line break between
+    them (only one of two selected models was rendered on 2026-10-15).
+    """
     if not text or not text.strip():
         return []
-    raw = text.replace("\r", "").replace("|", "\n").replace(";", "\n")
-    return [Path(line.strip()) for line in raw.split("\n") if line.strip()]
+    raw = re.sub(r"(?i)<br\s*/?>|</?p[^>]*>|</?div[^>]*>", "\n", text)
+    raw = raw.replace("\r", "").replace("|", "\n").replace(";", "\n")
+    out: List[Path] = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.findall(r".+?\.f3d(?=\s*(?:[A-Za-z]:[\\/]|\\\\|$))", line, flags=re.I)
+        out.extend(Path(p.strip()) for p in (parts or [line]))
+    return out
 
 
 def resolve_pipeline_mode(

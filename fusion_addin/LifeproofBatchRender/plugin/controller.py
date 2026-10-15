@@ -235,7 +235,7 @@ def _execute_batch_inner(
     summary_lines: List[str] = [
         "Texture root: {}".format(texture_root),
         "Color sets: {}".format(len(color_sets)),
-        "Models: {}".format(len(models)),
+        "Models: {} ({})".format(len(models), ", ".join(Path(m).name for m in models)),
         "Output: {} × {} {}".format(render_width, render_height, output_ext.upper()),
         "Pipeline mode: {}".format(pipeline_selection),
         # Which build actually ran. Fusion caches modules for the whole session,
@@ -265,6 +265,9 @@ def _execute_batch_inner(
     # Decals that kept the model's original texture. Renders still succeed in
     # that case, so without this the totals read 'Failed: 0' over a wrong image.
     decal_failures: List[str] = []
+    # Render Instructions decal sizes that may not cover their part (bare ends or
+    # edges). Renders are still made; these say which ones to look at.
+    size_warnings: List[str] = []
 
     # Estimate from the JSON rather than the first model — configuration counts
     # differ per model now, so the old "first model × everything" guess would skew
@@ -340,6 +343,15 @@ def _execute_batch_inner(
         if not design:
             summary_lines.append("No active design.")
             continue
+
+        # Render Instructions decal sizes (deliverable 2). Resizing a decal rolls the
+        # timeline back and recomputes the model, so it is done first: the geometry
+        # settle and the visibility snapshot below then see the finished model.
+        if mode == "decal":
+            for size_line in texture_pipeline.apply_json_decal_sizes(design):
+                summary_lines.append("  {}".format(size_line))
+            for size_warning in texture_pipeline.pop_decal_size_warnings():
+                size_warnings.append("{} | {}".format(mp.name, size_warning))
 
         viewport_render.prepare_clean_render_view(app)
 
@@ -609,6 +621,8 @@ def _execute_batch_inner(
                 decal_failures.append(
                     "{} | {} | {}".format(mp.name, cs.folder.name, failed_decal)
                 )
+            for size_warning in texture_pipeline.pop_decal_size_warnings():
+                size_warnings.append("{} | {}".format(mp.name, size_warning))
             if n_tex == 0:
                 zero_texture_color_sets.append(cs.folder.name)
             # Emit the texture log lines even when 0 updates — they carry the
@@ -783,6 +797,13 @@ def _execute_batch_inner(
         summary_lines.extend(["  {}".format(x) for x in _post_purge])
 
     summary_lines.append("")
+    if size_warnings:
+        summary_lines.append(
+            "*** {} decal size warning(s) - the Render Instructions size may not "
+            "cover these parts fully; check their renders: ***".format(len(size_warnings))
+        )
+        summary_lines.extend("  {}".format(x) for x in size_warnings)
+        summary_lines.append("")
     if decal_failures:
         summary_lines.append(
             "*** {} decal problem(s) - these parts do not show the colour set "
@@ -791,8 +812,9 @@ def _execute_batch_inner(
         summary_lines.extend("  {}".format(x) for x in decal_failures)
         summary_lines.append("")
     summary_lines.append(
-        "Renders OK: {}  Failed: {}  Models skipped: {}  Decal updates failed: {}".format(
-            renders_ok, renders_fail, models_skipped, len(decal_failures)
+        "Renders OK: {}  Failed: {}  Models skipped: {}  Decal updates failed: {}  "
+        "Size warnings: {}".format(
+            renders_ok, renders_fail, models_skipped, len(decal_failures), len(size_warnings)
         )
     )
     summary_lines.append("CSV log: {}".format(csv_log))
@@ -824,6 +846,15 @@ def _execute_batch_inner(
                 "set correctly. See the summary.".format(len(decal_failures)),
             ]
             if decal_failures
+            else []
+        ),
+        *(
+            [
+                "",
+                "NOTE: {} decal size warning(s) - the Render Instructions size may not "
+                "cover some parts fully. See the summary.".format(len(size_warnings)),
+            ]
+            if size_warnings
             else []
         ),
         "",

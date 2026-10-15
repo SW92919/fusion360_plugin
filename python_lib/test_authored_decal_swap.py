@@ -109,23 +109,87 @@ class Matrix:
     def copy(self):
         return Matrix(self.origin, self.x, self.y, self.z)
 
+    def setWithCoordinateSystem(self, origin, x, y, z):
+        self.origin, self.x, self.y, self.z = origin, x, y, z
+        return True
+
+
+class FakeTimeline:
+    """design.timeline: the marker sits at the end unless a decal rolled it back."""
+
+    def __init__(self):
+        self.count = 10
+        self._marker = 10
+        self.rolled_to = None
+        self.moves_to_end = 0
+        self.stuck = False
+
+    @property
+    def markerPosition(self):
+        return self._marker
+
+    @markerPosition.setter
+    def markerPosition(self, value):
+        if getattr(self, "stuck", False):
+            return
+        self._marker = int(value)
+        self.rolled_to = None  # the marker left the decal it was rolled to
+
+    def moveToEnd(self):
+        self.markerPosition = self.count
+        self.moves_to_end += 1
+        return True
+
+
+_TIMELINE = FakeTimeline()
+
+if not _REAL_ADSK:
+    _core_mod = sys.modules["adsk.core"]
+    _core_mod.Vector3D = types.SimpleNamespace(create=lambda x=0.0, y=0.0, z=0.0: Vec(x, y, z))
+    _core_mod.Point3D = types.SimpleNamespace(create=lambda x=0.0, y=0.0, z=0.0: Point(x, y, z))
+    _core_mod.Matrix3D = types.SimpleNamespace(
+        create=lambda: Matrix(Point(0, 0, 0), Vec(1, 0, 0), Vec(0, 1, 0), Vec(0, 0, 1))
+    )
+
 
 class _Evaluator:
-    def __init__(self, normal):
+    """A horizontal plane at the face's height; parameters are (x, z)."""
+
+    def __init__(self, normal, face=None):
         self._n = normal
+        self._face = face
 
     def getNormalAtPoint(self, _point):
         return True, self._n
 
+    def getParameterAtPoint(self, point):
+        return True, types.SimpleNamespace(x=point.x, y=point.z)
+
+    def getPointAtParameter(self, param):
+        return True, Point(param.x, self._face._y, param.y)
+
 
 class Face:
-    def __init__(self, body, z_height, normal=(0, 1, 0), area=1800.0):
+    def __init__(self, body, z_height, normal=(0, 1, 0), area=1800.0, box=None):
         self.body, self.area = body, area
         self._y = z_height
-        self.evaluator = _Evaluator(Vec(*normal))
+        self.evaluator = _Evaluator(Vec(*normal), self)
+        self._box = box  # ((x0, y0, z0), (x1, y1, z1)) or None = unbounded
+
+    @property
+    def boundingBox(self):
+        if self._box is None:
+            raise RuntimeError("no bounding box in this fake")
+        lo, hi = self._box
+        return types.SimpleNamespace(minPoint=Point(*lo), maxPoint=Point(*hi))
 
     def isPointOnFace(self, point, tol=0.0):
-        return abs(point.y - self._y) <= tol
+        if abs(point.y - self._y) > tol:
+            return False
+        if self._box is None:
+            return True
+        lo, hi = self._box
+        return lo[0] - tol <= point.x <= hi[0] + tol and lo[2] - tol <= point.z <= hi[2] + tol
 
 
 class _Coll:
@@ -150,6 +214,15 @@ class Body:
     def faces(self):
         return _Coll(self._faces)
 
+    @property
+    def boundingBox(self):
+        boxes = [f._box for f in self._faces if f._box is not None]
+        if not boxes:
+            raise RuntimeError("no bounding box in this fake")
+        lo = tuple(min(b[0][i] for b in boxes) for i in range(3))
+        hi = tuple(max(b[1][i] for b in boxes) for i in range(3))
+        return types.SimpleNamespace(minPoint=Point(*lo), maxPoint=Point(*hi))
+
 
 class _Timeline:
     def __init__(self, decal):
@@ -158,6 +231,13 @@ class _Timeline:
         self.healthState = 0
         self.isSuppressed = False
         self.isRolledBack = False
+
+    def rollTo(self, before):
+        _TIMELINE._marker = self.index if before else self.index + 1
+        _TIMELINE.rolled_to = self.entity
+        if getattr(self, "raise_after_roll", False):
+            raise RuntimeError("compute failed after roll")
+        return True
 
 
 class Decal:
@@ -173,6 +253,11 @@ class Decal:
         self.refuse_show = False   # setting the bulb back ON fails (rollback trouble)
         self.refuse_delete = False
         self.refuse_write = False  # write refused although the face reads fine
+        self.refuse_redefine = False  # True: redefine returns False; "raise": it raises
+        self.faces_override = None  # a list of real faces, when n copies of one won't do
+        self.rolled_faces = None    # what decal.faces reads while the marker is rolled to it
+        self.store_as = None        # fn(matrix) -> matrix Fusion keeps (first redefine only)
+        self.redefines = []
         self.n_faces = 1
         self.isDerived = False
         self.deleted = False
@@ -197,6 +282,10 @@ class Decal:
     def faces(self):
         # Like the real API: a dead reference reads as ONE None however many faces
         # the designer picked (3-in-1's decal covers ~8 and reported nFaces=1).
+        if self.rolled_faces is not None and _TIMELINE.rolled_to is self:
+            return list(self.rolled_faces)
+        if self.faces_override is not None:
+            return list(self.faces_override)
         return [None] if self.broken else [self._face] * self.n_faces
 
     @property
@@ -217,6 +306,39 @@ class Decal:
 
     def saveImage(self, filename):
         return False
+
+    def redefine(self, matrix, faces, chain):
+        self.redefines.append((matrix, list(faces), chain))
+        if self.refuse_redefine == "raise":
+            raise RuntimeError("redefine failed")
+        if self.refuse_redefine:
+            return False
+        if _TIMELINE.rolled_to is not self:
+            raise RuntimeError("the timeline marker is not just before this decal")
+        _o, mx, my, mz = matrix.getAsCoordinateSystem()
+
+        def _dot(a, b):
+            return a.x * b.x + a.y * b.y + a.z * b.z
+
+        def _len(a):
+            return _dot(a, a) ** 0.5
+
+        for a, b in ((mx, my), (my, mz), (mx, mz)):
+            if abs(_dot(a, b)) > 1e-6 * _len(a) * _len(b):
+                # The message Fusion gave on 3-in-1 (2026-10-15).
+                raise RuntimeError("3 : Y and Z axes defined by the matrix, must be perpendicular to one another")
+        # Fusion is strict about the centre (2026-10-15, four of nine decals).
+        if faces and faces[0] is not None and not faces[0].isPointOnFace(_o, 1e-6):
+            raise RuntimeError("3 : Input point is not located on primary face (first face in array)")
+        if getattr(self, "redefine_distort", False) and len(self.redefines) == 1:
+            o, mx, my, mz = matrix.getAsCoordinateSystem()
+            matrix = Matrix(o, Vec(mx.x / 2, mx.y / 2, mx.z / 2), my, mz)  # Fusion keeps half the size
+        if self.store_as is not None and len(self.redefines) == 1:
+            matrix = self.store_as(matrix)
+        self._transform = matrix
+        if len(faces) > 1:
+            self.faces_override = list(faces)  # Fusion lists the faces primary-first afterwards
+        return True
 
     def deleteMe(self):
         if self.refuse_delete:
@@ -290,6 +412,9 @@ class Design:
             id="root", name=root_name, partNumber=root_name, decals=Decals([]),
             allOccurrences=_Coll(occurrences), isDecalFolderLightBulbOn=True,
         )
+        _TIMELINE.__init__()
+        self.timeline = _TIMELINE
+        self.snapshots = types.SimpleNamespace(hasPendingSnapshot=False)
 
 
 def _transform(y=1.0, along=127.0, across=22.86):
@@ -308,6 +433,8 @@ class _Fixture(unittest.TestCase):
     NOSE_BROKEN = False
 
     def setUp(self):
+        self._json_size_flag = tp.DECAL_APPLY_JSON_SIZE
+        tp.DECAL_APPLY_JSON_SIZE = False  # this suite: designer sizes
         self.tmp = tempfile.TemporaryDirectory()
         t = Path(self.tmp.name)
         self.authored_plank = _png(t / "authored-plank.png", 14, 79)   # 137x786-ish, portrait
@@ -346,6 +473,7 @@ class _Fixture(unittest.TestCase):
         image_orient.clear_cache()
 
     def tearDown(self):
+        tp.DECAL_APPLY_JSON_SIZE = self._json_size_flag
         tp.set_decal_targets(None)
         tp.pop_decal_swap_failures()
         image_orient.clear_cache()
@@ -688,6 +816,8 @@ class _OneToneFixture(unittest.TestCase):
     """
 
     def setUp(self):
+        self._json_size_flag = tp.DECAL_APPLY_JSON_SIZE
+        tp.DECAL_APPLY_JSON_SIZE = False  # this suite: designer sizes
         self.tmp = tempfile.TemporaryDirectory()
         t = Path(self.tmp.name)
         self.cs1 = _png(t / "Color Set 71-1.png", 100, 20)
@@ -719,6 +849,7 @@ class _OneToneFixture(unittest.TestCase):
         image_orient.clear_cache()
 
     def tearDown(self):
+        tp.DECAL_APPLY_JSON_SIZE = self._json_size_flag
         tp.set_decal_targets(None)
         tp.pop_decal_swap_failures()
         image_orient.clear_cache()
@@ -857,6 +988,8 @@ class ThreeInOneLayoutTests(unittest.TestCase):
     """
 
     def setUp(self):
+        self._json_size_flag = tp.DECAL_APPLY_JSON_SIZE
+        tp.DECAL_APPLY_JSON_SIZE = False  # this suite: designer sizes
         self.tmp = tempfile.TemporaryDirectory()
         t = Path(self.tmp.name)
         self.cs1 = _png(t / "Color Set 04-1.png", 100, 20)
@@ -878,6 +1011,7 @@ class ThreeInOneLayoutTests(unittest.TestCase):
         image_orient.clear_cache()
 
     def tearDown(self):
+        tp.DECAL_APPLY_JSON_SIZE = self._json_size_flag
         tp.set_decal_targets(None)
         tp.pop_decal_swap_failures()
         image_orient.clear_cache()
@@ -1016,6 +1150,31 @@ class PlacementCheckTests(_Fixture):
         probe = [l for l in lines if "Decal probe [Supplemental Plank#0]" in l]
         self.assertIn("centreOnFace=False", probe[0])
 
+    def test_dead_reference_that_iterates_as_an_empty_wrapper_is_not_misplaced(self):
+        # Real Fusion on Bullnose's nose: faces[0] is None, but iterating the list
+        # yields a wrapper whose calls raise. That must read as "cannot tell".
+        class _NullFace:
+            def __getattr__(self, name):
+                raise RuntimeError("null face")
+
+        class _OddList(list):
+            def __iter__(self):
+                return iter([_NullFace()])
+
+        class _NoseFacesFake(Decal):
+            @property
+            def faces(self):
+                return _OddList([None])
+
+        self.nose_decal.__class__ = _NoseFacesFake
+        self.nose_decal.broken = True
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertNotIn("not on its own surface", text)
+        self.assertEqual([f for f in tp.pop_decal_swap_failures() if "off its surface" in f], [], text)
+        probe = [l for l in lines if "Decal probe [Stair Nose#0]" in l]
+        self.assertIn("centreOnFace=None", probe[0])
+
     def test_dead_reference_is_not_reported_as_misplaced(self):
         self.nose_decal.broken = True
         _total, lines = self._apply(self.cs_a1, self.cs_a2)
@@ -1035,6 +1194,617 @@ class NearSquareFootprintTests(_Fixture):
         size = image_orient.image_size(Path(self.plank_decal.imageFilename))
         self.assertEqual(image_orient.orientation_of(size), image_orient.PORTRAIT, text)
         self.assertNotIn("other way", text)
+
+
+def _mags(decal):
+    _o, x, y, _z = decal.transform.getAsCoordinateSystem()
+    return (round(tp._vector_length(x), 3), round(tp._vector_length(y), 3))
+
+
+class _JsonSizeBullnoseFixture(_Fixture):
+    """Deliverable 2 on a Bullnose-shaped model (real footprints, real JSON sizes)."""
+
+    def setUp(self):
+        super().setUp()
+        tp.DECAL_APPLY_JSON_SIZE = True
+        # Plank decal: X across (13.04), Y along world z (121.5); its skin face spans 121.92 cm.
+        self.plank.bRepBodies.item(0)._faces[0]._box = ((-6.6, 1.0, -60.96), (6.6, 1.0, 60.96))
+        # Nose decal: X along world x (123.7), Y across (22.6).
+        self.nose_skin._faces[0]._box = ((-60.96, 1.0, -11.5), (60.96, 1.0, 11.5))
+        tp.pop_decal_size_warnings()
+
+    def tearDown(self):
+        tp.pop_decal_size_warnings()
+        super().tearDown()
+
+
+class JsonSizeBullnoseTests(_JsonSizeBullnoseFixture):
+    def test_both_decals_get_the_render_instructions_size(self):
+        total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(total, 2, text)
+        self.assertEqual(_mags(self.plank_decal), (17.78, 127.0), text)   # 7 x 50 in
+        self.assertEqual(_mags(self.nose_decal), (127.0, 22.86), text)    # 50 x 9 in
+        self.assertIn("size set from the Render Instructions: 17.8 x 127.0 cm", text)
+        self.assertIn("designer's 13.0 x 121.5 cm", text)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+        self.assertEqual(_TIMELINE.markerPosition, _TIMELINE.count)
+
+    def test_centre_and_directions_are_the_designers(self):
+        self._apply(self.cs_a1, self.cs_a2)
+        o, x, y, _z = self.plank_decal.transform.getAsCoordinateSystem()
+        self.assertEqual((o.x, o.y, o.z), (0.0, 1.0, 0.0))
+        self.assertEqual((x.y, x.z, y.x, y.y), (0.0, 0.0, 0.0, 0.0))
+        self.assertGreater(x.x, 0)
+        self.assertGreater(y.z, 0)
+
+    def test_images_are_still_swapped_and_fitted_over_the_new_footprint(self):
+        if not self._backend_available():
+            self.skipTest("no image backend on this platform")
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(self.plank_decal.name, "Color Set 71-2")
+        self.assertIn("footprint 17.8x127.0 cm (portrait)", text)
+        self.assertIn("footprint 127.0x22.9 cm (landscape)", text)
+
+    def test_sizes_are_applied_once_per_model(self):
+        self._apply(self.cs_a1, self.cs_a2)
+        self._apply(self.cs_b1, self.cs_b2)
+        self.assertEqual(len(self.plank_decal.redefines), 1)
+        self.assertEqual(len(self.nose_decal.redefines), 1)
+
+    def test_refused_redefine_keeps_the_designer_size_and_says_so(self):
+        self.plank_decal.refuse_redefine = True
+        total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(total, 2, text)
+        self.assertEqual(_mags(self.plank_decal), (13.041, 121.518))
+        warnings = tp.pop_decal_size_warnings()
+        self.assertEqual(len(warnings), 1, text)
+        self.assertIn("Fusion refused the new size", warnings[0])
+        self.assertEqual(_TIMELINE.markerPosition, _TIMELINE.count)
+
+    def test_failing_redefine_still_returns_the_timeline_marker(self):
+        self.plank_decal.refuse_redefine = "raise"
+        total, _lines = self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(total, 2)
+        self.assertIn("redefine failed", tp.pop_decal_size_warnings()[0])
+        self.assertEqual(_TIMELINE.markerPosition, _TIMELINE.count)
+        self.assertEqual(_TIMELINE.rolled_to, None)
+
+    def test_switch_off_keeps_every_designer_size(self):
+        tp.DECAL_APPLY_JSON_SIZE = False
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(self.plank_decal.redefines, [])
+        self.assertEqual(_mags(self.plank_decal), (13.041, 121.518))
+
+    def test_switched_off_decal_is_not_resized(self):
+        self.plank_decal.isLightBulbOn = False
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(self.plank_decal.redefines, [])
+
+    def test_broken_nose_gets_a_stand_in_at_the_render_instructions_size(self):
+        self.nose_decal.broken = True
+        total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(total, 2, text)
+        self.assertEqual(self.nose_decal.redefines, [], "a dead decal cannot be redefined")
+        self.assertIn("goes to its stand-in", text)
+        stand_in = self.nose.decals.item(1)
+        self.assertEqual(_mags(stand_in), (127.0, 22.86), text)
+        self.assertIn("sized from the Render Instructions: 127.0 x 22.9 cm", text)
+        self.assertFalse(self.nose_decal.isLightBulbOn)
+        self.assertEqual(tp.pop_decal_swap_failures(), [], text)
+
+
+class JsonSizeTimelineAndFrameTests(_JsonSizeBullnoseFixture):
+    """Fixes from the 2026-10-15 Fusion run on 3-in-1."""
+
+    def test_marker_goes_back_where_the_model_had_it_not_to_the_end(self):
+        # One-tone models are saved with the marker part-way; an old stair scene
+        # after it must stay off (moveToEnd brought it into the renders).
+        _TIMELINE.markerPosition = 7
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(_TIMELINE.markerPosition, 7)
+        self.assertEqual(_mags(self.plank_decal), (17.78, 127.0))
+
+    def test_marker_goes_back_even_when_redefine_fails(self):
+        _TIMELINE.markerPosition = 7
+        self.plank_decal.refuse_redefine = "raise"
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(_TIMELINE.markerPosition, 7)
+
+    def test_frame_that_is_not_square_is_squared_and_accepted(self):
+        # Fusion read back a slightly skewed frame for the re-made 3-in-1 decal;
+        # handing it to redefine as-is was refused.
+        self.plank_decal._transform = Matrix(
+            Point(0, 1, 0), Vec(13.041, 0, 0), Vec(0, 0.4, 121.518), Vec(0, 1, 0)
+        )
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+        _o, x, y, z = self.plank_decal.transform.getAsCoordinateSystem()
+        self.assertAlmostEqual(y.x * z.x + y.y * z.y + y.z * z.z, 0.0, places=6)
+        self.assertEqual(_mags(self.plank_decal), (17.78, 127.0))
+        self.assertGreater(y.z, 0, "the designer's direction is kept")
+
+    def test_mirrored_decal_stays_mirrored(self):
+        self.plank_decal._transform = Matrix(
+            Point(0, 1, 0), Vec(13.041, 0, 0), Vec(0, 0, -121.518), Vec(0, 1, 0)
+        )
+        self._apply(self.cs_a1, self.cs_a2)
+        _o, x, y, _z = self.plank_decal.transform.getAsCoordinateSystem()
+        self.assertGreater(x.x, 0)
+        self.assertLess(y.z, 0, "a flipped decal must stay flipped")
+
+
+class JsonSizeHardeningTests(_JsonSizeBullnoseFixture):
+    """Second review round: every way a resize can go wrong leaves the model sound."""
+
+    def test_marker_put_back_even_when_the_roll_itself_raises(self):
+        _TIMELINE.markerPosition = 7
+        self.plank_decal.timelineObject.raise_after_roll = True
+        total, _lines = self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(total, 2)
+        self.assertEqual(_TIMELINE.markerPosition, 7)
+        self.assertEqual(_mags(self.plank_decal), (13.041, 121.518))
+        self.assertTrue(any("compute failed after roll" in w for w in tp.pop_decal_size_warnings()))
+
+    def test_marker_that_cannot_be_put_back_stops_sizing_and_is_a_failure(self):
+        _TIMELINE.markerPosition = 7
+        _TIMELINE.stuck = True
+        self._apply(self.cs_a1, self.cs_a2)
+        fails = tp.pop_decal_swap_failures()
+        self.assertTrue(any("timeline marker could not be put back" in f for f in fails), fails)
+        resized = len(self.plank_decal.redefines) + len(self.nose_decal.redefines)
+        self.assertEqual(resized, 1, "sizing stops after the first stuck marker")
+
+    def test_model_with_uncaptured_positions_is_not_resized(self):
+        self.design.snapshots.hasPendingSnapshot = True
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(self.plank_decal.redefines, [])
+        self.assertTrue(any("moved without a captured position" in w for w in tp.pop_decal_size_warnings()))
+
+    def test_resize_fusion_got_wrong_is_undone(self):
+        self.plank_decal.redefine_distort = True
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(_mags(self.plank_decal), (13.041, 121.518), text)
+        self.assertEqual(len(self.plank_decal.redefines), 2, "resize + undo")
+        self.assertTrue(any("the designer's size was kept" in w for w in tp.pop_decal_size_warnings()), text)
+        self.assertEqual(_TIMELINE.markerPosition, _TIMELINE.count)
+
+    def test_unhealthy_decal_after_resize_is_reported(self):
+        self.plank_decal.timelineObject.healthState = 1
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertTrue(any("not healthy" in w for w in tp.pop_decal_size_warnings()))
+
+    def test_stand_in_size_that_never_got_used_is_reported(self):
+        self.nose_decal.broken = True
+        old = tp.DECAL_REPLACE_UNWRITABLE_AUTHORED
+        tp.DECAL_REPLACE_UNWRITABLE_AUTHORED = False
+        try:
+            _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        finally:
+            tp.DECAL_REPLACE_UNWRITABLE_AUTHORED = old
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("no stand-in was made" in w for w in warnings), "\n".join(lines))
+
+    def test_decals_are_fetched_again_after_every_roll(self):
+        real = tp._collect_decals_with_owner
+        calls = []
+
+        def counting(design):
+            calls.append(1)
+            return real(design)
+
+        tp._collect_decals_with_owner = counting
+        try:
+            tp.apply_json_decal_sizes(self.design)
+        finally:
+            tp._collect_decals_with_owner = real
+        self.assertEqual(_mags(self.plank_decal), (17.78, 127.0))
+        self.assertEqual(_mags(self.nose_decal), (127.0, 22.86))
+        self.assertGreaterEqual(len(calls), 3, "initial collection + one after each roll")
+
+    def test_controller_step_runs_once_and_the_colour_set_does_not_repeat_it(self):
+        lines = tp.apply_json_decal_sizes(self.design)
+        self.assertTrue(any("size set from the Render Instructions" in l for l in lines))
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(len(self.plank_decal.redefines), 1)
+
+    def test_unmeasurable_part_and_shorter_decal_is_reported(self):
+        self.plank.bRepBodies.item(0)._faces[0]._box = None
+        self.plank_decal._transform = _transform(along=13.041, across=200.0)  # longer than JSON 127
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertTrue(any("could not be measured and the decal gets shorter" in w
+                            for w in tp.pop_decal_size_warnings()))
+
+
+class JsonSizeSolidBodyTests(_JsonSizeBullnoseFixture):
+    """A wrapping decal on a full solid must not run onto the cut ends (Square Nose plank)."""
+
+    def setUp(self):
+        super().setUp()
+        self._audit = tp.audit_decal_body_is_show_only
+        tp.audit_decal_body_is_show_only = lambda body: (False, "full solid with cut-end faces")
+
+    def tearDown(self):
+        tp.audit_decal_body_is_show_only = self._audit
+        super().tearDown()
+
+    def test_length_is_held_to_the_part_on_a_solid_body(self):
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(_mags(self.plank_decal), (17.78, 121.92), text)  # part, not 127
+        self.assertIn("length held to the part's 121.9 cm (Render Instructions: 127.0 cm)", text)
+
+    def test_wider_decal_on_a_solid_body_is_reported(self):
+        self._apply(self.cs_a1, self.cs_a2)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("wider than the designer's decal (13.0 cm)" in w for w in warnings), warnings)
+
+    def test_show_only_skin_keeps_the_full_json_length(self):
+        tp.audit_decal_body_is_show_only = self._audit
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(_mags(self.plank_decal), (17.78, 127.0))
+
+
+class JsonSizeSmallGuardTests(_JsonSizeBullnoseFixture):
+    def test_derived_decal_is_not_resized(self):
+        self.plank_decal.isDerived = True
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(self.plank_decal.redefines, [])
+        self.assertTrue(any("derived from another design" in w for w in tp.pop_decal_size_warnings()))
+
+    def test_designer_opacity_survives_the_resize(self):
+        self.plank_decal.opacity = 0.8
+        original = Decal.redefine
+
+        def resetting(decal, matrix, faces, chain):
+            ok = original(decal, matrix, faces, chain)
+            decal.opacity = 1.0  # a Fusion build that resets it
+            return ok
+
+        Decal.redefine = resetting
+        try:
+            self._apply(self.cs_a1, self.cs_a2)
+        finally:
+            Decal.redefine = original
+        self.assertEqual(self.plank_decal.opacity, 0.8)
+
+
+def _rotated_about_y(matrix, degrees):
+    """``matrix`` with X and Z turned about world Y (the fakes' face normal)."""
+    import math
+
+    o, x, y, z = matrix.getAsCoordinateSystem()
+    c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+
+    def turn(v):
+        return Vec(c * v.x + s * v.z, v.y, -s * v.x + c * v.z)
+
+    return Matrix(o, turn(x), turn(y), z)
+
+
+class JsonSizeFusionRun3Tests(_JsonSizeBullnoseFixture):
+    """The third Fusion run (all 8 models, 2026-10-15): 7 of 9 resizes refused or undone."""
+
+    def test_centre_a_hair_off_its_face_is_put_exactly_on_it(self):
+        # Bullnose and Square Nose planks: "Input point is not located on primary face".
+        self.plank_decal._transform = Matrix(
+            Point(0, 1.005, 0), Vec(13.041, 0, 0), Vec(0, 0, 121.518), Vec(0, 1, 0)
+        )
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(_mags(self.plank_decal), (17.78, 127.0), text)
+        o, _x, _y, _z = self.plank_decal.transform.getAsCoordinateSystem()
+        self.assertEqual(o.y, 1.0)
+        self.assertIn("centre put exactly on its face (it read 0.005 cm off)", text)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_centre_far_off_its_face_is_not_moved_onto_it(self):
+        self.plank_decal._transform = Matrix(
+            Point(0, 1.5, 0), Vec(13.041, 0, 0), Vec(0, 0, 121.518), Vec(0, 1, 0)
+        )
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertIn("its centre is 0.50 cm from its nearest face", text)
+        self.assertEqual(_mags(self.plank_decal), (13.041, 121.518), "Fusion refuses; designer kept")
+        self.assertTrue(any("primary face" in w for w in tp.pop_decal_size_warnings()))
+
+    def test_face_that_sits_apart_while_rolled_back_gets_one_retry(self):
+        rolled = Face(self.plank.bRepBodies.item(0), 1.02, box=((-6.6, 1.02, -60.96), (6.6, 1.02, 60.96)))
+        self.plank_decal.rolled_faces = [rolled]
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 2, "refused, then retried on the face")
+        self.assertEqual(self.plank_decal.redefines[1][0].origin.y, 1.02)
+        self.assertEqual(_mags(self.plank_decal), (17.78, 127.0), text)
+
+    def test_face_far_apart_while_rolled_back_is_reported_with_the_distance(self):
+        rolled = Face(self.plank.bRepBodies.item(0), 3.0, box=((-6.6, 3.0, -60.96), (6.6, 3.0, 60.96)))
+        self.plank_decal.rolled_faces = [rolled]
+        self._apply(self.cs_a1, self.cs_a2)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(
+            any("at the decal's step in the timeline its centre is 2.00 cm from that face" in w
+                for w in warnings),
+            warnings,
+        )
+        self.assertEqual(_TIMELINE.markerPosition, _TIMELINE.count)
+
+    def test_frame_stored_slightly_off_square_is_kept(self):
+        # L-Cap, Reducer, Quarter Round: exact size and centre, axes "turned".
+        def tilt_out_of_surface(m):
+            o, x, y, z = m.getAsCoordinateSystem()
+            return Matrix(o, x, Vec(y.x, y.y + 0.05 * y.z, y.z), z)  # ~3 deg off the surface
+
+        self.plank_decal.store_as = tilt_out_of_surface
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 1, "no undo")
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_reversed_axis_is_kept_and_logged(self):
+        def reverse_y(m):
+            o, x, y, z = m.getAsCoordinateSystem()
+            return Matrix(o, x, Vec(-y.x, -y.y, -y.z), z)
+
+        self.plank_decal.store_as = reverse_y
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 1, "no undo")
+        self.assertIn("Fusion stored it with its Y axis reversed", text)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_small_turn_on_the_surface_is_kept_and_logged(self):
+        self.plank_decal.store_as = lambda m: _rotated_about_y(m, 2.0)
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 1, "no undo")
+        self.assertIn("its length turned 2.0 deg on the surface", text)
+
+    def test_centre_a_millimetre_off_after_the_resize_is_logged_not_warned(self):
+        # Bullnose plank, 4th Fusion run: Fusion put the centre 0.136 cm across.
+        def shift_across(m):
+            o, x, y, z = m.getAsCoordinateSystem()
+            return Matrix(Point(o.x + 0.136, o.y, o.z), x, y, z)
+
+        self.plank_decal.store_as = shift_across
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 1, "no undo")
+        self.assertIn("its centre 0.14 cm from where it was asked", text)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_turn_just_under_the_limit_is_kept(self):
+        self.plank_decal.store_as = lambda m: _rotated_about_y(m, 4.0)
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(len(self.plank_decal.redefines), 1, "4 deg is within the 5 deg limit")
+
+    def test_large_tilt_off_the_surface_alone_is_kept_and_logged(self):
+        def tilt_length(m):
+            import math
+
+            o, x, y, z = m.getAsCoordinateSystem()
+            t = math.radians(8.0)
+            n = (y.x ** 2 + y.y ** 2 + y.z ** 2) ** 0.5  # length axis is Y on the plank
+            return Matrix(o, x, Vec(0, n * math.sin(t), n * math.cos(t)), z)
+
+        self.plank_decal.store_as = tilt_length
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 1, text)
+        self.assertIn("its length tilted 8.0 deg off the surface", text)
+
+    def test_skewed_designer_frame_keeps_the_length_direction(self):
+        # Squaring around X would turn a Y-long decal's grain by the skew.
+        self.plank_decal._transform = Matrix(
+            Point(0, 1, 0), Vec(13.041, 0, 0.68), Vec(0, 0, 121.518), Vec(0, 1, 0)
+        )
+        self._apply(self.cs_a1, self.cs_a2)
+        _o, x, y, _z = self.plank_decal.transform.getAsCoordinateSystem()
+        self.assertEqual((y.x, y.y), (0.0, 0.0))
+        self.assertAlmostEqual(y.z, 127.0, places=9)
+        self.assertAlmostEqual(x.x * y.x + x.y * y.y + x.z * y.z, 0.0, places=9)
+
+    def test_large_turn_on_the_surface_is_undone(self):
+        self.plank_decal.store_as = lambda m: _rotated_about_y(m, 10.0)
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 2, "resize + undo")
+        self.assertEqual(_mags(self.plank_decal), (13.041, 121.518), text)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("length turned 10.0 deg on the surface" in w and "designer's size was kept" in w
+                            for w in warnings), warnings)
+
+    def test_undo_squares_a_designer_frame_redefine_will_not_take(self):
+        # Quarter Round: "putting the designer's size back failed (3 : X and Z axes
+        # defined by the matrix, must be perpendicular to one another)".
+        self.plank_decal._transform = Matrix(
+            Point(0, 1, 0), Vec(13.041, 0.3, 0), Vec(0, 0, 121.518), Vec(0, 1, 0)
+        )
+        self.plank_decal.redefine_distort = True
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(len(self.plank_decal.redefines), 3, "\n".join(lines))
+        self.assertAlmostEqual(_vector_len(self.plank_decal.transform.x), (13.041 ** 2 + 0.3 ** 2) ** 0.5, places=6)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("the designer's size was kept" in w for w in warnings), warnings)
+        self.assertFalse(any("putting the designer's size back failed" in w for w in warnings), warnings)
+
+
+def _vector_len(v):
+    return (v.x * v.x + v.y * v.y + v.z * v.z) ** 0.5
+
+
+class ModelPathsBlobTests(unittest.TestCase):
+    """The dialog's model-files box: only one of two picked models was rendered."""
+
+    A = r"C:\Users\L.C\Fusion360Model\Resources\Models\3-in-1.f3d"
+    B = r"C:\Users\L.C\Fusion360Model\Resources\Models\Bullnose.f3d"
+
+    def _names(self, text):
+        import batch_config
+        return [p.name for p in batch_config.parse_model_paths_blob(text)]
+
+    def test_every_way_the_text_box_can_hand_two_paths_back(self):
+        both = ["3-in-1.f3d", "Bullnose.f3d"]
+        for text in (self.A + " |\n" + self.B, self.A + "\n" + self.B, self.A + self.B,
+                     self.A + "<br>" + self.B, "<p>" + self.A + "</p><p>" + self.B + "</p>",
+                     self.A + " | " + self.B, self.A + ";" + self.B):
+            self.assertEqual(self._names(text), both, text)
+
+    def test_single_path_and_empty(self):
+        self.assertEqual(self._names(self.A), ["3-in-1.f3d"])
+        self.assertEqual(self._names("  "), [])
+
+    def test_f3d_inside_a_folder_name_is_not_a_split_point(self):
+        self.assertEqual(self._names(r"C:\x.f3d files\a.f3d"), ["a.f3d"])
+
+
+class JsonSizeTrimTests(unittest.TestCase):
+    """One-tone trims: 3-in-1 (centre at the trim's start), L-Cap, Reducer shapes."""
+
+    def setUp(self):
+        self._flag = tp.DECAL_APPLY_JSON_SIZE
+        tp.DECAL_APPLY_JSON_SIZE = True
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        self.cs1 = _png(t / "Color Set 04-1.png", 100, 20)
+        self.cs2 = _png(t / "Color Set 04-2.png", 90, 21)
+        tp.pop_decal_size_warnings()
+        tp.pop_decal_swap_failures()
+        image_orient.clear_cache()
+
+    def tearDown(self):
+        tp.DECAL_APPLY_JSON_SIZE = self._flag
+        tp.set_decal_targets(None)
+        tp.pop_decal_size_warnings()
+        tp.pop_decal_swap_failures()
+        image_orient.clear_cache()
+        self.tmp.cleanup()
+
+    def _trim(self, part, width_in, origin_x, along, across, part_x=(0.0, 121.92), faces=None):
+        body = Body(part, top_y=0.76)
+        body._faces[0]._box = ((part_x[0], 0.76, -2.9), (part_x[1], 0.76, 2.9))
+        if faces:
+            body._faces = faces
+            for f in faces:
+                f.body = body
+        decal = Decal("Grand Palais Oak-1", _png(Path(self.tmp.name) / "g.png", 100, 14),
+                      Matrix(Point(origin_x, 0.76, 0), Vec(along, 0, 0), Vec(0, 0, across), Vec(0, 1, 0)),
+                      body._faces[0])
+        decal.isChainFaces = False
+        comp = Component("c-" + part, part, [body], Decals([decal]))
+        self.design = Design([Occurrence(part + ":1", comp)], root_name="Untitled")
+        spec = ri.parse_instructions(
+            '[{"fileName":"m","decals":[{"componentPartNumber":"%s","textureSize":'
+            '{"width":%s,"length":50,"unit":"in"}}],"renderConfigurations":'
+            '[{"namedView":"Close Up","hideBodies":[]}]}]' % (part, width_in)
+        )
+        tp.set_decal_targets(ri.decal_size_map(spec.models[0]))
+        return decal
+
+    def test_3in1_decal_reopened_at_the_trim_start_is_centred_and_sized(self):
+        decal = self._trim("3-In-1", 3, origin_x=0.03, along=254.0, across=7.62)
+        total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        self.assertEqual(total, 1, text)
+        o, _x, _y, _z = decal.transform.getAsCoordinateSystem()
+        self.assertAlmostEqual(o.x, 60.96, places=2)
+        self.assertEqual(_mags(decal), (127.0, 7.62))
+        self.assertIn("centred on the part (moved +60.9 cm along its length)", text)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_lcap_json_width_narrower_than_the_designer_is_reported(self):
+        decal = self._trim("L-Cap", 3, origin_x=60.97, along=131.379, across=8.986)
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        self.assertEqual(_mags(decal), (127.0, 7.62))
+        warnings = tp.pop_decal_size_warnings()
+        self.assertEqual(len(warnings), 1, "\n".join(lines))
+        self.assertIn("narrower than the designer's decal (9.0 cm)", warnings[0])
+
+    def test_part_longer_than_the_json_length_is_reported(self):
+        decal = self._trim("Reducer", 3, origin_x=89.7, along=179.419, across=5.537,
+                           part_x=(0.0, 179.4))
+        tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        self.assertEqual(_mags(decal), (127.0, 7.62))
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("about 52.4 cm at its ends stays bare" in w for w in warnings), warnings)
+
+    def test_centre_moved_onto_another_listed_face_makes_it_the_primary_face(self):
+        # T-Molding (42 faces split along its length), 2026-10-15: the moved centre
+        # sat on a neighbour of the first face and Fusion refused it.
+        first = Face(None, 0.76, box=((0.0, 0.76, -2.9), (30.0, 0.76, 2.9)))
+        second = Face(None, 0.76, box=((30.0, 0.76, -2.9), (121.92, 0.76, 2.9)))
+        decal = self._trim("3-In-1", 3, origin_x=0.03, along=254.0, across=7.62,
+                           faces=[first, second])
+        decal.faces_override = [first, second]
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        o, _x, _y, _z = decal.transform.getAsCoordinateSystem()
+        self.assertAlmostEqual(o.x, 60.96, places=2)
+        self.assertEqual(_mags(decal), (127.0, 7.62))
+        self.assertIs(decal.redefines[0][1][0], second, "the face under the centre goes first")
+        self.assertEqual(len(decal.redefines[0][1]), 2, "every listed face is kept")
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_undo_after_a_primary_switch_leads_with_the_designers_face(self):
+        # Review 2026-10-15: Fusion lists the faces primary-first after the resize,
+        # so an undo that went by position led with the wrong face and was refused.
+        first = Face(None, 0.76, box=((0.0, 0.76, -2.9), (30.0, 0.76, 2.9)))
+        second = Face(None, 0.76, box=((30.0, 0.76, -2.9), (121.92, 0.76, 2.9)))
+        decal = self._trim("3-In-1", 3, origin_x=0.03, along=254.0, across=7.62,
+                           faces=[first, second])
+        decal.faces_override = [first, second]
+        decal.store_as = lambda m: _rotated_about_y(m, 10.0)
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        self.assertEqual(len(decal.redefines), 2, text)
+        self.assertIs(decal.redefines[1][1][0], first)
+        self.assertEqual(_mags(decal), (254.0, 7.62), text)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("the designer's size was kept" in w for w in warnings), warnings)
+
+    def test_centre_that_cannot_move_onto_any_listed_face_is_reported(self):
+        first = Face(None, 0.76, box=((0.0, 0.76, -2.9), (30.0, 0.76, 2.9)))
+        last = Face(None, 0.76, box=((90.0, 0.76, -2.9), (121.92, 0.76, 2.9)))
+        decal = self._trim("3-In-1", 3, origin_x=0.03, along=254.0, across=7.62,
+                           faces=[first, last])
+        decal.faces_override = [first, last]
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        o, _x, _y, _z = decal.transform.getAsCoordinateSystem()
+        self.assertAlmostEqual(o.x, 0.03)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("could not be centred" in w for w in warnings), "\n".join(lines))
+
+    def test_centre_slides_along_the_surface_not_along_a_tilted_axis(self):
+        # 3-in-1, 2026-10-15: moving the centre along the decal's own (tilted)
+        # length axis lifted it off the face, and Fusion refused it.
+        decal = self._trim("3-In-1", 3, origin_x=0.03, along=254.0, across=7.62)
+        decal._transform = Matrix(Point(0.03, 0.76, 0), Vec(254.0, 0.6, 0), Vec(0, 0, 7.62), Vec(0, 1, 0))
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        o, _x, _y, _z = decal.transform.getAsCoordinateSystem()
+        self.assertAlmostEqual(o.x, 60.96, places=2)
+        self.assertAlmostEqual(o.y, 0.76, places=9)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_nearly_square_decal_is_left_alone(self):
+        decal = self._trim("3-In-1", 3, origin_x=60.0, along=10.0, across=9.5)
+        tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        self.assertEqual(decal.redefines, [])
+        self.assertTrue(any("nearly equal" in w for w in tp.pop_decal_size_warnings()))
+
+    def test_decal_on_an_unlisted_part_is_not_resized(self):
+        decal = self._trim("Track", 3, origin_x=60.0, along=127.0, across=7.0)
+        tp.set_decal_targets(ri.decal_size_map(ri.parse_instructions(
+            '[{"fileName":"m","decals":[{"componentPartNumber":"3-In-1","textureSize":'
+            '{"width":3,"length":50,"unit":"in"}}],"renderConfigurations":'
+            '[{"namedView":"Close Up","hideBodies":[]}]}]').models[0]))
+        tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        self.assertEqual(decal.redefines, [])
 
 
 class PerModelResetTests(_Fixture):
