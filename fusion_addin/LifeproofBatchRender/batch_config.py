@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Callable, List
+from typing import List
 
 
 def parse_model_paths_blob(text: str) -> List[Path]:
@@ -25,19 +25,6 @@ def parse_model_paths_blob(text: str) -> List[Path]:
         parts = re.findall(r".+?\.f3d(?=\s*(?:[A-Za-z]:[\\/]|\\\\|$))", line, flags=re.I)
         out.extend(Path(p.strip()) for p in (parts or [line]))
     return out
-
-
-def resolve_pipeline_mode(
-    setting: str,
-    model_path: Path,
-    infer_fn: Callable[[Path], str],
-) -> str:
-    s = (setting or "").strip().lower()
-    if "force appearance" in s or s == "appearance":
-        return "appearance"
-    if "force decal" in s or s == "decal":
-        return "decal"
-    return infer_fn(model_path)
 
 
 def parse_positive_int(s: str, default: int, min_v: int, max_v: int) -> int:

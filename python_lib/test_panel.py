@@ -80,7 +80,6 @@ class _TempFiles(unittest.TestCase):
             "height": "1080",
             "quality": "Draft (25)",
             "format": "JPG",
-            "pipeline": "Force Decal",
         }
         s.update(over)
         return s
@@ -92,17 +91,16 @@ class SettingsTests(_TempFiles):
         self.assertEqual(problem, "")
         self.assertEqual(request.models, [self.model_a, self.model_b])
         self.assertEqual((request.width, request.height), (1920, 1080))
-        self.assertEqual((request.render_quality, request.ext, request.pipeline), (25, ".jpg", "Force Decal"))
+        self.assertEqual((request.render_quality, request.ext), (25, ".jpg"))
 
     def test_quoted_paths_and_bad_numbers_fall_back_sensibly(self):
         request, _ = panel_settings.validate_settings(
             self.settings(instructions='"{}"'.format(self.instructions), width="abc", quality="?",
-                          format="PNG", pipeline="nonsense")
+                          format="PNG")
         )
         self.assertEqual(request.instructions_path, self.instructions)
         self.assertEqual(request.width, int(uip.DEFAULT_IMG_W))
         self.assertEqual((request.render_quality, request.ext), (uip.DEFAULT_RENDER_QUALITY, ".png"))
-        self.assertEqual(request.pipeline, uip.PIPELINE_CHOICES[0])
 
     def test_each_missing_setting_says_what_to_fix(self):
         cases = (
@@ -129,7 +127,8 @@ class SettingsTests(_TempFiles):
         d = panel_settings.panel_defaults()
         self.assertEqual(d["values"]["quality"], "Final (75)")
         self.assertEqual((d["values"]["width"], d["values"]["height"]), ("2000", "1130"))
-        self.assertEqual(d["pipelines"][0], "Auto (from render instructions)")
+        self.assertEqual(d["formats"], ["PNG", "JPG"])
+        self.assertNotIn("pipelines", d, "the batch is decal-only; no pipeline choice")
 
 
 class RequestTests(_TempFiles):
@@ -324,8 +323,7 @@ class RunTests(_TempFiles):
         # The real controller, up to its first check (an empty texture root).
         reporter = panel.PanelReporter(FakePalette())
         controller.execute_batch(
-            reporter, self.textures, [self.model_a], 1920, 1080, ".png",
-            uip.PIPELINE_CHOICES[0], self.instructions, 75,
+            reporter, self.textures, [self.model_a], 1920, 1080, ".png", self.instructions, 75,
         )
         sent = reporter._palette.sent
         self.assertEqual(sent[-1][0], "finished")

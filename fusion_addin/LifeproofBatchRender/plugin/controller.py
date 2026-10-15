@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import adsk.core
 import adsk.fusion
 
-import batch_config
 import image_orient
 import render_instructions
 import support_paths
@@ -162,7 +161,6 @@ def execute_batch(
     render_width: int,
     render_height: int,
     output_ext: str,
-    pipeline_selection: str,
     instructions_path: Path,
     render_quality: int,
 ) -> None:
@@ -182,7 +180,6 @@ def execute_batch(
         render_width,
         render_height,
         output_ext,
-        pipeline_selection,
         instructions_path,
         render_quality,
         log_path,
@@ -196,7 +193,6 @@ def _execute_batch_inner(
     render_width: int,
     render_height: int,
     output_ext: str,
-    pipeline_selection: str,
     instructions_path: Path,
     render_quality: int,
     log_path: Path,
@@ -238,7 +234,6 @@ def _execute_batch_inner(
         "Color sets: {}".format(len(color_sets)),
         "Models: {} ({})".format(len(models), ", ".join(Path(m).name for m in models)),
         "Output: {} × {} {}".format(render_width, render_height, output_ext.upper()),
-        "Pipeline mode: {}".format(pipeline_selection),
         # Which build actually ran. Fusion caches modules for the whole session,
         # so without this a stale build and a fresh log look identical.
         "Code loaded: {}".format(_code_build_stamp()),
@@ -307,12 +302,7 @@ def _execute_batch_inner(
             models_skipped += 1
             continue
 
-        # The mode comes from the Render Instructions (a non-empty decals[] means
-        # decal mode): the .f3d filenames no longer say "Decal"/"Appearance".
-        mode = batch_config.resolve_pipeline_mode(
-            pipeline_selection, mp, lambda _p, _entry=entry: _entry.texture_mode
-        )
-        summary_lines.append("=== {} → {} ===".format(mp.name, mode))
+        summary_lines.append("=== {} ===".format(mp.name))
 
         # Install this model's decal targets. These drive BOTH which components get
         # a decal (replacing the filename-derived guess, which the model rename
@@ -331,6 +321,11 @@ def _execute_batch_inner(
                     )
                 )
             )
+        else:
+            summary_lines.append(
+                "  No decals listed in the Render Instructions: the model's own "
+                "decals are matched to _1 / _2 by name, else by order"
+            )
 
         doc, err = model_handler.open_model(app, mp)
         if not doc:
@@ -345,11 +340,10 @@ def _execute_batch_inner(
         # Render Instructions decal sizes (deliverable 2). Resizing a decal rolls the
         # timeline back and recomputes the model, so it is done first: the geometry
         # settle and the visibility snapshot below then see the finished model.
-        if mode == "decal":
-            for size_line in texture_pipeline.apply_json_decal_sizes(design):
-                summary_lines.append("  {}".format(size_line))
-            for size_warning in texture_pipeline.pop_decal_size_warnings():
-                size_warnings.append("{} | {}".format(mp.name, size_warning))
+        for size_line in texture_pipeline.apply_json_decal_sizes(design):
+            summary_lines.append("  {}".format(size_line))
+        for size_warning in texture_pipeline.pop_decal_size_warnings():
+            size_warnings.append("{} | {}".format(mp.name, size_warning))
 
         viewport_render.prepare_clean_render_view(app)
 
@@ -392,14 +386,9 @@ def _execute_batch_inner(
             models_skipped += 1
             continue
 
-        an, dn = texture_pipeline.list_appearance_and_decal_names(design)
+        dn = texture_pipeline.list_decal_names(design)
         summary_lines.append(
-            "Template targets - Appearances ({}): {} | Decals ({}): {}".format(
-                len(an),
-                ", ".join(an) if an else "(none)",
-                len(dn),
-                ", ".join(dn) if dn else "(none)",
-            )
+            "Template decals ({}): {}".format(len(dn), ", ".join(dn) if dn else "(none)")
         )
 
         occ_snap, body_snap, mesh_snap, decal_snap = visibility_apply.capture_visibility(root)
@@ -417,10 +406,8 @@ def _execute_batch_inner(
 
             bump_progress("Textures: {} / {}".format(model_stem, cs.folder.name))
 
-            s1, s2 = image_mapper.effective_texture_slots(design, mode, cs.slot1, cs.slot2)
-            n_tex = 0
-            tex_lines: List[str] = []
-            n_tex, tex_lines = texture_pipeline.apply_color_set_for_open_design(mode, s1, s2)
+            s1, s2 = image_mapper.effective_texture_slots(design, cs.slot1, cs.slot2)
+            n_tex, tex_lines = texture_pipeline.apply_decal_color_set(design, s1, s2)
             for failed_decal in texture_pipeline.pop_decal_swap_failures():
                 decal_failures.append(
                     "{} | {} | {}".format(mp.name, cs.folder.name, failed_decal)
@@ -429,9 +416,8 @@ def _execute_batch_inner(
                 size_warnings.append("{} | {}".format(mp.name, size_warning))
             if n_tex == 0:
                 zero_texture_color_sets.append(cs.folder.name)
-            # Emit the texture log lines even when 0 updates — they carry the
-            # appearance property-tree diagnostic (DIAG_DUMP_APPEARANCE_TREE)
-            # that tells us why changeTextureImage found no image node.
+            # Emit the texture log lines even when 0 decals were updated — they
+            # say which decal was skipped or refused, and why.
             for line in tex_lines:
                 summary_lines.append("  {} | {}".format(cs.folder.name, line))
 
@@ -561,10 +547,8 @@ def _execute_batch_inner(
                 )
             )
             summary_lines.append(
-                "  Hint: rename appearances/decals to match SLOT*_NAMES in texture_pipeline.py,"
-            )
-            summary_lines.append(
-                "  or rely on the positional fallback (decal mode only)."
+                "  Hint: check the Render Instructions part numbers and the model's "
+                "decals (names in SLOT*_DECAL_NAMES in texture_pipeline.py)."
             )
 
     summary_lines.append("")
@@ -636,7 +620,6 @@ def _execute_batch_inner(
         "Texture root: {}".format(texture_root),
         "Color sets: {} | Models: {}".format(len(color_sets), len(models)),
         "Output: {} x {} {}".format(render_width, render_height, output_ext.upper()),
-        "Pipeline: {}".format(pipeline_selection),
         "",
         "Full summary: {}".format(summary_path),
         "CSV log:      {}".format(csv_log),

@@ -1,6 +1,6 @@
-# Fusion 360: apply colour-set images to the designer's authored decals (decal mode)
-# or to document appearances (appearance mode), and size the decals from the Render
-# Instructions. The name sets below match the client's .f3d (Browser names).
+# Fusion 360: apply colour-set images to the designer's authored decals and size
+# them from the Render Instructions. The name sets below match the client's .f3d
+# (Browser names).
 
 from __future__ import annotations
 
@@ -25,66 +25,20 @@ except Exception:
 
 import image_orient
 
-# --- User template: exact Fusion names for each slot (Appearance mode) ---
-# Client allowlist — only these appearances receive batch color images; foam,
-# steel, paint, and all other document appearances are left unchanged.
-#
-# Matching is NORMALIZED (see ``appearance_name_slot``): spacing and separator
-# drift don't matter, so "Vinyl Skin - 1", "Vinyl Skin-1" and "Vinyl_1" all map
-# to slot 1. The client's models are inconsistent across files:
-#   Treads Plus Bullnose - Appearance (2).f3d → "Vinyl Skin-1" / "Vinyl Skin-2"
-#   Treads Plus Bullnose - Appearance1.f3d    → "Vinyl"        / "Vinyl Skin - 2"
-#   Treads Plus Bullnose - Appearance2.f3d    → "Vinyl Skin - 1" / "Vinyl Skin - 2"
-# All three are handled by the entries below.
-SLOT1_APPEARANCE_NAMES: FrozenSet[str] = frozenset(
-    {
-        "Vinyl_1",
-        "Vinyl Skin - 1",
-        "Vinyl Skin-1",
-        "Vinyl",
-    }
-)
-SLOT2_APPEARANCE_NAMES: FrozenSet[str] = frozenset(
-    {
-        "Vinyl_2",
-        "Vinyl Skin - 2",
-        "Vinyl Skin-2",
-    }
-)
 
-
-def _normalize_appearance_slot_name(name: str) -> str:
-    """Collapse spacing / separator drift for slot-name comparison.
+def _normalize_slot_name(name: str) -> str:
+    """Collapse spacing / separator drift for decal slot-name comparison.
 
     Lowercases, folds NBSP, and reduces any run of space / underscore / hyphen
-    to a single ``-`` so ``"Vinyl Skin - 1"``, ``"Vinyl Skin-1"`` and
-    ``"Vinyl_1"`` all normalize to ``"vinyl-skin-1"`` / ``"vinyl-1"``.
+    to a single ``-`` so ``"Batch Decal - 1"`` and ``"Batch_Decal_1"`` both
+    normalize to ``"batch-decal-1"``.
     """
     s = (name or "").strip().lower().replace(" ", " ")
     s = re.sub(r"[\s_\-]+", "-", s)
     return s.strip("-")
 
 
-_SLOT1_APPEARANCE_NAMES_NORM: FrozenSet[str] = frozenset(
-    _normalize_appearance_slot_name(n) for n in SLOT1_APPEARANCE_NAMES
-)
-_SLOT2_APPEARANCE_NAMES_NORM: FrozenSet[str] = frozenset(
-    _normalize_appearance_slot_name(n) for n in SLOT2_APPEARANCE_NAMES
-)
-
-
-def appearance_name_slot(name: str) -> Optional[int]:
-    """Return 1 or 2 if ``name`` matches a slot-1 / slot-2 appearance, else None."""
-    n = _normalize_appearance_slot_name(name)
-    if not n:
-        return None
-    if n in _SLOT1_APPEARANCE_NAMES_NORM:
-        return 1
-    if n in _SLOT2_APPEARANCE_NAMES_NORM:
-        return 2
-    return None
-
-# --- User template: exact Fusion names for each slot (Decal mode) ---
+# --- Decal names for each slot (name-based slot matching) ---
 SLOT1_DECAL_NAMES: FrozenSet[str] = frozenset(
     {
         "Batch_Decal_1",
@@ -111,10 +65,10 @@ SLOT2_DECAL_NAMES: FrozenSet[str] = frozenset(
 )
 
 _SLOT1_DECAL_NAMES_NORM: FrozenSet[str] = frozenset(
-    _normalize_appearance_slot_name(n) for n in SLOT1_DECAL_NAMES
+    _normalize_slot_name(n) for n in SLOT1_DECAL_NAMES
 )
 _SLOT2_DECAL_NAMES_NORM: FrozenSet[str] = frozenset(
-    _normalize_appearance_slot_name(n) for n in SLOT2_DECAL_NAMES
+    _normalize_slot_name(n) for n in SLOT2_DECAL_NAMES
 )
 _DECAL_TRAILING_SLOT_RE = re.compile(r"([12])\s*$")
 
@@ -131,7 +85,7 @@ def decal_name_slot(name: str) -> Optional[int]:
     n = (name or "").strip()
     if not n:
         return None
-    norm = _normalize_appearance_slot_name(n)
+    norm = _normalize_slot_name(n)
     if norm in _SLOT1_DECAL_NAMES_NORM:
         return 1
     if norm in _SLOT2_DECAL_NAMES_NORM:
@@ -431,383 +385,6 @@ def _win_path(path: Path) -> str:
 def _win_path_for_decal_image(src: Optional[Path]) -> Optional[str]:
     """Return the path to give Decal.imageFilename, or None if the file is missing."""
     return _win_path(src) if src and src.is_file() else None
-
-
-def _texture_image_path_candidates(image_path: str) -> List[str]:
-    """Fusion builds differ on slash direction; try a small stable set."""
-    norm = os.path.normpath(image_path)
-    out: List[str] = []
-    seen: Set[str] = set()
-    for p in (norm, norm.replace("\\", "/"), norm.replace("/", "\\")):
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
-
-
-_NON_COLOR_BRANCH_HINTS: Tuple[str, ...] = (
-    "bump",
-    "normal",
-    "rough",
-    "metal",
-    "specular",
-    "gloss",
-    "displace",
-    "height",
-    "ao",
-    "ambient_occlusion",
-    "opacity",
-    "transparency",
-    "emission",
-    "anisotropy",
-    "cutout",
-    "mask",
-)
-
-
-def _branch_label_is_color(parent_names: Tuple[str, ...]) -> bool:
-    """True unless the texture's branch path clearly identifies it as a
-    non-visible channel (bump / normal / roughness / metallic / etc.).
-
-    Which appearances are touched at all is decided by name (the slot lists
-    above), so this per-slot filter has one job: reject swaps that *clearly*
-    landed on a non-color branch. Anything else — including
-    properties with unnamed parents or names Fusion doesn't tag with
-    "color"/"albedo" — is accepted, because real raster diffuse slots in
-    Fusion libraries often have generic names like ``value``, ``Image``,
-    ``texture``, or empty strings on some builds.
-    """
-    if not parent_names:
-        return True
-    joined = " ".join(parent_names).lower()
-    if any(neg in joined for neg in _NON_COLOR_BRANCH_HINTS):
-        return False
-    return True
-
-
-def _apply_image_to_appearance_textures_detailed(
-    appearance: adsk.fusion.Appearance, image_path: str
-) -> Tuple[int, int]:
-    """
-    Call changeTextureImage on every AppearanceTexture reachable from this
-    appearance, at any nesting depth.
-
-    Modern Fusion PBR appearances (the bulk of materialLibraries) expose
-    their texture as ``AppearanceTextureProperty.value`` rather than as a
-    top-level ``AppearanceTexture`` on ``appearanceProperties`` — a flat
-    ``AppearanceTexture.cast(prop)`` over the top level misses them and
-    returns 0, which is what made every library probe fail in the field.
-    """
-    try:
-        props = appearance.appearanceProperties
-    except Exception:
-        return 0, 0
-    path_opts = _texture_image_path_candidates(image_path)
-    changed = 0
-    color_changed = 0
-    seen: Set[int] = set()
-
-    def _try_change_on(tex: Any) -> bool:
-        method = getattr(tex, "changeTextureImage", None)
-        if not callable(method):
-            return False
-        for cand in path_opts:
-            try:
-                if method(cand):
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _record(parents: Tuple[str, ...]) -> None:
-        nonlocal changed, color_changed
-        changed += 1
-        if _branch_label_is_color(parents):
-            color_changed += 1
-
-    def walk(coll: Any, parents: Tuple[str, ...], depth: int) -> None:
-        if coll is None or depth > 28:
-            return
-        try:
-            n = coll.count
-        except Exception:
-            return
-        for i in range(n):
-            try:
-                p = coll.item(i)
-            except Exception:
-                continue
-            try:
-                k = id(p)
-                if k in seen:
-                    continue
-                seen.add(k)
-            except Exception:
-                pass
-            try:
-                pname = p.name or ""
-            except Exception:
-                pname = ""
-            child_parents = parents + (pname,) if pname else parents
-            try:
-                tex = adsk.core.AppearanceTexture.cast(p)
-                if tex is not None and _try_change_on(tex):
-                    _record(child_parents)
-                    continue
-            except Exception:
-                pass
-            try:
-                tprop = adsk.core.AppearanceTextureProperty.cast(p)
-                if tprop is not None:
-                    inner = getattr(tprop, "value", None)
-                    if inner is not None and _try_change_on(inner):
-                        _record(child_parents)
-                    inner_props = getattr(inner, "properties", None) if inner is not None else None
-                    if inner_props is not None:
-                        walk(inner_props, child_parents, depth + 1)
-                    continue
-            except Exception:
-                pass
-            # Image attached as a connected texture on a Color/other property
-            # (ColorProperty.connectedTexture). This is how the client's
-            # Vinyl Skin-1/-2 appearances hold their photo — there is NO
-            # standalone AppearanceTexture node, so the casts above miss it.
-            try:
-                if getattr(p, "hasConnectedTexture", False):
-                    ct = p.connectedTexture
-                    if ct is not None:
-                        if _try_change_on(ct):
-                            _record(child_parents)
-                        ct_props = getattr(ct, "properties", None)
-                        if ct_props is not None:
-                            walk(ct_props, child_parents, depth + 1)
-                        continue
-            except Exception:
-                pass
-            if _try_change_on(p):
-                _record(child_parents)
-                continue
-            try:
-                child = getattr(p, "properties", None)
-                if child is not None:
-                    walk(child, child_parents, depth + 1)
-            except Exception:
-                pass
-
-    walk(props, (), 0)
-    return changed, color_changed
-
-
-def _apply_image_to_appearance_textures(appearance: adsk.fusion.Appearance, image_path: str) -> int:
-    """Backwards-compatible wrapper that returns total slot updates only."""
-    total, _ = _apply_image_to_appearance_textures_detailed(appearance, image_path)
-    return total
-
-
-def _appearance_texture_child_property_lists(prop: Any) -> List[Any]:
-    subs: List[Any] = []
-    seen: Set[int] = set()
-
-    def add(ch: Any) -> None:
-        if ch is None:
-            return
-        try:
-            k = id(ch)
-            if k in seen:
-                return
-            seen.add(k)
-        except Exception:
-            pass
-        subs.append(ch)
-
-    try:
-        atp = adsk.core.AppearanceTextureProperty.cast(prop)
-        if atp is not None and atp.value is not None:
-            ch = getattr(atp.value, "properties", None)
-            add(ch)
-    except Exception:
-        pass
-    try:
-        tex = adsk.core.AppearanceTexture.cast(prop)
-        if tex is not None:
-            ch = getattr(tex, "properties", None)
-            add(ch)
-    except Exception:
-        pass
-    return subs
-
-
-# When True, and an appearance image swap changes 0 textures, dump that
-# appearance's full property tree to the summary so we can see exactly where the
-# image node lives on this Fusion build (property name/type + whether it exposes
-# changeTextureImage / a connected texture). Behavior-safe: logging only.
-DIAG_DUMP_APPEARANCE_TREE: bool = True
-
-
-def dump_appearance_property_tree(
-    appearance: adsk.fusion.Appearance, max_depth: int = 12
-) -> List[str]:
-    """Return human-readable lines describing every property under an appearance.
-
-    Flags each node with what the image-swap walk cares about:
-      * ``changeTextureImage``          — node itself exposes the method
-      * ``AppearanceTexture``           — castable to a texture object
-      * ``AppearanceTextureProperty``   — a property whose ``.value`` is a texture
-      * ``value=<Type>``                — the texture-property's current value type
-    Used only for diagnostics when a swap reports 0 texture updates.
-    """
-    lines: List[str] = []
-    seen: Set[int] = set()
-
-    def _describe(p: Any) -> str:
-        try:
-            name = p.name or "?"
-        except Exception:
-            name = "?"
-        try:
-            otype = p.objectType or type(p).__name__
-        except Exception:
-            otype = type(p).__name__
-        flags: List[str] = []
-        if callable(getattr(p, "changeTextureImage", None)):
-            flags.append("changeTextureImage")
-        try:
-            tex = adsk.core.AppearanceTexture.cast(p)
-        except Exception:
-            tex = None
-        if tex is not None:
-            flags.append("AppearanceTexture")
-            if callable(getattr(tex, "changeTextureImage", None)):
-                flags.append("tex.changeTextureImage")
-        try:
-            tprop = adsk.core.AppearanceTextureProperty.cast(p)
-        except Exception:
-            tprop = None
-        if tprop is not None:
-            flags.append("AppearanceTextureProperty")
-            try:
-                val = tprop.value
-                flags.append("value={}".format(type(val).__name__ if val is not None else "None"))
-                if val is not None and callable(getattr(val, "changeTextureImage", None)):
-                    flags.append("value.changeTextureImage")
-            except Exception as ex:
-                flags.append("value_err={}".format(ex))
-        try:
-            if getattr(p, "hasConnectedTexture", False):
-                flags.append("hasConnectedTexture")
-                ct = p.connectedTexture
-                if ct is not None:
-                    flags.append("connectedTexture={}".format(type(ct).__name__))
-                    try:
-                        ct_otype = ct.objectType
-                        if ct_otype:
-                            flags.append("ct.objectType={}".format(ct_otype))
-                    except Exception:
-                        pass
-                    if callable(getattr(ct, "changeTextureImage", None)):
-                        flags.append("ct.changeTextureImage")
-        except Exception as ex:
-            flags.append("ct_err={}".format(ex))
-        return "{} : {} [{}]".format(name, otype, ", ".join(flags) if flags else "-")
-
-    def walk(coll: Any, depth: int, prefix: str) -> None:
-        if coll is None or depth > max_depth:
-            return
-        try:
-            n = coll.count
-        except Exception:
-            return
-        for i in range(n):
-            try:
-                p = coll.item(i)
-            except Exception:
-                continue
-            try:
-                k = id(p)
-                if k in seen:
-                    continue
-                seen.add(k)
-            except Exception:
-                pass
-            lines.append("{}{}".format(prefix, _describe(p)))
-            for sub in _appearance_texture_child_property_lists(p):
-                walk(sub, depth + 1, prefix + "  ")
-            try:
-                child = getattr(p, "properties", None)
-                if child is not None and child is not coll:
-                    walk(child, depth + 1, prefix + "  ")
-            except Exception:
-                pass
-
-    try:
-        walk(appearance.appearanceProperties, 0, "")
-    except Exception as ex:
-        lines.append("(property-tree dump failed: {})".format(ex))
-    return lines or ["(no properties enumerated)"]
-
-
-def apply_appearance_color_set(
-    design: adsk.fusion.Design,
-    slot1: Optional[Path],
-    slot2: Optional[Path],
-) -> Tuple[int, List[str]]:
-    """
-    For each document appearance whose name is in SLOT*_APPEARANCE_NAMES,
-    push the corresponding raster path into texture slots.
-    Returns (total_texture_updates, log_lines).
-    """
-    lines: List[str] = []
-    total = 0
-    apps = design.appearances
-
-    # Snapshot the matching appearances BEFORE editing any of them.
-    # ``changeTextureImage`` can localize a library-linked appearance, which
-    # inserts a copy into ``design.appearances`` and shifts the live indices
-    # mid-loop — that caused Skin-1 to be visited twice and Skin-2 to be skipped
-    # on later color sets. Collecting targets first (this loop never modifies),
-    # then editing the fixed ``targets`` list, avoids that. Every matching
-    # appearance is updated (incl. duplicate-named ones) so whichever instance a
-    # body references receives the image; duplicate log lines are cosmetic.
-    #
-    # NOTE: do NOT dedupe by ``id(ap)`` — the unmatched appearances are released
-    # each iteration and CPython reuses their addresses, so ``id`` collides
-    # across different appearances and wrongly skips the Vinyl slots.
-    targets: List[Tuple[Any, int, str]] = []
-    for i in range(apps.count):
-        try:
-            ap = apps.item(i)
-        except Exception:
-            continue
-        try:
-            ap_name = ap.name or ""
-        except Exception:
-            ap_name = ""
-        slot = appearance_name_slot(ap_name)
-        if slot == 1 and slot1:
-            target_path = _win_path(slot1)
-        elif slot == 2 and slot2:
-            target_path = _win_path(slot2)
-        else:
-            continue
-        targets.append((ap, slot, target_path))
-
-    for ap, slot, target_path in targets:
-        try:
-            ap_name = ap.name
-        except Exception:
-            ap_name = "?"
-        n = _apply_image_to_appearance_textures(ap, target_path)
-        total += n
-        lines.append('Appearance "{}": {} texture(s) updated'.format(ap_name, n))
-        if n == 0 and DIAG_DUMP_APPEARANCE_TREE:
-            lines.append(
-                '  DIAG property tree for "{}" (slot {}) — why changeTextureImage found 0:'.format(
-                    ap_name, slot
-                )
-            )
-            for tree_line in dump_appearance_property_tree(ap):
-                lines.append("    " + tree_line)
-    return total, lines
 
 
 def _set_decal_image(decal: "adsk.fusion.Decal", image_path: str) -> Tuple[bool, str]:
@@ -3012,53 +2589,9 @@ def apply_decal_color_set(
     return total, lines
 
 
-def apply_color_set_for_open_design(
-    mode: str,
-    slot1: Optional[Path],
-    slot2: Optional[Path],
-) -> Tuple[int, List[str]]:
-    """Apply textures using the requested pipeline against the active design.
-
-    mode:
-      - 'appearance' : update document appearances by name.
-      - 'decal'      : swap the image on the designer's authored decals
-                       (named match + positional fallback), then run the
-                       appearance pass above.
-    """
-    app = adsk.core.Application.get()
-    design = adsk.fusion.Design.cast(app.activeProduct)
-    if not design:
-        return 0, ["No active design."]
-
-    total = 0
-    lines: List[str] = []
-
-    if mode == "decal":
-        d_total, d_lines = apply_decal_color_set(design, slot1, slot2)
-        total += d_total
-        lines += d_lines
-
-    a_total, a_lines = apply_appearance_color_set(design, slot1, slot2)
-    total += a_total
-    lines += a_lines
-
-    return total, lines
-
-
-def list_appearance_and_decal_names(design: adsk.fusion.Design) -> Tuple[List[str], List[str]]:
-    """Helper for UI: show names present in the document so users can edit SLOT*_ constants."""
-    anames = [design.appearances.item(i).name for i in range(design.appearances.count)]
-    dnames = [d.name for d in _collect_all_decals(design)]
-    return anames, dnames
-
-
-def design_has_slot2_target(design: adsk.fusion.Design) -> bool:
-    """True if the document has at least one appearance matching slot-2 names."""
-    apps = design.appearances
-    for i in range(apps.count):
-        if appearance_name_slot(apps.item(i).name) == 2:
-            return True
-    return False
+def list_decal_names(design: adsk.fusion.Design) -> List[str]:
+    """Names of every decal in the model, for the run summary."""
+    return [d.name for d in _collect_all_decals(design)]
 
 
 def root_has_slot2_decal_target(design: adsk.fusion.Design) -> bool:

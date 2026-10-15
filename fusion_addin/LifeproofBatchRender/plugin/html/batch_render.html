@@ -141,11 +141,6 @@
     <select id="format"></select>
     <span></span>
   </div>
-  <div class="row">
-    <label for="pipeline">Texture pipeline</label>
-    <select id="pipeline"></select>
-    <span></span>
-  </div>
 
   <div class="status">
     <div class="status-head"><strong>Status</strong><span id="count"></span></div>
@@ -165,7 +160,7 @@
   //   from Python: started, status, progress, finished, idle   (fusionJavaScriptHandler)
   // The Render button follows the batch's own messages ("started" ... "idle"),
   // not request replies: a reply can come back late or not at all.
-  var FIELDS = ["instructions", "textureRoot", "models", "width", "height", "quality", "format", "pipeline"];
+  var FIELDS = ["instructions", "textureRoot", "models", "width", "height", "quality", "format"];
   var running = false;
   var batchStarted = false;
   var startTimer = null;
@@ -294,7 +289,6 @@
       var d = reply.defaults, v = reply.values;
       fillSelect($("quality"), d.qualities, v.quality);
       fillSelect($("format"), d.formats, v.format);
-      fillSelect($("pipeline"), d.pipelines, v.pipeline);
       ["instructions", "textureRoot", "models", "width", "height"].forEach(function (f) {
         $(f).value = v[f] || "";
       });

@@ -16,3 +16,5 @@ fusion_addin/LifeproofBatchRender/*.log
 fusion_addin/LifeproofBatchRender/*.txt
 # APS secrets (copy aps_config.sample.json → aps_config.json locally)
 fusion_addin/LifeproofBatchRender/aps_config.json
+# Local Claude Code settings (per machine)
+.claude/settings.local.json

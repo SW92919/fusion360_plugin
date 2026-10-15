@@ -22,7 +22,6 @@ class BatchRequest:
     width: int
     height: int
     ext: str
-    pipeline: str
     render_quality: int
 
 
@@ -34,7 +33,6 @@ def panel_defaults() -> Dict[str, Any]:
     return {
         "qualities": [name for name, _value in uip.RENDER_QUALITY_CHOICES],
         "formats": list(uip.IMAGE_FORMATS),
-        "pipelines": list(uip.PIPELINE_CHOICES),
         "values": {
             "instructions": "",
             "textureRoot": "",
@@ -43,7 +41,6 @@ def panel_defaults() -> Dict[str, Any]:
             "height": uip.DEFAULT_IMG_H,
             "quality": quality,
             "format": uip.IMAGE_FORMATS[0],
-            "pipeline": uip.PIPELINE_CHOICES[0],
         },
     }
 
@@ -112,9 +109,6 @@ def validate_settings(raw: Dict[str, Any]) -> Tuple[Optional[BatchRequest], str]
         (value for name, value in uip.RENDER_QUALITY_CHOICES if name == quality_label),
         uip.DEFAULT_RENDER_QUALITY,
     )
-    pipeline = str(raw.get("pipeline") or "")
-    if pipeline not in uip.PIPELINE_CHOICES:
-        pipeline = uip.PIPELINE_CHOICES[0]
 
     return (
         BatchRequest(
@@ -124,7 +118,6 @@ def validate_settings(raw: Dict[str, Any]) -> Tuple[Optional[BatchRequest], str]
             width=width,
             height=height,
             ext=ext,
-            pipeline=pipeline,
             render_quality=quality,
         ),
         "",

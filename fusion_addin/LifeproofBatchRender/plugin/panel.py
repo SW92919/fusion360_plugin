@@ -239,7 +239,6 @@ def run_pending(fui: Any) -> None:
             request.width,
             request.height,
             request.ext,
-            request.pipeline,
             request.instructions_path,
             request.render_quality,
         )

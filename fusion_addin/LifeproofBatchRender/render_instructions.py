@@ -97,11 +97,6 @@ class ModelInstructions:
     decals: Tuple[DecalSizeSpec, ...]
     render_configurations: Tuple[RenderConfiguration, ...]
 
-    @property
-    def texture_mode(self) -> str:
-        """Non-empty decals[] means this model is driven by the decal pipeline."""
-        return "decal" if self.decals else "appearance"
-
 
 @dataclass(frozen=True)
 class RenderInstructions:

@@ -127,18 +127,6 @@ class LabelTests(unittest.TestCase):
         self.assertEqual(cfgs[0].index, 1)  # not 0 — the surviving config was 2nd
 
 
-class ModeTests(unittest.TestCase):
-    def test_non_empty_decals_means_decal_mode(self):
-        got = ri.parse_instructions(json.dumps([_entry(decals=[
-            {"componentPartNumber": "Stair Nose",
-             "textureSize": {"width": 9, "length": 50, "unit": "in"}}])]))
-        self.assertEqual(got.models[0].texture_mode, "decal")
-
-    def test_empty_decals_means_appearance_mode(self):
-        got = ri.parse_instructions(json.dumps([_entry(decals=[])]))
-        self.assertEqual(got.models[0].texture_mode, "appearance")
-
-
 class MatchingTests(unittest.TestCase):
     def setUp(self):
         self.ins = ri.parse_instructions(json.dumps([
@@ -287,9 +275,9 @@ class RealClientFileTests(unittest.TestCase):
         self.assertTrue(got.ok, [p.message for p in got.problems])
         self.assertEqual(len(got.models), 8)
 
-    def test_every_model_is_decal_mode(self):
+    def test_every_model_lists_its_decals(self):
         got = ri.load_instructions(self.path)
-        self.assertEqual([m.texture_mode for m in got.models], ["decal"] * 8)
+        self.assertEqual([m.file_name for m in got.models if not m.decals], [])
 
     def test_bullnose_has_four_configs_with_unique_labels(self):
         got = ri.load_instructions(self.path)

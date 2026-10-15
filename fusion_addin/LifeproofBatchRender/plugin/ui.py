@@ -18,12 +18,3 @@ RENDER_QUALITY_CHOICES = (
 DEFAULT_RENDER_QUALITY = 75
 
 IMAGE_FORMATS = ("PNG", "JPG")
-
-# "Auto" reads the mode from the Render Instructions entry (decals[] present →
-# decal), not from the .f3d filename — the model files no longer carry a
-# "Decal"/"Appearance" suffix to sniff.
-PIPELINE_CHOICES = (
-    "Auto (from render instructions)",
-    "Force Appearance",
-    "Force Decal",
-)

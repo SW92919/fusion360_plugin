@@ -11,19 +11,12 @@ import texture_pipeline
 
 def effective_texture_slots(
     design: "adsk.fusion.Design",
-    mode: str,
     slot1: Optional[Path],
     slot2: Optional[Path],
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """
-    If the active document has no second-slot targets, ignore *_2 images (never crash).
+    If the model has no second decal target, ignore the *_2 image (never crash).
     """
-    if mode == "appearance":
-        if not texture_pipeline.design_has_slot2_target(design):
-            return slot1, None
-        return slot1, slot2
-    if mode == "decal":
-        if not texture_pipeline.root_has_slot2_decal_target(design):
-            return slot1, None
-        return slot1, slot2
+    if not texture_pipeline.root_has_slot2_decal_target(design):
+        return slot1, None
     return slot1, slot2
