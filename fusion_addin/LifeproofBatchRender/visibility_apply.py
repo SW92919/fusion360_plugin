@@ -9,7 +9,6 @@ from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 import adsk.fusion
 
 from render_instructions import normalize_part_key
-from visibility_rules import visibility_for_description
 
 # Optional exact Fusion Browser names (normalized lower-case / stripped — use
 # ``my body`` or ``my-body`` as stored after trim+lower). Use when helpers use
@@ -409,50 +408,6 @@ def restore_visibility(
         try:
             if getattr(snap.decal, "isValid", True):
                 snap.decal.isLightBulbOn = snap.was_on
-        except Exception:
-            pass
-
-
-def apply_visibility_for_named_view(root: adsk.fusion.Component, view_name: str) -> None:
-    """Set isLightBulbOn from description rules for this view name (absolute, not delta)."""
-    for occ in _iter_occurrences_union(root):
-        try:
-            desc = occ.component.description or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            occ.isLightBulbOn = vis
-        except Exception:
-            pass
-    for body in _iter_bodies_recursive(root):
-        try:
-            desc = getattr(body, "description", "") or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            body.isLightBulbOn = vis
-        except Exception:
-            pass
-    for mesh in _iter_mesh_bodies_recursive(root):
-        try:
-            desc = getattr(mesh, "description", "") or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            mesh.isLightBulbOn = vis
-        except Exception:
-            pass
-    for decal in _iter_root_decals(root):
-        try:
-            desc = getattr(decal, "description", "") or ""
-        except Exception:
-            desc = ""
-        vis = visibility_for_description(desc, view_name)
-        try:
-            decal.isLightBulbOn = vis
         except Exception:
             pass
 

@@ -1,1 +1,1 @@
-# Pure-Python helpers for folder scan, naming, and task planning (Fusion-independent).
+# Tests for the LifeproofBatchRender add-in (Fusion-independent; run with unittest).

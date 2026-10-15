@@ -1,10 +1,16 @@
+"""Output names and colour-set folder scanning (the add-in's support_paths.py)."""
+
+import sys
 import unittest
 from pathlib import Path
 
-from naming import build_output_basename, versioned_path
-from folder_scan import find_slot_images, scan_texture_root
-from visibility_rules import parse_description, is_visible_for_view, visibility_for_description
-from model_kind import infer_texture_mode
+_ADDIN = Path(__file__).resolve().parent.parent / "fusion_addin" / "LifeproofBatchRender"
+if str(_ADDIN) not in sys.path:
+    sys.path.insert(0, str(_ADDIN))
+
+from support_paths import build_output_basename, find_slot_images, versioned_path  # noqa: E402
+
+
 class TestNaming(unittest.TestCase):
     def test_basename(self):
         b = build_output_basename(
@@ -22,32 +28,6 @@ class TestNaming(unittest.TestCase):
             p.write_bytes(b"x")
             v = versioned_path(p)
             self.assertEqual(v.name, "a (v2).png")
-
-
-class TestVisibility(unittest.TestCase):
-    def test_hide_list(self):
-        d = parse_description("hide: Nose Front , Tread Rear ")
-        assert d is not None
-        self.assertFalse(is_visible_for_view(d, "Nose Front"))
-        self.assertTrue(is_visible_for_view(d, "SQ - Tread Front"))
-
-    def test_show_only(self):
-        d = parse_description("show:Nose Front")
-        assert d is not None
-        self.assertTrue(is_visible_for_view(d, "Nose Front"))
-        self.assertFalse(is_visible_for_view(d, "Tread Rear"))
-
-    def test_substring_freeform(self):
-        self.assertFalse(visibility_for_description("markers for Nose Front QA", "Nose Front"))
-        self.assertTrue(visibility_for_description("markers for Nose Front QA", "Tread Rear"))
-
-
-class TestModelKind(unittest.TestCase):
-    def test_infer_from_filename(self):
-        from pathlib import Path
-
-        self.assertEqual(infer_texture_mode(Path("Treads Plus Square Nose - Decal.f3d")), "decal")
-        self.assertEqual(infer_texture_mode(Path("Treads Plus Bullnose - Appearance.f3d")), "appearance")
 
 
 class TestFolderScan(unittest.TestCase):

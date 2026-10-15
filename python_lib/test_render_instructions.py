@@ -497,9 +497,9 @@ class OutputNameIntegrationTests(unittest.TestCase):
     """
 
     def setUp(self):
-        import naming
+        import support_paths
 
-        self.naming = naming
+        self.naming = support_paths
 
     def _names_for(self, configs):
         ins = ri.parse_instructions(json.dumps([_entry(configs=configs)]))

@@ -117,9 +117,8 @@ class RenderInstructions:
 def normalize_name_key(name: str) -> str:
     """Canonical compare key: ``Square Nose`` / ``square-nose`` / ``Square_Nose`` → ``square-nose``.
 
-    Keep in sync with texture_pipeline._normalize_product_name_key so keys built
-    here are directly comparable with keys built there. NBSP and Unicode dashes are
-    folded first because these names are copied out of Word/PDF.
+    NBSP and Unicode dashes are folded first because these names are copied out
+    of Word/PDF.
     """
     s = (name or "").strip().replace(" ", " ").lower()
     for ch in _DASH_CHARS:
@@ -159,10 +158,6 @@ def normalize_part_key(name: str) -> str:
 def model_match_key(model_path: Path) -> str:
     """Match key for a selected .f3d — extension dropped, case/spacing-insensitive."""
     return normalize_name_key(model_path.stem)
-
-
-def inches_to_cm(value: float) -> float:
-    return float(value) * INCH_TO_CM
 
 
 def _as_clean_str(value: object) -> str:

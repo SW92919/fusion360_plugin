@@ -1,5 +1,4 @@
-# Shipped inside the add-in bundle so Fusion can load without repo PYTHONPATH.
-# Keep in sync with ../../python_lib/folder_scan.py and naming.py when those change.
+# Colour-set folder scanning and output file names (pure Python, no Fusion API).
 
 from __future__ import annotations
 
@@ -14,16 +13,6 @@ RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 # Delete ``*flipped*`` sidecar rasters in each color folder before swatches (not written by this add-in).
 DELETE_FLIPPED_TEXTURE_SIDECARS: bool = True
-
-
-def infer_texture_mode(model_path: Path) -> str:
-    """Return 'decal' or 'appearance' from .f3d filename (see docs/APPEARANCE_AND_DECAL.md)."""
-    stem = model_path.stem.lower()
-    if "decal" in stem:
-        return "decal"
-    if "appearance" in stem or "appearances" in stem:
-        return "appearance"
-    return "appearance"
 
 
 def _is_raster(p: Path) -> bool:
