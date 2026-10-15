@@ -299,12 +299,11 @@ def run(context):
                     elif iid == uip.INPUT_BROWSE_MODEL_PATHS:
                         picked = _dialog_model_paths(fui)
                         if picked:
-                            # " |" as well as a line break: Fusion's text box can drop
-                            # the break, and the "|" still keeps the paths apart.
+                            # A one-line field: "|" keeps the paths apart.
                             uip.set_text_input(
                                 ins,
                                 uip.INPUT_MODEL_PATHS,
-                                " |\n".join(str(p) for p in picked),
+                                " | ".join(str(p) for p in picked),
                             )
                 except Exception:
                     _log("OnInputChanged failed:\n" + traceback.format_exc())

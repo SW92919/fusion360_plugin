@@ -163,9 +163,11 @@ class _Evaluator:
         return True, self._n
 
     def getParameterAtPoint(self, point):
+        self._face._check_alive()
         return True, types.SimpleNamespace(x=point.x, y=point.z)
 
     def getPointAtParameter(self, param):
+        self._face._check_alive()
         return True, Point(param.x, self._face._y, param.y)
 
 
@@ -175,6 +177,11 @@ class Face:
         self._y = z_height
         self.evaluator = _Evaluator(Vec(*normal), self)
         self._box = box  # ((x0, y0, z0), (x1, y1, z1)) or None = unbounded
+        self.stale_when_rolled = False  # a finished-model face that does not exist at the decal's step
+
+    def _check_alive(self):
+        if self.stale_when_rolled and _TIMELINE.rolled_to is not None:
+            raise RuntimeError("this face does not exist at this point in the timeline")
 
     @property
     def boundingBox(self):
@@ -184,6 +191,7 @@ class Face:
         return types.SimpleNamespace(minPoint=Point(*lo), maxPoint=Point(*hi))
 
     def isPointOnFace(self, point, tol=0.0):
+        self._check_alive()
         if abs(point.y - self._y) > tol:
             return False
         if self._box is None:
@@ -257,6 +265,7 @@ class Decal:
         self.faces_override = None  # a list of real faces, when n copies of one won't do
         self.rolled_faces = None    # what decal.faces reads while the marker is rolled to it
         self.store_as = None        # fn(matrix) -> matrix Fusion keeps (first redefine only)
+        self.refuse_centre = None   # fn(origin) -> True: refused as "not on primary face"
         self.redefines = []
         self.n_faces = 1
         self.isDerived = False
@@ -328,7 +337,11 @@ class Decal:
                 # The message Fusion gave on 3-in-1 (2026-10-15).
                 raise RuntimeError("3 : Y and Z axes defined by the matrix, must be perpendicular to one another")
         # Fusion is strict about the centre (2026-10-15, four of nine decals).
-        if faces and faces[0] is not None and not faces[0].isPointOnFace(_o, 1e-6):
+        try:
+            on_primary = not faces or faces[0] is None or faces[0].isPointOnFace(_o, 1e-6)
+        except RuntimeError:
+            on_primary = False  # a face that does not exist at this step: Fusion says the same
+        if not on_primary or (self.refuse_centre is not None and self.refuse_centre(_o)):
             raise RuntimeError("3 : Input point is not located on primary face (first face in array)")
         if getattr(self, "redefine_distort", False) and len(self.redefines) == 1:
             o, mx, my, mz = matrix.getAsCoordinateSystem()
@@ -1578,6 +1591,41 @@ class JsonSizeFusionRun3Tests(_JsonSizeBullnoseFixture):
         self.assertIn("its centre 0.14 cm from where it was asked", text)
         self.assertEqual(tp.pop_decal_size_warnings(), [], text)
 
+    def test_sideways_centre_shift_under_a_centimetre_is_kept(self):
+        # Square Nose plank, 4-model run: exact size, centre 0.59 cm across -> undone,
+        # and the undo landed 0.59 cm across as well.
+        def shift_across(m):
+            o, x, y, z = m.getAsCoordinateSystem()
+            return Matrix(Point(o.x + 0.59, o.y, o.z), x, y, z)  # plank length runs along z
+
+        self.plank_decal.store_as = shift_across
+        _total, lines = self._apply(self.cs_a1, self.cs_a2)
+        text = "\n".join(lines)
+        self.assertEqual(len(self.plank_decal.redefines), 1, "no undo")
+        self.assertIn("its centre 0.59 cm from where it was asked (0.00 along the part, 0.59 across)", text)
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_sideways_centre_shift_over_a_centimetre_is_undone(self):
+        def shift_across(m):
+            o, x, y, z = m.getAsCoordinateSystem()
+            return Matrix(Point(o.x + 1.5, o.y, o.z), x, y, z)
+
+        self.plank_decal.store_as = shift_across
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(len(self.plank_decal.redefines), 2, "resize + undo")
+        self.assertEqual(_mags(self.plank_decal), (13.041, 121.518))
+
+    def test_centre_shift_along_the_part_is_undone(self):
+        def shift_along(m):
+            o, x, y, z = m.getAsCoordinateSystem()
+            return Matrix(Point(o.x, o.y, o.z + 0.5), x, y, z)
+
+        self.plank_decal.store_as = shift_along
+        self._apply(self.cs_a1, self.cs_a2)
+        self.assertEqual(len(self.plank_decal.redefines), 2, "resize + undo")
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("0.50 along the part, 0.00 across" in w for w in warnings), warnings)
+
     def test_turn_just_under_the_limit_is_kept(self):
         self.plank_decal.store_as = lambda m: _rotated_about_y(m, 4.0)
         self._apply(self.cs_a1, self.cs_a2)
@@ -1685,7 +1733,8 @@ class JsonSizeTrimTests(unittest.TestCase):
         image_orient.clear_cache()
         self.tmp.cleanup()
 
-    def _trim(self, part, width_in, origin_x, along, across, part_x=(0.0, 121.92), faces=None):
+    def _trim(self, part, width_in, origin_x, along, across, part_x=(0.0, 121.92), faces=None,
+              length_in=50):
         body = Body(part, top_y=0.76)
         body._faces[0]._box = ((part_x[0], 0.76, -2.9), (part_x[1], 0.76, 2.9))
         if faces:
@@ -1700,8 +1749,8 @@ class JsonSizeTrimTests(unittest.TestCase):
         self.design = Design([Occurrence(part + ":1", comp)], root_name="Untitled")
         spec = ri.parse_instructions(
             '[{"fileName":"m","decals":[{"componentPartNumber":"%s","textureSize":'
-            '{"width":%s,"length":50,"unit":"in"}}],"renderConfigurations":'
-            '[{"namedView":"Close Up","hideBodies":[]}]}]' % (part, width_in)
+            '{"width":%s,"length":%s,"unit":"in"}}],"renderConfigurations":'
+            '[{"namedView":"Close Up","hideBodies":[]}]}]' % (part, width_in, length_in)
         )
         tp.set_decal_targets(ri.decal_size_map(spec.models[0]))
         return decal
@@ -1749,6 +1798,91 @@ class JsonSizeTrimTests(unittest.TestCase):
         self.assertIs(decal.redefines[0][1][0], second, "the face under the centre goes first")
         self.assertEqual(len(decal.redefines[0][1]), 2, "every listed face is kept")
         self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_refused_moved_centre_is_sized_at_the_designers_centre(self):
+        # T-Molding, 4-model run: Fusion refused the centre moved -3.2 cm to the
+        # middle of the part, so the Render Instructions size was never applied.
+        decal = self._trim("T-Molding", 2.5, origin_x=64.19, along=128.884, across=5.961)
+        decal.refuse_centre = lambda o: abs(o.x - 64.19) > 0.01
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        o, _x, _y, _z = decal.transform.getAsCoordinateSystem()
+        self.assertAlmostEqual(o.x, 64.19, places=6)
+        self.assertEqual(_mags(decal), (127.0, 6.35), text)
+        self.assertIn("so it is sized at the designer's centre instead", text)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("could not be centred on it, so about 0.7 cm at that end stays bare" in w
+                            for w in warnings), warnings)
+        self.assertFalse(any("size not applied" in w for w in warnings), warnings)
+        self.assertEqual(_TIMELINE.markerPosition, _TIMELINE.count)
+
+    def test_faces_split_after_the_decals_step_are_used_as_they_are_at_that_step(self):
+        # T-Molding, 2-model run: even the designer's own centre was refused. Its
+        # decal sits at step 5 and later steps re-split the faces, so the finished
+        # model's face objects (here two) do not exist where redefine runs (one).
+        first = Face(None, 0.76, box=((0.0, 0.76, -2.9), (30.0, 0.76, 2.9)))
+        second = Face(None, 0.76, box=((30.0, 0.76, -2.9), (121.92, 0.76, 2.9)))
+        first.stale_when_rolled = second.stale_when_rolled = True
+        whole = Face(None, 0.76, box=((0.0, 0.76, -2.9), (121.92, 0.76, 2.9)))
+        decal = self._trim("T-Molding", 2.5, origin_x=64.19, along=128.884, across=5.961,
+                           faces=[first, second])
+        decal.faces_override = [first, second]
+        decal.rolled_faces = [whole]
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        o, _x, _y, _z = decal.transform.getAsCoordinateSystem()
+        self.assertAlmostEqual(o.x, 60.96, places=2)
+        self.assertEqual(_mags(decal), (127.0, 6.35), text)
+        self.assertEqual([f for f in decal.redefines[0][1]], [whole])
+        self.assertEqual(tp.pop_decal_size_warnings(), [], text)
+
+    def test_refusal_reports_the_faces_at_the_decals_step(self):
+        decal = self._trim("T-Molding", 2.5, origin_x=64.19, along=128.884, across=5.961)
+        decal.refuse_centre = lambda o: True
+        tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("and at the designer's centre:", warnings[0])
+        self.assertIn("1 face(s) at the decal's step, 1 in the finished model: "
+                      "1 of 1 face(s) within 0.1 cm of the centre, 1 measurable, nearest 0.000 cm away",
+                      warnings[0])
+        self.assertEqual(_mags(decal), (128.884, 5.961))
+
+    def test_shorter_json_length_does_not_skip_the_fallback_check(self):
+        # Review 2026-10-15: with the part longer than the JSON length the check
+        # read 0 cm, so 3-in-1 at 40 in would have been sized at its trim-end
+        # centre and left ~71 cm bare.
+        decal = self._trim("3-In-1", 3, origin_x=0.03, along=254.0, across=7.62, length_in=40)
+        decal.refuse_centre = lambda o: abs(o.x - 0.03) > 0.01
+        tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        self.assertEqual(_mags(decal), (254.0, 7.62))
+        self.assertEqual(len(decal.redefines), 1)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("size not applied" in w and "about 60.9 cm more of the part would stay bare" in w
+                            for w in warnings), warnings)
+
+    def test_slightly_off_centre_fallback_reports_uneven_bare_ends(self):
+        decal = self._trim("Reducer", 3, origin_x=60.2, along=179.419, across=5.537, length_in=40)
+        decal.refuse_centre = lambda o: abs(o.x - 60.2) > 0.01
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        self.assertEqual(_mags(decal), (101.6, 7.62), text)
+        self.assertIn("so it is sized at the designer's centre instead", text)
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("the bare ends are uneven: about 10.9 cm at one end and 9.4 cm at the other" in w
+                            for w in warnings), warnings)
+
+    def test_refused_moved_centre_keeps_the_designer_size_when_much_would_stay_bare(self):
+        # 3-in-1's centre sits at the trim's end: 127 cm there would leave 58.4 cm bare.
+        decal = self._trim("3-In-1", 3, origin_x=0.03, along=254.0, across=7.62)
+        decal.refuse_centre = lambda o: abs(o.x - 0.03) > 0.01
+        _total, lines = tp.apply_decal_color_set(self.design, self.cs1, self.cs2)
+        text = "\n".join(lines)
+        self.assertEqual(_mags(decal), (254.0, 7.62), text)
+        self.assertEqual(len(decal.redefines), 1, "no second try at the trim's end")
+        warnings = tp.pop_decal_size_warnings()
+        self.assertTrue(any("size not applied" in w and "about 58.4 cm more of the part would stay bare" in w
+                            for w in warnings), warnings)
 
     def test_undo_after_a_primary_switch_leads_with_the_designers_face(self):
         # Review 2026-10-15: Fusion lists the faces primary-first after the resize,

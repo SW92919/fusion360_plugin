@@ -426,6 +426,16 @@ DECAL_SIZE_END_GAP_CM: float = 0.3
 # A resized decal whose length Fusion turned further than this (degrees, on the
 # surface) would show the grain crooked, so the designer's size is put back.
 DECAL_SIZE_MAX_TURN_DEG: float = 5.0
+# How far (cm) Fusion may put a resized decal's centre ACROSS the part before the
+# designer's size is put back. Wrapping decals come back shifted sideways (Square
+# Nose plank 0.59 cm, Bullnose plank 0.14 cm, 2026-10-15) and Fusion shifts the
+# designer's own placement the same way, so undoing gains nothing. Along the part
+# the limit stays DECAL_SIZE_END_GAP_CM, since that is what leaves an end bare.
+DECAL_SIZE_MAX_ACROSS_SHIFT_CM: float = 1.0
+# When Fusion refuses a centre moved to the middle of the part, the JSON size is
+# applied at the designer's centre instead only if at most this much (cm) of one
+# end then stays bare (T-Molding: 0.7 cm; 3-in-1 would leave 58 cm, so not there).
+DECAL_SIZE_FALLBACK_MAX_BARE_CM: float = 1.0
 
 # Per-model bookkeeping for authored decals, keyed by (component id, index in that
 # component's Decals folder). Reset by ``set_decal_targets`` for every model.
@@ -6153,6 +6163,29 @@ def _matrix_onto_face(matrix: Any, face: Any) -> Tuple[Optional[Any], str]:
     return m, err or ""
 
 
+def _faces_near_diag(faces: List[Any], centre: Any) -> str:
+    """How the listed faces relate to ``centre``, for a refusal message."""
+    near = projected = 0
+    nearest: Optional[float] = None
+    for face in faces:
+        try:
+            if face.isPointOnFace(centre, _DECAL_CENTRE_ON_FACE_TOL):
+                near += 1
+        except Exception:
+            pass
+        hit = _closest_point_on_face(face, centre)
+        if hit is not None:
+            projected += 1
+            nearest = hit[1] if nearest is None else min(nearest, hit[1])
+    return "{} of {} face(s) within {} cm of the centre, {} measurable{}".format(
+        near,
+        len(faces),
+        _DECAL_CENTRE_ON_FACE_TOL,
+        projected,
+        "" if nearest is None else ", nearest {:.3f} cm away".format(nearest),
+    )
+
+
 def _squared_designer_matrix(
     origin: Any, x_axis: Any, y_axis: Any, z_axis: Any, faces: List[Any], chain: bool
 ) -> Tuple[Optional[Any], int]:
@@ -6279,17 +6312,21 @@ def _json_size_plan(
     faces: List[Any],
     chain: bool,
     first_face: Any,
+    recentre: bool = True,
 ) -> Dict[str, Any]:
     """New placement for a decal: the JSON width x length, centred on its part.
 
     Keeps the designer's axis directions; the longer axis gets the JSON length.
     Moves the centre along that axis only when the decal would otherwise miss an
     end of the part (3-in-1: Fusion reopens its decal centred on the trim's first
-    end) and the moved centre is still on the decal's first face. Returns ``ok``,
-    ``matrix``, ``origin``, ``mag_x``/``mag_y`` (new), ``was`` (old), ``notes``,
-    ``warnings`` and, when not ok, ``reason``.
+    end), the moved centre is still on one of the decal's faces, and ``recentre``
+    is on. Returns ``ok``, ``matrix``, ``origin``, ``mag_x``/``mag_y`` (new),
+    ``was`` (old), ``notes``, ``warnings``, ``moved`` (the shift in cm, or None),
+    ``snapped`` and, when not ok, ``reason``.
     """
-    plan: Dict[str, Any] = {"ok": False, "notes": [], "warnings": [], "reason": ""}
+    plan: Dict[str, Any] = {
+        "ok": False, "notes": [], "warnings": [], "reason": "", "moved": None, "snapped": False,
+    }
     k = float(BATCH_DECAL_MAGNITUDE_CM_PER_UNIT) or 1.0
     mag_x, mag_y = _vector_length(x_axis), _vector_length(y_axis)
     plan["was"] = (mag_x * k, mag_y * k)
@@ -6370,26 +6407,42 @@ def _json_size_plan(
                 origin.y + unit[1] * shift,
                 origin.z + unit[2] * shift,
             )
-            # Any listed face will do (T-Molding's 42 faces split along its length);
-            # the one it lands on becomes the primary face below.
-            moved_anchor = _decal_anchor(faces, chain, moved)
-            if moved_anchor is not None:
-                on_face = moved_anchor[2] <= _DECAL_CENTRE_ON_FACE_TOL
-            else:
-                try:
-                    on_face = bool(first_face.isPointOnFace(moved, _DECAL_CENTRE_ON_FACE_TOL))
-                except Exception:
-                    on_face = False
+            on_face = False
+            if recentre:
+                # Any listed face will do (a part whose faces are split along its
+                # length); the one it lands on becomes the primary face below.
+                moved_anchor = _decal_anchor(faces, chain, moved)
+                if moved_anchor is not None:
+                    on_face = moved_anchor[2] <= _DECAL_CENTRE_ON_FACE_TOL
+                else:
+                    try:
+                        on_face = bool(first_face.isPointOnFace(moved, _DECAL_CENTRE_ON_FACE_TOL))
+                    except Exception:
+                        on_face = False
             if on_face:
                 new_origin = moved
+                plan["moved"] = shift
                 plan["notes"].append(
                     "centred on the part (moved {:+.1f} cm along its length)".format(shift)
                 )
-            elif part_len <= length_cm + gap:
-                plan["warnings"].append(
-                    "it does not reach one end of the part and could not be centred "
-                    "on it, so that end may stay bare"
-                )
+            else:
+                # Bare length that comes from NOT centring (on top of any the JSON
+                # length leaves anyway): the one missed end when the decal is longer
+                # than the part, the off-centre amount when it is shorter.
+                left, right = max(0.0, -half - start), max(0.0, end - half)
+                plan["bare_end_cm"] = max(left, right) - max(0.0, part_len - length_cm) / 2.0
+                if part_len <= length_cm + gap:
+                    plan["warnings"].append(
+                        "it does not reach one end of the part and could not be centred "
+                        "on it, so about {:.1f} cm at that end stays bare".format(max(left, right))
+                    )
+                elif plan["bare_end_cm"] > gap:
+                    plan["warnings"].append(
+                        "it could not be centred on the part, so the bare ends are uneven: "
+                        "about {:.1f} cm at one end and {:.1f} cm at the other".format(
+                            max(left, right), min(left, right)
+                        )
+                    )
     if solid_body and width_cm > designer_width_cm * (1.0 + float(DECAL_SIZE_NARROWER_WARN)):
         plan["warnings"].append(
             "the Render Instructions width ({:.1f} cm) is wider than the designer's "
@@ -6412,6 +6465,7 @@ def _json_size_plan(
         idx, on_face_point, off = anchor
         if off <= _DECAL_CENTRE_ON_FACE_TOL:
             primary, new_origin = idx, on_face_point
+            plan["snapped"] = True
             if off > 1e-3:
                 plan["notes"].append("centre put exactly on its face (it read {:.3f} cm off)".format(off))
         else:
@@ -6473,13 +6527,21 @@ def _redefine_decal(
         if timeline_obj.rollTo(True) is False:
             err = "the timeline marker could not be moved to it"
         else:
+            # Faces as they are with the marker rolled back. Later timeline steps
+            # can re-split a part's faces (T-Molding: 42 in the finished model, its
+            # decal at step 5), so the count may differ — and the finished model's
+            # face objects do not exist at the decal's step (Fusion then refused
+            # even the designer's own centre, 2026-10-15).
             pool = list(faces)
-            # Faces as they are with the marker rolled back, when readable.
+            pool_note = "faces at the decal's step could not be read"
             try:
                 listed = decal.faces
                 fresh = [listed[i] for i in range(len(listed))]
-                if len(fresh) == len(faces) and all(f is not None for f in fresh):
+                if fresh and all(f is not None for f in fresh):
                     pool = fresh
+                    pool_note = "{} face(s) at the decal's step, {} in the finished model".format(
+                        len(fresh), len(faces)
+                    )
             except Exception:
                 pass
             try:
@@ -6493,14 +6555,28 @@ def _redefine_decal(
             try:
                 ok = decal.redefine(matrix, use_faces, chain)
             except Exception as ex:
-                if "primary face" not in str(ex) or not use_faces:
+                if "primary face" not in str(ex) or not pool or centre is None:
                     raise
-                # Rolled back, the face can sit a hair apart from where the
-                # finished model shows it: put the centre on it as it is now.
-                retry, why = _matrix_onto_face(matrix, use_faces[0])
+                # Rolled back, the face under the centre can sit a hair apart from
+                # where the finished model shows it: find it among the faces as
+                # they are now and put the centre exactly on it.
+                diag = "{}: {}".format(pool_note, _faces_near_diag(pool, centre))
+                anchor = _decal_anchor(pool, chain, centre)
+                if anchor is None:
+                    raise RuntimeError("{} (no listed face found under its centre; {})".format(ex, diag))
+                idx = anchor[0]
+                retry, why = _matrix_onto_face(matrix, pool[idx])
+                if retry is None and anchor[2] <= 1e-9 and pool[idx] is not use_faces[0]:
+                    retry = matrix  # already on that face: only which face leads changes
                 if retry is None:
-                    raise RuntimeError("{} ({})".format(ex, why))
-                ok = decal.redefine(retry, use_faces, chain)
+                    raise RuntimeError("{} ({}; {})".format(ex, why, diag))
+                use_faces = _primary_first(pool, idx)
+                if chain:
+                    use_faces = use_faces[:1]
+                try:
+                    ok = decal.redefine(retry, use_faces, chain)
+                except Exception as ex2:
+                    raise RuntimeError("{} ({})".format(str(ex2) or type(ex2).__name__, diag))
             if ok is False:
                 err = "Fusion refused the new size"
     except Exception as ex:
@@ -6649,6 +6725,40 @@ def _apply_json_size_one(
     except Exception:
         opacity = None
     err, touched = _redefine_decal(design, d, plan["matrix"], faces, chain, plan.get("primary", 0))
+    if err and plan.get("moved") is not None and "primary face" in err and not _SIZING_ABORTED[0]:
+        # Last resort when Fusion refuses the centre moved to the middle of the
+        # part: size the decal at the centre Fusion placed itself — only when that
+        # leaves at most a sliver more bare. (T-Molding, 2026-10-15, was refused at
+        # both centres: they lie on the same full-length face, so the cause there
+        # was the rolled-back faces, handled in _redefine_decal.)
+        refused = "Fusion refused the centre moved to the middle of the part ({}; placed exactly on a listed face: {})".format(
+            err, "yes" if plan.get("snapped") else "no"
+        )
+        try:
+            listed = d.faces
+            refetched = [listed[i] for i in range(len(listed))]
+            if refetched and all(f is not None for f in refetched):
+                faces = refetched
+        except Exception:
+            pass
+        plan = _json_size_plan(origin, x_axis, y_axis, z_axis, spec, faces, chain, faces[0], recentre=False)
+        bare = float(plan.get("bare_end_cm") or 0.0)
+        if not plan["ok"] or bare > float(DECAL_SIZE_FALLBACK_MAX_BARE_CM):
+            why = plan["reason"] if not plan["ok"] else (
+                "at the designer's centre about {:.1f} cm more of the part would stay bare".format(bare)
+            )
+            _size_warning(label, "size not applied — {}, and {}".format(refused, why), lines)
+            return True
+        err, _t = _redefine_decal(design, d, plan["matrix"], faces, chain, plan.get("primary", 0))
+        if err:
+            _size_warning(
+                label,
+                "size not applied — {}, and at the designer's centre: {}".format(refused, err),
+                lines,
+            )
+            return True
+        lines.append("{}: {}, so it is sized at the designer's centre instead".format(label, refused))
+        lines.extend("{}: {}".format(label, n) for n in plan["notes"])
     if err:
         _size_warning(label, "size not applied — {}".format(err), lines)
         return touched
@@ -6700,15 +6810,36 @@ def _apply_json_size_one(
         if _cos(y2, ry) < 0:
             stored_as.append("its Y axis reversed")
 
+        # Along the part a shift can leave an end bare; across it, Fusion shifts
+        # wrapping decals sideways (see DECAL_SIZE_MAX_ACROSS_SHIFT_CM).
+        po = plan["origin"]
+        shift = (o2.x - po.x, o2.y - po.y, o2.z - po.z)
+
+        def _component(axis: Any) -> float:
+            n = _vector_length(axis)
+            if n <= 1e-12:
+                return moved
+            return abs(shift[0] * axis.x + shift[1] * axis.y + shift[2] * axis.z) / n
+
+        along_off = _component(long_req)
+        across_off = _component(ry if plan["length_axis"] == "X" else rx)
+        shifted = along_off > float(DECAL_SIZE_END_GAP_CM) or across_off > float(
+            DECAL_SIZE_MAX_ACROSS_SHIFT_CM
+        )
         size_off = any(abs(g - w) > 0.01 * max(w, 1e-9) for g, w in zip(got, want))
-        if size_off or turned or moved > float(DECAL_SIZE_END_GAP_CM):
-            what = "Fusion placed it at {:.2f} x {:.2f} (asked {:.2f} x {:.2f}; centre {:.2f} cm away{})".format(
-                got[0],
-                got[1],
-                want[0],
-                want[1],
-                moved,
-                "; length turned {:.1f} deg on the surface".format(turn_deg) if turned else "",
+        if size_off or turned or shifted:
+            what = (
+                "Fusion placed it at {:.2f} x {:.2f} (asked {:.2f} x {:.2f}; centre {:.2f} cm "
+                "away: {:.2f} along the part, {:.2f} across{})".format(
+                    got[0],
+                    got[1],
+                    want[0],
+                    want[1],
+                    moved,
+                    along_off,
+                    across_off,
+                    "; length turned {:.1f} deg on the surface".format(turn_deg) if turned else "",
+                )
             )
             undo_err, _t = _redefine_decal(design, d, designer_matrix, faces, chain)
             if undo_err and not _SIZING_ABORTED[0]:
@@ -6729,9 +6860,12 @@ def _apply_json_size_one(
                 _size_warning(label, "size not applied — {}; the designer's size was kept".format(what), lines)
             return True
         if moved > 0.01:
-            # Under DECAL_SIZE_END_GAP_CM it cannot show (Bullnose plank, 2026-10-15:
-            # 0.136 cm across a 17.8 cm wide decal), so it is logged, not warned.
-            stored_as.append("its centre {:.2f} cm from where it was asked".format(moved))
+            # Within the limits it cannot show (Bullnose plank, 2026-10-15: 0.136 cm
+            # across a 17.8 cm wide decal), so it is logged, not warned.
+            stored_as.append(
+                "its centre {:.2f} cm from where it was asked ({:.2f} along the part, "
+                "{:.2f} across)".format(moved, along_off, across_off)
+            )
     except Exception as ex:
         _size_warning(label, "the new size could not be read back ({})".format(ex), lines)
     try:
