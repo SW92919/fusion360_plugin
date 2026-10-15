@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Batch Render</title>
+<style>
+  :root {
+    --bg: #f5f5f5;
+    --text: #2b2b2b;
+    --muted: #5f5f5f;
+    --border: #c4c4c4;
+    --field: #ffffff;
+    --track: #e1e1e1;
+    --green: #3a9a3f;
+    --green-done: #2f8a34;
+    --error: #b3261e;
+  }
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px "Artifakt Element", "Segoe UI", Arial, sans-serif;
+  }
+  body { overflow: auto; }
+  /* Full-height column: the Status box takes the free space and scrolls, so a
+     long summary never pushes the Render button out of the panel. */
+  .wrap {
+    box-sizing: border-box;
+    height: 100%;
+    min-height: 420px;
+    display: flex;
+    flex-direction: column;
+    padding: 14px 16px 12px;
+  }
+  .row {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: 200px minmax(0, 1fr) 32px;
+    align-items: center;
+    column-gap: 8px;
+    margin-bottom: 8px;
+  }
+  .row label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  input[type="text"], select {
+    width: 100%;
+    box-sizing: border-box;
+    height: 26px;
+    padding: 0 7px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    background: var(--field);
+    color: var(--text);
+    font: inherit;
+  }
+  input[type="text"]:focus, select:focus { outline: none; border-color: #4f8fd6; }
+  input:disabled, select:disabled { background: #efefef; color: #8a8a8a; }
+  button {
+    height: 26px;
+    border: 1px solid #a8a8a8;
+    border-radius: 3px;
+    background: linear-gradient(#fdfdfd, #e7e7e7);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: #707070; }
+  button:active:not(:disabled) { background: #dedede; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .dots { width: 32px; padding: 0; font-weight: bold; letter-spacing: 1px; }
+  .status {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px solid #dadada;
+  }
+  .status-head { flex: 0 0 auto; display: flex; justify-content: space-between; align-items: baseline; }
+  #count { color: var(--muted); }
+  .bar {
+    flex: 0 0 auto;
+    height: 16px;
+    margin: 7px 0 8px;
+    background: var(--track);
+    border: 1px solid #c6c6c6;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  #fill { height: 100%; width: 0; background: var(--green); }
+  #fill.done { background: var(--green-done); }
+  #statusText {
+    flex: 1 1 auto;
+    min-height: 40px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--muted);
+  }
+  #statusText.error { color: var(--error); }
+  .actions { flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .actions button { min-width: 88px; }
+  #render { font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row">
+    <label for="instructions" title="Full path of the Render Instructions JSON file.">Render Instructions Location</label>
+    <input type="text" id="instructions" spellcheck="false" title="Full path of the Render Instructions JSON file.">
+    <button class="dots" data-target="instructions" title="Browse for the Render Instructions file">...</button>
+  </div>
+  <div class="row">
+    <label for="textureRoot" title="Folder that holds the colour-set folders.">Texture root folder</label>
+    <input type="text" id="textureRoot" spellcheck="false" title="Folder that holds the colour-set folders.">
+    <button class="dots" data-target="textureRoot" title="Browse for the texture folder">...</button>
+  </div>
+  <div class="row">
+    <label for="models" title="Model files (.f3d). Leave EMPTY to render every model listed in the Render Instructions file, or pick one or more .f3d files with the ... button (several paths are separated by |).">Model files (empty = all)</label>
+    <input type="text" id="models" spellcheck="false" title="Leave EMPTY to render every model listed in the Render Instructions file, or pick one or more .f3d files with the ... button (several paths are separated by |).">
+    <button class="dots" data-target="models" title="Browse for one or more model files (.f3d)">...</button>
+  </div>
+  <div class="row">
+    <label for="width">Image width (px)</label>
+    <input type="text" id="width" inputmode="numeric">
+    <span></span>
+  </div>
+  <div class="row">
+    <label for="height">Image height (px)</label>
+    <input type="text" id="height" inputmode="numeric">
+    <span></span>
+  </div>
+  <div class="row">
+    <label for="quality">Render Quality</label>
+    <select id="quality"></select>
+    <span></span>
+  </div>
+  <div class="row">
+    <label for="format">Image format</label>
+    <select id="format"></select>
+    <span></span>
+  </div>
+  <div class="row">
+    <label for="pipeline">Texture pipeline</label>
+    <select id="pipeline"></select>
+    <span></span>
+  </div>
+
+  <div class="status">
+    <div class="status-head"><strong>Status</strong><span id="count"></span></div>
+    <div class="bar"><div id="fill"></div></div>
+    <div id="statusText">Ready.</div>
+  </div>
+
+  <div class="actions">
+    <button id="render" title="Start the batch with these settings">Render</button>
+  </div>
+</div>
+
+<script>
+  "use strict";
+  // Page <-> add-in messages (see plugin/panel.py):
+  //   to Python:   ready, browse, render, start_now   (adsk.fusionSendData)
+  //   from Python: started, status, progress, finished, idle   (fusionJavaScriptHandler)
+  // The Render button follows the batch's own messages ("started" ... "idle"),
+  // not request replies: a reply can come back late or not at all.
+  var FIELDS = ["instructions", "textureRoot", "models", "width", "height", "quality", "format", "pipeline"];
+  var running = false;
+  var batchStarted = false;
+  var startTimer = null;
+  var START_WAIT_MS = 3000;
+
+  function $(id) { return document.getElementById(id); }
+
+  function send(action, data) {
+    try {
+      var reply = adsk.fusionSendData(action, JSON.stringify(data || {}));
+      return Promise.resolve(reply).then(function (text) {
+        try { return JSON.parse(text || "{}"); } catch (e) { return {}; }
+      }).catch(function (e) {
+        return { ok: false, error: String(e) };
+      });
+    } catch (e) {
+      return Promise.resolve({ ok: false, error: String(e) });
+    }
+  }
+
+  function values() {
+    var v = {};
+    FIELDS.forEach(function (f) { v[f] = $(f).value; });
+    return v;
+  }
+
+  function fillSelect(select, items, chosen) {
+    select.innerHTML = "";
+    items.forEach(function (text) {
+      var option = document.createElement("option");
+      option.value = text;
+      option.textContent = text;
+      if (text === chosen) { option.selected = true; }
+      select.appendChild(option);
+    });
+  }
+
+  function setRunning(on) {
+    running = on;
+    $("render").disabled = on;
+    FIELDS.forEach(function (f) { $(f).disabled = on; });
+    Array.prototype.forEach.call(document.querySelectorAll(".dots"), function (b) { b.disabled = on; });
+  }
+
+  function setStatus(text, isError) {
+    var box = $("statusText");
+    box.textContent = text;
+    box.classList.toggle("error", !!isError);
+    box.scrollTop = 0;
+  }
+
+  function setProgress(value, maximum) {
+    var pct = maximum > 0 ? Math.max(0, Math.min(100, Math.round(100 * value / maximum))) : 0;
+    var fill = $("fill");
+    fill.style.width = pct + "%";
+    fill.classList.toggle("done", pct >= 100);
+    $("count").textContent = maximum > 1 || value > 0 ? value + " / " + maximum + "  (" + pct + " %)" : "";
+  }
+
+  window.fusionJavaScriptHandler = {
+    handle: function (action, data) {
+      var d = {};
+      try { d = JSON.parse(data || "{}"); } catch (e) { d = {}; }
+      if (action === "started") {
+        batchStarted = true;
+        clearTimeout(startTimer);
+        setRunning(true);
+      } else if (action === "status") {
+        setStatus(d.text || "", false);
+      } else if (action === "progress") {
+        setProgress(d.value || 0, d.maximum || 1);
+      } else if (action === "finished") {
+        batchStarted = false;
+        setRunning(false);
+        setStatus(d.text || "", !d.ok);
+      } else if (action === "idle") {
+        batchStarted = false;
+        clearTimeout(startTimer);
+        setRunning(false);
+      }
+      return JSON.stringify({ ok: true });
+    }
+  };
+
+  Array.prototype.forEach.call(document.querySelectorAll(".dots"), function (button) {
+    button.addEventListener("click", function () {
+      if (running) { return; }
+      var target = button.getAttribute("data-target");
+      send("browse", { target: target }).then(function (reply) {
+        if (reply.ok && reply.value) { $(target).value = reply.value; }
+      });
+    });
+  });
+
+  $("render").addEventListener("click", function () {
+    if (running) { return; }
+    setRunning(true);  // locked until the batch reports "finished" / "idle"
+    setProgress(0, 1);
+    setStatus("Checking the settings…", false);
+    send("render", values()).then(function (reply) {
+      if (batchStarted) { return; }
+      if (reply.ok) {
+        setStatus("Starting…", false);
+        clearTimeout(startTimer);
+        startTimer = setTimeout(function () {
+          // No "started" yet: the add-in's queued start did not arrive. Ask it to
+          // run now; its reply is ignored (the batch reports through messages).
+          if (running && !batchStarted) { send("start_now", {}); }
+        }, START_WAIT_MS);
+      } else {
+        setRunning(false);
+        setStatus(reply.error || "The batch could not be started.", true);
+      }
+    });
+  });
+
+  function init(attempt) {
+    attempt = attempt || 0;
+    var retry = function () {
+      if (attempt < 100) { setTimeout(function () { init(attempt + 1); }, 150); }
+    };
+    // Fusion injects the "adsk" object shortly after the page loads.
+    if (!window.adsk || !adsk.fusionSendData) { retry(); return; }
+    send("ready", {}).then(function (reply) {
+      if (!reply.ok || !reply.defaults) { retry(); return; }
+      var d = reply.defaults, v = reply.values;
+      fillSelect($("quality"), d.qualities, v.quality);
+      fillSelect($("format"), d.formats, v.format);
+      fillSelect($("pipeline"), d.pipelines, v.pipeline);
+      ["instructions", "textureRoot", "models", "width", "height"].forEach(function (f) {
+        $(f).value = v[f] || "";
+      });
+      batchStarted = !!reply.running;
+      setRunning(!!reply.running);
+      if (reply.running) { setStatus("A batch is running…", false); }
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () { init(0); });
+  } else {
+    init(0);
+  }
+</script>
+</body>
+</html>

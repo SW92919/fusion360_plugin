@@ -19,7 +19,6 @@ import viewport_render
 from plugin import image_mapper
 from plugin import logger as logutil
 from plugin import model_handler
-from plugin import ui as uip
 
 
 def _log_timestamp() -> str:
@@ -157,8 +156,7 @@ def _resolve_render_tasks(
 
 
 def execute_batch(
-    fui: adsk.core.UserInterface,
-    ins: adsk.core.CommandInputs,
+    reporter: Any,
     texture_root: Path,
     models: List[Path],
     render_width: int,
@@ -168,12 +166,17 @@ def execute_batch(
     instructions_path: Path,
     render_quality: int,
 ) -> None:
+    """Run one batch. ``reporter`` shows progress on the Batch Render panel.
+
+    It needs ``set_status(text)``, ``set_progress(value, maximum)``,
+    ``finish(summary)`` (every render made) and ``fail(text)`` (could not run, or
+    some renders / decal updates failed).
+    """
     log_path = logutil.default_log_path(texture_root)
     logutil.append_log(log_path, "execute_batch start")
 
     _execute_batch_inner(
-        fui,
-        ins,
+        reporter,
         texture_root,
         models,
         render_width,
@@ -187,8 +190,7 @@ def execute_batch(
 
 
 def _execute_batch_inner(
-    fui: adsk.core.UserInterface,
-    ins: adsk.core.CommandInputs,
+    reporter: Any,
     texture_root: Path,
     models: List[Path],
     render_width: int,
@@ -203,14 +205,14 @@ def _execute_batch_inner(
     try:
         color_sets = support_paths.scan_texture_root(texture_root)
     except Exception as ex:
-        fui.messageBox("Invalid texture folder:\n{}".format(ex))
+        reporter.fail("Invalid texture folder:\n{}".format(ex))
         logutil.append_log(log_path, "scan_texture_root failed", ex)
         return
     if not color_sets:
-        fui.messageBox("No color subfolders found under:\n{}".format(texture_root))
+        reporter.fail("No color subfolders found under:\n{}".format(texture_root))
         return
     if not models:
-        fui.messageBox("No model files selected.")
+        reporter.fail("No model files selected.")
         return
 
     # The render instructions now drive views, hides and decal sizes, so a bad file
@@ -218,7 +220,7 @@ def _execute_batch_inner(
     instructions = render_instructions.load_instructions(instructions_path)
     if not instructions.ok:
         detail = "\n".join(render_instructions.describe_problems(instructions, limit=12))
-        fui.messageBox(
+        reporter.fail(
             "Render Instructions could not be used:\n\n{}\n\n"
             "Fix the file and run again.".format(detail)
         )
@@ -281,10 +283,9 @@ def _execute_batch_inner(
     done_steps = 0
 
     def bump_progress(msg: str) -> None:
-        uip.set_status(ins, msg)
         try:
-            pct = 0 if not total_steps else int(min(100, (100 * done_steps) // max(1, total_steps)))
-            uip.set_progress(ins, pct, 100)
+            reporter.set_status(msg)
+            reporter.set_progress(min(done_steps, total_steps), total_steps)
         except Exception:
             pass
         viewport_render.pump_ui()
@@ -710,6 +711,9 @@ def _execute_batch_inner(
                     except Exception:
                         render_cam = None
 
+                bump_progress(
+                    "Rendering {} of {}: {}".format(done_steps + 1, total_steps, out_path.name)
+                )
                 ok = _save_local_image(
                     design,
                     app,
@@ -742,7 +746,9 @@ def _execute_batch_inner(
                     renders_fail += 1
 
                 done_steps += 1
-                bump_progress("Saved: {}".format(out_path.name))
+                bump_progress(
+                    "{}: {}".format("Saved" if ok else "Render FAILED", out_path.name)
+                )
 
                 visibility_apply.restore_visibility(
                     occ_snap, body_snap, mesh_snap, decal_snap
@@ -827,13 +833,9 @@ def _execute_batch_inner(
     except Exception as ex:
         logutil.append_log(log_path, "summary write failed: {}".format(ex))
 
+    # The result comes first: the panel's Status box shows the top of this text.
     short_lines: List[str] = [
-        "Texture root: {}".format(texture_root),
-        "Color sets: {} | Models: {}".format(len(color_sets), len(models)),
-        "Output: {} x {} {}".format(render_width, render_height, output_ext.upper()),
-        "Pipeline: {}".format(pipeline_selection),
-        "",
-        "Renders OK: {}  Failed: {}".format(renders_ok, renders_fail),
+        "Done. Renders OK: {}  Failed: {}".format(renders_ok, renders_fail),
         *(
             ["Models skipped (no render-instructions entry): {}".format(models_skipped)]
             if models_skipped
@@ -858,6 +860,11 @@ def _execute_batch_inner(
             else []
         ),
         "",
+        "Texture root: {}".format(texture_root),
+        "Color sets: {} | Models: {}".format(len(color_sets), len(models)),
+        "Output: {} x {} {}".format(render_width, render_height, output_ext.upper()),
+        "Pipeline: {}".format(pipeline_selection),
+        "",
         "Full summary: {}".format(summary_path),
         "CSV log:      {}".format(csv_log),
         "Plugin log:   {}".format(log_path),
@@ -865,10 +872,15 @@ def _execute_batch_inner(
     short_text = "\n".join(short_lines)
 
     try:
-        uip.set_progress(ins, 100, 100)
+        # The images actually made (views missing from a model are planned but
+        # never rendered), and red text when anything failed.
+        reporter.set_progress(done_steps, max(1, done_steps))
+        if renders_fail or decal_failures or not renders_ok:
+            reporter.fail(short_text)
+        else:
+            reporter.finish(short_text)
     except Exception:
         pass
-    fui.messageBox(short_text, "Batch Render")
     logutil.append_log(
         log_path,
         "execute_batch done ok={} fail={} decal_failures={}".format(
