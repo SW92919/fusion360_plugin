@@ -23,7 +23,7 @@ import zlib
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_ADDIN = _ROOT / "fusion_addin" / "LifeproofBatchRender"
+_ADDIN = _ROOT / "fusion_addin" / "BatchRender"
 for _p in (str(_ADDIN), str(Path(__file__).resolve().parent)):
     if _p not in sys.path:
         sys.path.insert(0, _p)

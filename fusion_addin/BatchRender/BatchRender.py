@@ -1,4 +1,5 @@
-# LifeproofBatchRender — Fusion 360 Python add-in entry point.
+# BatchRender — Fusion 360 Python add-in entry point. Fusion lists an add-in by its
+# folder name, which must match this file's and the .manifest's names.
 # Implementation lives in ./plugin (modular UI, controller, local render export).
 
 from __future__ import annotations

@@ -4,7 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 
-_ADDIN = Path(__file__).resolve().parent.parent / "fusion_addin" / "LifeproofBatchRender"
+_ADDIN = Path(__file__).resolve().parent.parent / "fusion_addin" / "BatchRender"
 if str(_ADDIN) not in sys.path:
     sys.path.insert(0, str(_ADDIN))
 

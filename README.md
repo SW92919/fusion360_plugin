@@ -8,7 +8,7 @@ A Fusion 360 Python add-in that batch-renders flooring-trim models for every col
 
 | Path | Purpose |
 |------|---------|
-| `fusion_addin/LifeproofBatchRender/` | The add-in. Install this folder in Fusion. |
+| `fusion_addin/BatchRender/` | The add-in. Install this folder in Fusion; it is listed by its folder name, **BatchRender**. |
 | `Resources/Models/` | The client's 8 models (`.f3d`), `Rendering Instructions.json`, and the change request (`.docx` / `.pdf`). |
 | `Resources/Models_old/` | Earlier versions of the models, from before the 2026-09 rename. |
 | `docs/CLIENT_GUIDE_Lifeproof_Batch_Render.md` | User guide for the client. |
@@ -19,7 +19,7 @@ A Fusion 360 Python add-in that batch-renders flooring-trim models for every col
 
 | File | Role |
 |------|------|
-| `LifeproofBatchRender.py` | Entry point. Reloads the add-in's modules on every **Run**. |
+| `BatchRender.py`, `BatchRender.manifest` | Entry point and manifest. Their names must match the folder's. Reloads the add-in's modules on every **Run**. |
 | `plugin/bootstrap.py` | Registers the **Batch Render** command (SOLID → MODIFY, UTILITIES → ADD-INS). |
 | `plugin/panel.py`, `plugin/html/batch_render.html` | The Batch Render palette: fields, status text, progress bar. |
 | `plugin/ui.py` | Command and palette IDs, and the panel's default values and choices (size, quality, format). |
@@ -38,8 +38,8 @@ A Fusion 360 Python add-in that batch-renders flooring-trim models for every col
 
 ## Install (developers)
 
-1. In Fusion: **UTILITIES → ADD-INS → Scripts and Add-Ins** → **+** → select `fusion_addin/LifeproofBatchRender` (the folder with the `.py` files and the `.manifest`).
-2. Select **LifeproofBatchRender** and click **Run**, then open **SOLID → MODIFY → Batch Render**.
+1. In Fusion: **UTILITIES → ADD-INS → Scripts and Add-Ins** → **+** → select `fusion_addin/BatchRender` (the folder with the `.py` files and the `.manifest`).
+2. Select **BatchRender** and click **Run**, then open **SOLID → MODIFY → Batch Render**.
 3. After editing code: **Stop**, then **Run** again. The `Code loaded:` line in `_LifeproofBatchRender_summary.txt` (texture root) shows which build ran. `STALE` there, or a `running build` time older than `newest source on disk`, means the old code is still loaded; the `STALE` check itself only looks at `texture_pipeline.py`.
 
 ## Running the tests

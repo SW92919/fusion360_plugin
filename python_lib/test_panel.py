@@ -17,7 +17,7 @@ import test_authored_decal_swap
 _STAND_IN_ADSK = test_authored_decal_swap.tp  # importing it installs the stand-in adsk package
 
 _ROOT = Path(__file__).resolve().parent.parent
-_ADDIN = _ROOT / "fusion_addin" / "LifeproofBatchRender"
+_ADDIN = _ROOT / "fusion_addin" / "BatchRender"
 if str(_ADDIN) not in sys.path:
     sys.path.insert(0, str(_ADDIN))
 

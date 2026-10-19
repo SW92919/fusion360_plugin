@@ -23,9 +23,9 @@ A CSV log and a summary are written into the texture root folder. No cloud rende
 
 ## Installing the add-in
 
-1. Copy the whole folder **`fusion_addin/LifeproofBatchRender`** from this repository, with all its files: `LifeproofBatchRender.py`, `LifeproofBatchRender.manifest`, the other `.py` files and the `plugin` folder.
+1. Copy the whole folder **`fusion_addin/BatchRender`** from this repository, with all its files: `BatchRender.py`, `BatchRender.manifest`, the other `.py` files and the `plugin` folder. Keep the folder name `BatchRender`: Fusion lists the add-in by its folder name.
 2. In Fusion: **UTILITIES → ADD-INS → Scripts and Add-Ins** → **+** (Add) → select that folder.
-3. Select **LifeproofBatchRender** in the list and click **Run**. Tick **Run on Startup** if you want it loaded every time Fusion starts.
+3. Select **BatchRender** in the list and click **Run**. Tick **Run on Startup** if you want it loaded every time Fusion starts.
 4. The command is called **Batch Render**. It appears at the bottom of the **SOLID → MODIFY** menu, and also in the **UTILITIES → ADD-INS** menu. It has no icon, only the text entry. If you cannot find it, use Fusion's command search and type `Batch Render`.
 
 Clicking **Batch Render** opens the **Batch Render panel**. The panel stays open while a batch runs.
@@ -192,7 +192,7 @@ Check the **summary file** after every batch that finishes; some problems appear
 | `Open failed for …` | The model could not be opened. It is listed only in the summary. |
 | The add-in does not start | A message box says `Batch Render failed to start` (or `could not open its panel`). Send `_LifeproofBatchRender_startup.log` from the add-in folder with your report. |
 
-**After updating the add-in files**, open **Scripts and Add-Ins**, select **LifeproofBatchRender**, click **Stop**, then **Run** (or restart Fusion). Re-opening the panel is not enough. The `Code loaded:` line near the top of the summary file shows which build ran; `STALE` there means the old code is still running.
+**After updating the add-in files**, open **Scripts and Add-Ins**, select **BatchRender**, click **Stop**, then **Run** (or restart Fusion). Re-opening the panel is not enough. The `Code loaded:` line near the top of the summary file shows which build ran; `STALE` there means the old code is still running.
 
 ---
 
